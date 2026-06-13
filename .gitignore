@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.pipeline/
+docs/notes/
+.idea/
+
+# Local env (holds VITE_WC_PROJECT_ID etc.) — never commit; see .env.example
+.env
+.env.*
+!.env.example

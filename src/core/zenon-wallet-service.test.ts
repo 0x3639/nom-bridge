@@ -1,0 +1,245 @@
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {ZENON_CHAIN} from '@/config'
+
+// Fakes for the three external boundaries this service touches: the WC
+// SignClient (init/on/session/connect/request/disconnect), the WC modal, and the
+// SDK's AccountBlockTemplate.fromJson. We assert how the service DRIVES these —
+// the request envelope, the session-reuse selection, the disconnect reason — not
+// what the fakes return.
+const h = vi.hoisted(() => {
+  const onHandlers: Record<string, (...args: unknown[]) => void> = {}
+  const client = {
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      onHandlers[event] = cb
+    }),
+    session: {getAll: vi.fn(() => [] as unknown[])},
+    connect: vi.fn(),
+    request: vi.fn(),
+    disconnect: vi.fn().mockResolvedValue(undefined),
+  }
+  const modal = {openModal: vi.fn().mockResolvedValue(undefined), closeModal: vi.fn()}
+  return {
+    onHandlers,
+    client,
+    modal,
+    initSpy: vi.fn(async () => client),
+    fromJson: vi.fn((json: unknown) => ({fromJson: json})),
+  }
+})
+
+vi.mock('@walletconnect/sign-client', () => ({SignClient: {init: h.initSpy}}))
+vi.mock('@walletconnect/modal', () => ({WalletConnectModal: vi.fn(() => h.modal)}))
+vi.mock('znn-typescript-sdk', () => ({AccountBlockTemplate: {fromJson: h.fromJson}}))
+
+const future = () => Math.floor(Date.now() / 1000) + 3600
+const past = () => Math.floor(Date.now() / 1000) - 3600
+const zenonSession = (topic: string, expiry: number) => ({
+  topic,
+  expiry,
+  namespaces: {zenon: {}},
+})
+
+beforeEach(() => {
+  vi.resetModules()
+  Object.keys(h.onHandlers).forEach(k => delete h.onHandlers[k])
+  h.client.on.mockClear()
+  h.client.session.getAll.mockReset().mockReturnValue([])
+  h.client.connect.mockReset()
+  h.client.request.mockReset().mockResolvedValue({address: 'z1addr', chainId: 1})
+  h.client.disconnect.mockClear()
+  h.modal.openModal.mockClear()
+  h.modal.closeModal.mockClear()
+  h.fromJson.mockClear()
+  vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}})
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('ZenonWalletService.connect — session reuse', () => {
+  it('reuses the LAST non-expired zenon session and skips the modal', async () => {
+    h.client.session.getAll.mockReturnValue([
+      zenonSession('topic-A', future()),
+      zenonSession('topic-B', future()),
+    ])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    // No new pairing was opened...
+    expect(h.client.connect).not.toHaveBeenCalled()
+    expect(h.modal.openModal).not.toHaveBeenCalled()
+    // ...and the reused session is the LAST matching one (topic-B).
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-B'}),
+    )
+  })
+
+  it('skips expired sessions when choosing one to reuse', async () => {
+    h.client.session.getAll.mockReturnValue([
+      zenonSession('topic-valid', future()),
+      zenonSession('topic-expired', past()),
+    ])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-valid'}),
+    )
+  })
+
+  it('ignores sessions without a zenon namespace', async () => {
+    h.client.session.getAll.mockReturnValue([
+      zenonSession('topic-zenon', future()),
+      {topic: 'topic-eip155', expiry: future(), namespaces: {eip155: {}}},
+    ])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-zenon'}),
+    )
+  })
+})
+
+describe('ZenonWalletService.connect — fresh pairing', () => {
+  it('opens the modal with the uri and stores the approved session when none to reuse', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:deadbeef',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requiredNamespaces: expect.objectContaining({
+          zenon: expect.objectContaining({chains: [ZENON_CHAIN]}),
+        }),
+      }),
+    )
+    expect(h.modal.openModal).toHaveBeenCalledWith({uri: 'wc:deadbeef'})
+    expect(h.modal.closeModal).toHaveBeenCalled()
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-new'}),
+    )
+  })
+
+  it('closes the modal even when pairing approval rejects', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:abc',
+      approval: vi.fn().mockRejectedValue(Object.assign(new Error('rejected'), {code: 5000})),
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'Request rejected in the wallet',
+    )
+    expect(h.modal.closeModal).toHaveBeenCalled()
+  })
+})
+
+describe('ZenonWalletService request envelope', () => {
+  it('always sends topic + chainId + method/params on every request', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect() // triggers getInfo -> znn_info
+
+    expect(h.client.request).toHaveBeenCalledWith({
+      topic: 'topic-A',
+      chainId: ZENON_CHAIN,
+      request: {method: 'znn_info', params: undefined},
+    })
+  })
+
+  it('throws "No active Zenon session" when requesting before connecting', async () => {
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().getInfo()).rejects.toThrow(
+      'No active Zenon session',
+    )
+    expect(h.client.request).not.toHaveBeenCalled()
+  })
+})
+
+describe('ZenonWalletService.send', () => {
+  it('serializes the block, calls znn_send, and rehydrates the result', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({published: true}) // znn_send result
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    const result = await service.send('z1from', block as never)
+
+    expect(block.toJson).toHaveBeenCalled()
+    expect(h.client.request).toHaveBeenLastCalledWith({
+      topic: 'topic-A',
+      chainId: ZENON_CHAIN,
+      request: {method: 'znn_send', params: {fromAddress: 'z1from', accountBlock: {cell: 'serialized'}}},
+    })
+    expect(h.fromJson).toHaveBeenCalledWith({published: true})
+    expect(result).toEqual({fromJson: {published: true}})
+  })
+})
+
+describe('ZenonWalletService.disconnect', () => {
+  it('disconnects with reason code 6000, clears the session, and fires onDisconnect', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    const onDisconnect = vi.fn()
+    service.onDisconnect = onDisconnect
+    await service.connect()
+
+    await service.disconnect()
+
+    expect(h.client.disconnect).toHaveBeenCalledWith({
+      topic: 'topic-A',
+      reason: {code: 6000, message: 'User disconnected'},
+    })
+    expect(onDisconnect).toHaveBeenCalledTimes(1)
+    // Session is cleared: a subsequent request has nothing to send on.
+    await expect(service.getInfo()).rejects.toThrow('No active Zenon session')
+  })
+})
+
+describe('ZenonWalletService session lifecycle events', () => {
+  it('clears the session and fires onDisconnect on a session_delete event', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    const onDisconnect = vi.fn()
+    service.onDisconnect = onDisconnect
+    await service.connect()
+
+    h.onHandlers.session_delete()
+
+    expect(onDisconnect).toHaveBeenCalledTimes(1)
+    await expect(service.getInfo()).rejects.toThrow('No active Zenon session')
+  })
+
+  it('also clears on a session_expire event', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    const onDisconnect = vi.fn()
+    service.onDisconnect = onDisconnect
+    await service.connect()
+
+    h.onHandlers.session_expire()
+
+    expect(onDisconnect).toHaveBeenCalledTimes(1)
+  })
+})

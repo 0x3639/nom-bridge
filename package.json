@@ -1,0 +1,39 @@
+{
+  "name": "nom-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vueuse/core": "^14.2.0",
+    "@walletconnect/modal": "^2.6.2",
+    "@walletconnect/sign-client": "^2.11.0",
+    "buffer": "^6.0.3",
+    "lucide-vue-next": "^0.563.0",
+    "nom-ui": "github:digitalSloth/nom-ui",
+    "viem": "^2.21.0",
+    "vue": "^3.4.0",
+    "vue-router": "^4.2.0",
+    "znn-typescript-sdk": "^1.0.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.18",
+    "@types/chrome": "^0.0.260",
+    "@walletconnect/types": "^2.11.0",
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "tailwindcss": "^4.0.0",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.3.0",
+    "vite": "^7.3.1",
+    "vite-plugin-node-polyfills": "^0.25.0",
+    "vitest": "^2.1.9",
+    "vue-tsc": "^3.3.3"
+  }
+}
