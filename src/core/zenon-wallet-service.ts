@@ -2,7 +2,7 @@ import {SignClient} from '@walletconnect/sign-client'
 import type {SessionTypes} from '@walletconnect/types'
 import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
 import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
-import {delay, WC_TIMING} from './wc-reliability'
+import {delay, WC_TIMING, withTimeout} from './wc-reliability'
 
 const ZENON_NAMESPACE = {
   methods: ['znn_info', 'znn_sign', 'znn_send'],
@@ -106,7 +106,7 @@ export class ZenonWalletService {
           await modal.openModal({uri})
         }
       }
-      const approved = await approval()
+      const approved = await withTimeout(approval(), WC_TIMING.approvalTimeoutMs, 'Wallet approval')
       // The SignClient session store lags behind approval(); give it a moment,
       // then prefer the store's copy of the newest live zenon session.
       await delay(WC_TIMING.settleMs)
@@ -150,15 +150,28 @@ export class ZenonWalletService {
     this.clearSession()
   }
 
+  private async ensureRelayConnected(client: SignClientInstance): Promise<void> {
+    if (client.core.relayer.connected) return
+    // A request sent into a dead relay (e.g. after laptop sleep) vanishes
+    // silently; reopen the transport and let it settle first.
+    await client.core.relayer.transportOpen()
+    await delay(WC_TIMING.relaySettleMs)
+  }
+
   private async request<T>(method: string, params: unknown): Promise<T> {
     const client = await this.getClient()
     if (!this.session) throw new Error('No active Zenon session')
+    await this.ensureRelayConnected(client)
     try {
-      return await client.request<T>({
-        topic: this.session.topic,
-        chainId: ZENON_CHAIN,
-        request: {method, params},
-      })
+      return await withTimeout(
+        client.request<T>({
+          topic: this.session.topic,
+          chainId: ZENON_CHAIN,
+          request: {method, params},
+        }),
+        WC_TIMING.requestTimeoutMs,
+        `Syrius request (${method})`,
+      )
     } catch (e) {
       throw mapWcError(e)
     }

@@ -16,6 +16,7 @@ const h = vi.hoisted(() => {
     connect: vi.fn(),
     request: vi.fn(),
     disconnect: vi.fn().mockResolvedValue(undefined),
+    core: {relayer: {connected: true, transportOpen: vi.fn().mockResolvedValue(undefined)}},
   }
   const modal = {openModal: vi.fn().mockResolvedValue(undefined), closeModal: vi.fn()}
   const modalCtor = vi.fn(() => modal)
@@ -53,6 +54,8 @@ beforeEach(() => {
   h.client.connect.mockReset()
   h.client.request.mockReset().mockResolvedValue({address: 'z1addr', chainId: 1})
   h.client.disconnect.mockClear()
+  h.client.core.relayer.connected = true
+  h.client.core.relayer.transportOpen.mockClear()
   h.modal.openModal.mockClear()
   h.modal.closeModal.mockClear()
   h.modalCtor.mockClear()
@@ -377,5 +380,57 @@ describe('ZenonWalletService.connect — post-approval settle', () => {
     expect(h.client.request).toHaveBeenCalledWith(
       expect.objectContaining({topic: 'topic-approval'}),
     )
+  })
+})
+
+describe('ZenonWalletService relay guard and timeouts', () => {
+  it('reopens the relay transport before a request when disconnected', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.core.relayer.connected = false
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.relaySettleMs = 0
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.core.relayer.transportOpen).toHaveBeenCalled()
+    const openOrder = h.client.core.relayer.transportOpen.mock.invocationCallOrder[0]
+    const requestOrder = h.client.request.mock.invocationCallOrder[0]
+    expect(openOrder).toBeLessThan(requestOrder)
+  })
+
+  it('does not touch the transport when the relay is connected', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.core.relayer.transportOpen).not.toHaveBeenCalled()
+  })
+
+  it('times out a hanging request with a Syrius-flavored error', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReturnValue(new Promise(() => {}))
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.requestTimeoutMs = 10
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'timed out — check that Syrius is open and responsive',
+    )
+  })
+
+  it('times out a never-approved pairing', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:hang',
+      approval: vi.fn().mockReturnValue(new Promise(() => {})),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.approvalTimeoutMs = 10
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow('timed out')
+    expect(h.modal.closeModal).toHaveBeenCalled()
   })
 })
