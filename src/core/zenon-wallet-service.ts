@@ -147,7 +147,6 @@ export class ZenonWalletService {
     return validateZenonWalletInfo(info)
   }
 
-  // WIRED now, first USED in Phase 3. Do not call it this phase.
   async send(fromAddress: string, block: AccountBlockTemplate): Promise<AccountBlockTemplate> {
     const info = await this.getInfo()
     if (info.address !== fromAddress) {

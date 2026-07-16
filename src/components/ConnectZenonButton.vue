@@ -16,4 +16,7 @@ function truncate(a: string): string {
   <Button v-else variant="outline" @click="disconnect().catch(() => {})">
     <span class="mr-2 inline-block w-2 h-2 rounded-full bg-primary" />{{ truncate(address) }} · Disconnect
   </Button>
+  <p v-if="!address && isConnecting" class="mt-1 text-xs text-muted-foreground">
+    Approve in Syrius — if nothing opens, copy the link from the QR screen and paste it into Syrius's WalletConnect tab.
+  </p>
 </template>
