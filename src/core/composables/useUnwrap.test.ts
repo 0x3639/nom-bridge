@@ -34,13 +34,13 @@ beforeEach(() => {
 describe('useUnwrap.unwrap', () => {
   it('ensures allowance, unwraps, then tracks with id `${hash}:${provisionalLogIndex}`', async () => {
     h.ensureAllowance.mockResolvedValue(undefined)
-    h.unwrap.mockResolvedValue({hash: '0xunwraptx', provisionalLogIndex: 3})
+    h.unwrap.mockResolvedValue({hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true})
     h.trackUnwrap.mockResolvedValue(undefined)
     const {useUnwrap} = await import('./useUnwrap')
 
     const token = '0xToken0000000000000000000000000000000001' as `0x${string}`
     const bridge = '0xBridge00000000000000000000000000000000' as `0x${string}`
-    const result = await useUnwrap().unwrap(token, 500n, 'z1qrecipient', bridge, 'zts1znn')
+    const result = await useUnwrap().unwrap(token, 500n, 'z1qrecipient', bridge, 'zts1znn', 8, 'ZNN')
 
     expect(h.ensureAllowance).toHaveBeenCalledWith(token, bridge, 500n)
     expect(h.unwrap).toHaveBeenCalledWith(bridge, token, 500n, 'z1qrecipient')
@@ -49,10 +49,12 @@ describe('useUnwrap.unwrap', () => {
         id: '0xunwraptx:3',
         zts: 'zts1znn',
         amount: '500',
+        decimals: 8,
+        symbol: 'ZNN',
         zenonToAddress: 'z1qrecipient',
       }),
     )
-    expect(result).toEqual({hash: '0xunwraptx', provisionalLogIndex: 3})
+    expect(result).toEqual({hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true})
   })
 
   it('ensures allowance BEFORE the unwrap call', async () => {
@@ -62,7 +64,7 @@ describe('useUnwrap.unwrap', () => {
     })
     h.unwrap.mockImplementation(async () => {
       order.push('unwrap')
-      return {hash: '0xtx', provisionalLogIndex: 0}
+      return {hash: '0xtx', provisionalLogIndex: 0, eventMatched: true}
     })
     h.trackUnwrap.mockResolvedValue(undefined)
     const {useUnwrap} = await import('./useUnwrap')
@@ -73,6 +75,8 @@ describe('useUnwrap.unwrap', () => {
       'z1q',
       '0xBridge00000000000000000000000000000000' as `0x${string}`,
       'zts1znn',
+      8,
+      'ZNN',
     )
 
     expect(order).toEqual(['allowance', 'unwrap'])
@@ -82,7 +86,7 @@ describe('useUnwrap.unwrap', () => {
 describe('useUnwrap.redeemZenon', () => {
   it('builds the redeem block with the NODE logIndex then sends it', async () => {
     h.buildRedeemBlock.mockReturnValue({__block: true})
-    h.send.mockResolvedValue(undefined)
+    h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
     const {useUnwrap} = await import('./useUnwrap')
 
     const view = {
@@ -91,11 +95,13 @@ describe('useUnwrap.redeemZenon', () => {
       logIndex: 9,
       zts: 'zts1znn',
       amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
       toAddress: 'z1qrecipient',
       status: 'redeemable' as const,
     }
 
-    await useUnwrap().redeemZenon(view)
+    await expect(useUnwrap().redeemZenon(view)).resolves.toBe('zenonhash')
 
     expect(h.buildRedeemBlock).toHaveBeenCalledWith('0xtx', 9)
     expect(h.send).toHaveBeenCalledWith({__block: true})

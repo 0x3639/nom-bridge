@@ -1,15 +1,106 @@
 <script setup lang="ts">
-import {Card, CardContent} from 'nom-ui'
-import {History} from 'lucide-vue-next'
+import {onMounted, onUnmounted, watch} from 'vue'
+import {Alert, AlertDescription, AlertTitle, Badge, Card, CardContent, CardHeader, CardTitle} from 'nom-ui'
+import {config} from '@/config'
+import {useBridge, useEvmWallet, useRequests, useZenonWallet} from '@/core'
+import {formatAmount, truncateAddress} from '@/core/composables/utils/formatters'
+
+const {tokenPairs, bridgeAddress, momentumTime, error: bridgeError, load} = useBridge()
+const {account: evmAccount} = useEvmWallet()
+const {address: zenonAddress} = useZenonWallet()
+const {
+  wrapRequests,
+  unwrapRequests,
+  isLoading,
+  pollingError,
+  startPolling,
+  stopPolling,
+  refreshForAccountChange,
+} = useRequests()
+
+watch([evmAccount, zenonAddress], () => {
+  void refreshForAccountChange().catch(() => undefined)
+})
+
+onMounted(async () => {
+  try {
+    await load()
+  } catch {
+    return
+  }
+  startPolling(
+    () => evmAccount.value,
+    () => bridgeAddress.value,
+    () => zenonAddress.value,
+    () => momentumTime.value,
+    () => tokenPairs.value,
+  )
+})
+
+onUnmounted(stopPolling)
 </script>
 
 <template>
   <Card>
-    <CardContent class="flex flex-col items-center gap-3 py-12 text-center">
-      <span class="grid h-10 w-10 place-items-center rounded-full border bg-card/40">
-        <History class="h-5 w-5 text-muted-foreground" />
-      </span>
-      <p class="font-mono text-sm text-muted-foreground">Request history — coming soon</p>
+    <CardHeader>
+      <CardTitle>Bridge history</CardTitle>
+    </CardHeader>
+    <CardContent class="space-y-5">
+      <Alert v-if="pollingError" variant="destructive">
+        <AlertTitle>History refresh failed</AlertTitle>
+        <AlertDescription>{{ pollingError }}</AlertDescription>
+      </Alert>
+      <Alert v-else-if="bridgeError" variant="destructive">
+        <AlertTitle>Bridge configuration unavailable</AlertTitle>
+        <AlertDescription>{{ bridgeError }}</AlertDescription>
+      </Alert>
+
+      <p v-if="!evmAccount && !zenonAddress" class="text-sm text-muted-foreground">
+        Connect a wallet to load its bridge history.
+      </p>
+      <p v-else-if="isLoading" class="text-sm text-muted-foreground">Loading history…</p>
+
+      <section v-if="evmAccount" class="space-y-2">
+        <h2 class="text-sm font-semibold">Zenon → Ethereum</h2>
+        <a
+          v-for="request in wrapRequests"
+          :key="request.id"
+          :href="config.zenonExplorerTxUrl + request.id"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="flex items-center justify-between gap-3 rounded-md border p-3 text-sm hover:border-primary/50"
+        >
+          <span>
+            <span class="block font-mono">
+              {{ formatAmount(request.amount, request.decimals) }} {{ request.symbol }}
+            </span>
+            <span class="text-xs text-muted-foreground">To {{ truncateAddress(request.toAddress) }}</span>
+          </span>
+          <Badge variant="secondary">{{ request.status }}</Badge>
+        </a>
+        <p v-if="!wrapRequests.length" class="text-sm text-muted-foreground">No wrap requests found.</p>
+      </section>
+
+      <section v-if="zenonAddress" class="space-y-2">
+        <h2 class="text-sm font-semibold">Ethereum → Zenon</h2>
+        <a
+          v-for="request in unwrapRequests"
+          :key="request.id"
+          :href="config.evmExplorerTxUrl + request.transactionHash"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="flex items-center justify-between gap-3 rounded-md border p-3 text-sm hover:border-primary/50"
+        >
+          <span>
+            <span class="block font-mono">
+              {{ formatAmount(request.amount, request.decimals) }} {{ request.symbol }}
+            </span>
+            <span class="text-xs text-muted-foreground">To {{ truncateAddress(request.toAddress) }}</span>
+          </span>
+          <Badge variant="secondary">{{ request.status }}</Badge>
+        </a>
+        <p v-if="!unwrapRequests.length" class="text-sm text-muted-foreground">No unwrap requests found.</p>
+      </section>
     </CardContent>
   </Card>
 </template>

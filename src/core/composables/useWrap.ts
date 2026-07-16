@@ -1,5 +1,5 @@
 import {ref} from 'vue'
-import {extractNumberDecimals} from 'znn-typescript-sdk'
+import {parseAmount} from '../amount'
 import {BridgeService} from '../bridge-service'
 import {EvmService, tssSignatureToHex} from '../evm-service'
 import {requestStore} from '../request-store'
@@ -15,6 +15,7 @@ async function wrap(
   humanAmount: string | number,
   decimals: number,
   zts: string,
+  symbol: string,
 ): Promise<string> {
   isWrapping.value = true
   error.value = null
@@ -25,7 +26,9 @@ async function wrap(
     await requestStore.trackWrap({
       id,
       zts,
-      amount: extractNumberDecimals(humanAmount, decimals).toString(),
+      amount: parseAmount(humanAmount, decimals).toString(),
+      decimals,
+      symbol,
       evmToAddress,
       createdAt: Date.now(),
     })

@@ -1,7 +1,8 @@
 import {storageService} from './storage/storage-service'
 import type {TrackedRequest} from '@/types'
+import {config} from '@/config'
 
-const STORAGE_KEY = 'nom-bridge:requests'
+const STORAGE_KEY = 'nom-bridge:requests:v2'
 
 // In-memory mirror, loaded once on first access. Mutations update the mirror
 // synchronously and persist asynchronously; reads go through the mirror so they
@@ -20,18 +21,27 @@ async function persist(): Promise<void> {
 }
 
 export const requestStore = {
-  async trackWrap(r: Omit<TrackedRequest, 'kind'>): Promise<void> {
+  async trackWrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
     const list = await ensureLoaded()
     if (list.some(e => e.id === r.id)) return
-    list.push({kind: 'wrap', ...r})
+    list.push({
+      kind: 'wrap',
+      evmChainId: config.evmChainId,
+      zenonChainId: config.zenonChainId,
+      ...r,
+    })
     await persist()
   },
 
-  // Phase 4 — declared now, same shape; used by useUnwrap then.
-  async trackUnwrap(r: Omit<TrackedRequest, 'kind'>): Promise<void> {
+  async trackUnwrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
     const list = await ensureLoaded()
     if (list.some(e => e.id === r.id)) return
-    list.push({kind: 'unwrap', ...r})
+    list.push({
+      kind: 'unwrap',
+      evmChainId: config.evmChainId,
+      zenonChainId: config.zenonChainId,
+      ...r,
+    })
     await persist()
   },
 

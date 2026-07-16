@@ -15,12 +15,14 @@ async function unwrap(
   zenonAddress: string,
   bridge: Address,
   zts: string,
-): Promise<{hash: Hex; provisionalLogIndex: number}> {
+  decimals: number,
+  symbol: string,
+): Promise<{hash: Hex; provisionalLogIndex: number; eventMatched: boolean}> {
   isUnwrapping.value = true
   error.value = null
   try {
     await EvmService.getInstance().ensureAllowance(token, bridge, amount)
-    const {hash, provisionalLogIndex} = await EvmService.getInstance().unwrap(
+    const {hash, provisionalLogIndex, eventMatched} = await EvmService.getInstance().unwrap(
       bridge,
       token,
       amount,
@@ -30,10 +32,12 @@ async function unwrap(
       id: `${hash}:${provisionalLogIndex}`,
       zts,
       amount: amount.toString(),
+      decimals,
+      symbol,
       zenonToAddress: zenonAddress,
       createdAt: Date.now(),
     })
-    return {hash, provisionalLogIndex}
+    return {hash, provisionalLogIndex, eventMatched}
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
     throw e
@@ -42,14 +46,15 @@ async function unwrap(
   }
 }
 
-async function redeemZenon(request: UnwrapRequestView): Promise<void> {
+async function redeemZenon(request: UnwrapRequestView): Promise<string> {
   error.value = null
   try {
     const block = BridgeService.getInstance().buildRedeemBlock(
       request.transactionHash,
       request.logIndex,
     )
-    await useZenonWallet().send(block)
+    const published = await useZenonWallet().send(block)
+    return published.hash.toString()
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to redeem'
     throw e

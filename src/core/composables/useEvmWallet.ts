@@ -1,7 +1,7 @@
 import {ref} from 'vue'
 import {EvmService} from '../evm-service'
 import {config} from '@/config'
-import type {Address} from 'viem'
+import {getAddress, type Address} from 'viem'
 
 const account = ref<Address | null>(null)
 const chainId = ref<number | null>(null)
@@ -14,10 +14,19 @@ function attachProviderListeners() {
   if (listenersAttached || !window.ethereum) return
   listenersAttached = true
   window.ethereum.on('accountsChanged', (accounts: string[]) => {
-    account.value = accounts.length ? (accounts[0] as Address) : null
+    if (!accounts.length) {
+      account.value = null
+      return
+    }
+    try {
+      account.value = getAddress(accounts[0])
+    } catch {
+      account.value = null
+    }
   })
   window.ethereum.on('chainChanged', (hexChainId: string) => {
-    chainId.value = Number.parseInt(hexChainId, 16)
+    const nextChainId = Number.parseInt(hexChainId, 16)
+    chainId.value = Number.isSafeInteger(nextChainId) ? nextChainId : null
   })
 }
 

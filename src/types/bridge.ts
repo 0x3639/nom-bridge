@@ -17,16 +17,24 @@ export type UnwrapStatus =
 export interface TokenPairView {
   zts: string            // TokenStandard string
   tokenAddress: string   // EVM ERC-20 address
-  decimals: number       // see useBridge note on decimals sourcing
-  minAmount: bigint
+  symbol: string
+  evmSymbol: string
+  decimals: number
+  wrapMinAmount: bigint
+  unwrapMinAmount: bigint
   feePercentage: number  // basis points
   redeemDelay: number    // Zenon-side unwrap delay (momentums)
+  wrapEnabled: boolean
+  unwrapEnabled: boolean
+  owned: boolean
 }
 
 export interface WrapRequestView {
   id: string             // wrap block hash
   zts: string
   amount: bigint
+  decimals: number
+  symbol: string
   toAddress: string      // EVM recipient
   status: WrapStatus
   remainingSeconds?: number
@@ -38,6 +46,8 @@ export interface UnwrapRequestView {
   logIndex: number
   zts: string
   amount: bigint
+  decimals: number
+  symbol: string
   toAddress: string      // Zenon recipient
   status: UnwrapStatus
   remainingSeconds?: number
@@ -46,8 +56,12 @@ export interface UnwrapRequestView {
 export interface TrackedRequest {
   kind: 'wrap' | 'unwrap'
   id: string
+  evmChainId: number
+  zenonChainId: number
   zts: string
   amount: string         // bigint as string (JSON-safe)
+  decimals: number
+  symbol: string
   evmToAddress?: string
   zenonToAddress?: string
   createdAt: number

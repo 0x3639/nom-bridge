@@ -8,8 +8,14 @@ const h = vi.hoisted(() => ({
     readContract: vi.fn(),
     getBlockNumber: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
+    simulateContract: vi.fn(),
   },
-  walletClient: {requestAddresses: vi.fn(), switchChain: vi.fn(), writeContract: vi.fn()},
+  walletClient: {
+    requestAddresses: vi.fn(),
+    switchChain: vi.fn(),
+    writeContract: vi.fn(),
+    getChainId: vi.fn(),
+  },
 }))
 
 vi.mock('viem', async (importOriginal) => {
@@ -26,9 +32,11 @@ beforeEach(() => {
   h.publicClient.readContract.mockReset()
   h.publicClient.getBlockNumber.mockReset()
   h.publicClient.waitForTransactionReceipt.mockReset()
+  h.publicClient.simulateContract.mockReset().mockResolvedValue({request: {}})
   h.walletClient.requestAddresses.mockReset()
   h.walletClient.switchChain.mockReset()
   h.walletClient.writeContract.mockReset()
+  h.walletClient.getChainId.mockReset().mockResolvedValue(1)
   // A present, minimal EIP-1193 provider for the wallet path.
   vi.stubGlobal('window', {ethereum: {request: vi.fn()}})
 })
@@ -92,6 +100,39 @@ describe('EvmService.getBalance', () => {
   })
 })
 
+describe('EvmService token and bridge metadata', () => {
+  it('reads ERC-20 decimals and symbol', async () => {
+    h.publicClient.readContract
+      .mockResolvedValueOnce(18)
+      .mockResolvedValueOnce('UNI-V2')
+    const {EvmService} = await import('./evm-service')
+
+    await expect(
+      EvmService.getInstance().getTokenMetadata(
+        '0xdac866a3796f85cb84a914d98faec052e3b5596d',
+      ),
+    ).resolves.toEqual({decimals: 18, symbol: 'UNI-V2'})
+  })
+
+  it('decodes all five deployed tokensInfo fields', async () => {
+    h.publicClient.readContract.mockResolvedValue([100n, 90n, true, false, true])
+    const {EvmService} = await import('./evm-service')
+
+    await expect(
+      EvmService.getInstance().getTokenInfo(
+        '0xa98706106f7710d743186031be2245f33acea106',
+        '0xdac866a3796f85cb84a914d98faec052e3b5596d',
+      ),
+    ).resolves.toEqual({
+      minAmount: 100n,
+      redeemDelay: 90,
+      bridgeable: true,
+      redeemable: false,
+      owned: true,
+    })
+  })
+})
+
 describe('tssSignatureToHex', () => {
   it('converts a 65-byte base64 sig with final byte 0x00 → 0x…1b', async () => {
     const {tssSignatureToHex} = await import('./evm-service')
@@ -127,6 +168,18 @@ describe('tssSignatureToHex', () => {
     const expected =
       '0x' + '01'.repeat(32) + '02'.repeat(32) + '1b'
     expect(tssSignatureToHex(b64)).toBe(expected)
+  })
+
+  it('rejects malformed length and recovery bytes', async () => {
+    const {tssSignatureToHex} = await import('./evm-service')
+    expect(() => tssSignatureToHex(Buffer.from(new Uint8Array(64)).toString('base64'))).toThrow(
+      'signature length',
+    )
+    const bytes = new Uint8Array(65)
+    bytes[64] = 2
+    expect(() => tssSignatureToHex(Buffer.from(bytes).toString('base64'))).toThrow(
+      'recovery byte',
+    )
   })
 })
 
@@ -194,7 +247,7 @@ describe('EvmService.getWrapRedeemProgress', () => {
     h.publicClient.readContract
       .mockResolvedValueOnce([100n, '0x0']) // redeemsInfo.blockNumber
       .mockResolvedValueOnce(3n) // estimatedBlockTime
-      .mockResolvedValueOnce([0n, 10, true]) // tokensInfo → redeemDelay=10
+      .mockResolvedValueOnce([0n, 10n, true, true, false]) // tokensInfo → redeemDelay=10
     h.publicClient.getBlockNumber.mockResolvedValue(102n)
     const progress = await EvmService.getInstance().getWrapRedeemProgress(bridge, token, id)
     // remainingBlocks = 10-2+1 = 9; *3 = 27
@@ -203,12 +256,12 @@ describe('EvmService.getWrapRedeemProgress', () => {
 })
 
 describe('selectProvisionalLogIndex', () => {
-  const account = '0xAbC0000000000000000000000000000000000001'
+  const account = '0x52908400098527886E0F7030069857D2E4169EE7'
   const zenon = 'z1qztestrecipient'
 
-  it('empty logs → 0', async () => {
+  it('empty logs → null', async () => {
     const {selectProvisionalLogIndex} = await import('./evm-service')
-    expect(selectProvisionalLogIndex([], account, zenon)).toBe(0)
+    expect(selectProvisionalLogIndex([], account, zenon)).toBeNull()
   })
 
   it('matches from (checksum-insensitive) + exact to, returns that logIndex', async () => {
@@ -216,7 +269,7 @@ describe('selectProvisionalLogIndex', () => {
     const logs = [
       {logIndex: 7, args: {from: account.toLowerCase(), to: zenon}},
     ]
-    expect(selectProvisionalLogIndex(logs, account.toUpperCase(), zenon)).toBe(7)
+    expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(7)
   })
 
   it('multiple logs picks the matching one', async () => {
@@ -229,37 +282,37 @@ describe('selectProvisionalLogIndex', () => {
     expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(3)
   })
 
-  it('no match → first log logIndex', async () => {
+  it('no match → null', async () => {
     const {selectProvisionalLogIndex} = await import('./evm-service')
     const logs = [
       {logIndex: 5, args: {from: account, to: 'z1qsomeoneelse'}},
       {logIndex: 6, args: {from: '0x0000000000000000000000000000000000000099', to: zenon}},
     ]
-    expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(5)
+    expect(selectProvisionalLogIndex(logs, account, zenon)).toBeNull()
   })
 
   it('malformed from does not throw, treated as no-match', async () => {
     const {selectProvisionalLogIndex} = await import('./evm-service')
     const logs = [{logIndex: 9, args: {from: 'not-an-address', to: zenon}}]
     expect(() => selectProvisionalLogIndex(logs, account, zenon)).not.toThrow()
-    expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(9)
+    expect(selectProvisionalLogIndex(logs, account, zenon)).toBeNull()
   })
 
-  it('missing from is guarded (no throw), treated as no-match → first log', async () => {
+  it('missing from is guarded (no throw), treated as no-match → null', async () => {
     const {selectProvisionalLogIndex} = await import('./evm-service')
     const logs = [{logIndex: 4, args: {to: zenon}}]
     expect(() => selectProvisionalLogIndex(logs, account, zenon)).not.toThrow()
-    expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(4)
+    expect(selectProvisionalLogIndex(logs, account, zenon)).toBeNull()
   })
 
   it('matching from but non-matching to is rejected (both must match)', async () => {
     // Same account, but the `to` is a different Zenon recipient than the one we
-    // unwrapped to → must NOT match; falls back to the first log.
+    // unwrapped to → must NOT match.
     const {selectProvisionalLogIndex} = await import('./evm-service')
     const logs = [
       {logIndex: 2, args: {from: account, to: 'z1qdifferentrecipient'}},
     ]
-    expect(selectProvisionalLogIndex(logs, account, zenon)).toBe(2)
+    expect(selectProvisionalLogIndex(logs, account, zenon)).toBeNull()
   })
 })
 
@@ -292,15 +345,72 @@ describe('EvmService.ensureAllowance', () => {
   it('approves and awaits the receipt when allowance < amount', async () => {
     h.walletClient.requestAddresses.mockResolvedValue(['0xOwner000000000000000000000000000000001'])
     h.publicClient.readContract.mockResolvedValue(100n)
+    h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'approve'}})
     h.walletClient.writeContract.mockResolvedValue('0xapprovetx')
-    h.publicClient.waitForTransactionReceipt.mockResolvedValue({})
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success'})
     const {EvmService} = await import('./evm-service')
 
     await EvmService.getInstance().ensureAllowance(token, bridge, 500n)
 
-    expect(h.walletClient.writeContract).toHaveBeenCalledWith(
+    expect(h.publicClient.simulateContract).toHaveBeenCalledWith(
       expect.objectContaining({address: token, functionName: 'approve', args: [bridge, 500n]}),
     )
+    expect(h.walletClient.writeContract).toHaveBeenCalledWith({simulated: 'approve'})
     expect(h.publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({hash: '0xapprovetx'})
+  })
+
+  it('rejects writes when the wallet changed to another chain', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue(['0xOwner000000000000000000000000000000001'])
+    h.walletClient.getChainId.mockResolvedValue(10)
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().ensureAllowance(token, bridge, 500n)).rejects.toThrow(
+      'Please switch MetaMask',
+    )
+    expect(h.publicClient.readContract).not.toHaveBeenCalled()
+  })
+})
+
+describe('EvmService write verification', () => {
+  const bridge = '0xa98706106f7710d743186031be2245f33acea106' as const
+  const token = '0xb2e96a63479c2edd2fd62b382c89d5ca79f572d3' as const
+  const account = '0x52908400098527886E0F7030069857D2E4169EE7' as const
+
+  it('simulates unwrap and preserves a confirmed hash when event recovery is needed', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'unwrap'}})
+    h.walletClient.writeContract.mockResolvedValue('0xunwraptx')
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success', logs: []})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(
+      EvmService.getInstance().unwrap(bridge, token, 100n, 'z1recipient'),
+    ).resolves.toEqual({hash: '0xunwraptx', provisionalLogIndex: -1, eventMatched: false})
+    expect(h.walletClient.writeContract).toHaveBeenCalledWith({simulated: 'unwrap'})
+  })
+
+  it('rejects a reverted unwrap receipt', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'unwrap'}})
+    h.walletClient.writeContract.mockResolvedValue('0xunwraptx')
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'reverted', logs: []})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(
+      EvmService.getInstance().unwrap(bridge, token, 100n, 'z1recipient'),
+    ).rejects.toThrow('Unwrap transaction reverted')
+  })
+
+  it('simulates redeem and returns only after a successful receipt', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'redeem'}})
+    h.walletClient.writeContract.mockResolvedValue('0xredeemtx')
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success'})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(
+      EvmService.getInstance().redeem(bridge, account, token, 100n, 1n, '0x1234'),
+    ).resolves.toBe('0xredeemtx')
+    expect(h.walletClient.writeContract).toHaveBeenCalledWith({simulated: 'redeem'})
   })
 })

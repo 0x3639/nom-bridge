@@ -48,7 +48,7 @@ const canRedeem = computed(() => props.request.status === 'redeemable')
   <Item variant="outline">
     <ItemContent>
       <ItemTitle>
-        {{ formatAmount(props.request.amount, 8) }}
+        {{ formatAmount(props.request.amount, props.request.decimals) }} {{ props.request.symbol }}
         <Badge :variant="badge.variant">{{ badge.label }}</Badge>
       </ItemTitle>
       <ItemDescription>To {{ truncateAddress(props.request.toAddress) }}</ItemDescription>

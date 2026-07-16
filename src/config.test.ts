@@ -1,7 +1,7 @@
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-// config.ts derives its exports at module-eval time, so the MODE-dependent
-// selection (mainnet vs testnet) is exercised via resetModules + dynamic import.
+// config.ts derives its exports at module-eval time, so unsupported modes are
+// exercised via resetModules + dynamic import.
 afterEach(() => {
   vi.unstubAllEnvs()
   vi.resetModules()
@@ -40,21 +40,30 @@ describe('network selection by MODE', () => {
     vi.resetModules()
     const {config, ZENON_CHAIN} = await import('./config')
     expect(config.zenonChainId).toBe(1)
+    expect(config.zenonNetworkId).toBe(1)
     expect(config.evmChainId).toBe(1)
+    expect(config.evmRpcUrls.length).toBeGreaterThan(1)
     expect(ZENON_CHAIN).toBe('zenon:1')
   })
 
-  it('selects testnet (zenonChainId 3, sepolia) when MODE is testnet', async () => {
+  it('fails closed in testnet mode until verified endpoints are configured', async () => {
     vi.stubEnv('MODE', 'testnet')
     vi.resetModules()
-    const {config, ZENON_CHAIN} = await import('./config')
-    expect(config.zenonChainId).toBe(3)
-    expect(config.evmChainId).toBe(11155111)
-    expect(ZENON_CHAIN).toBe('zenon:3')
+    await expect(import('./config')).rejects.toThrow('Testnet mode is disabled')
   })
 
   it('derives ZENON_CHAIN as `zenon:${zenonChainId}`', async () => {
     const {config, ZENON_CHAIN} = await import('./config')
     expect(ZENON_CHAIN).toBe(`zenon:${config.zenonChainId}`)
+  })
+
+  it('pins the deployed bridge and supported token contracts', async () => {
+    const {config} = await import('./config')
+    expect(config.expectedBridgeAddress).toBe('0xa98706106f7710d743186031be2245f33acea106')
+    expect(config.expectedTokenPairs.zts1znnxxxxxxxxxxxxx9z4ulx).toEqual({
+      tokenAddress: '0xb2e96a63479c2edd2fd62b382c89d5ca79f572d3',
+      decimals: 8,
+    })
+    expect(config.expectedTokenPairs.zts17d6yr02kh0r9qr566p7tg6.decimals).toBe(18)
   })
 })

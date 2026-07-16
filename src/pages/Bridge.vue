@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import {computed, onMounted, onUnmounted, ref, watch} from 'vue'
-import {extractNumberDecimals} from 'znn-typescript-sdk'
 import {
   Alert,
   AlertDescription,
@@ -23,12 +22,24 @@ import UnwrapRequestItem from '@/components/UnwrapRequestItem.vue'
 import {useBridge, useEvmWallet, useRequests, useUnwrap, useWrap, useZenonWallet} from '@/core'
 import type {UnwrapRequestView, WrapRequestView} from '@/types'
 import type {Address} from 'viem'
+import {config, FEE_DENOMINATOR} from '@/config'
+import {parseAmount} from '@/core/amount'
+import {formatAmount} from '@/core/composables/utils/formatters'
 
 const toast = useToast()
 
-const {tokenPairs, bridgeAddress, halted, momentumTime, load, refreshHalted} = useBridge()
-const {address: zenonAddress} = useZenonWallet()
-const {account: evmAccount, getTokenBalance} = useEvmWallet()
+const {
+  tokenPairs,
+  bridgeAddress,
+  halted,
+  allowKeyGen,
+  momentumTime,
+  error: bridgeError,
+  load,
+  refresh: refreshBridge,
+} = useBridge()
+const {address: zenonAddress, getTokenBalance: getZenonTokenBalance} = useZenonWallet()
+const {account: evmAccount, chainId: evmChainId, getTokenBalance} = useEvmWallet()
 const {wrap, redeemEvm, isWrapping, error: wrapError} = useWrap()
 const {unwrap: doUnwrap, redeemZenon, isUnwrapping, error: unwrapError} = useUnwrap()
 const {
@@ -37,29 +48,45 @@ const {
   getRawWrapRequest,
   startPolling,
   stopPolling,
-  refresh,
+  refresh: refreshRequests,
+  refreshForAccountChange,
+  pollingError,
 } = useRequests()
 
 const direction = ref<'wrap' | 'unwrap'>('wrap')
 const selectedZts = ref<string | null>(null)
 const amount = ref('')
 const localError = ref<string | null>(null)
+const lastSubmitted = ref<{label: string; url: string} | null>(null)
 
 const selectedPair = computed(() => tokenPairs.value.find(p => p.zts === selectedZts.value) ?? null)
 const evmBalance = ref<bigint | undefined>(undefined)
+const zenonBalance = ref<bigint | undefined>(undefined)
+const sourceBalance = computed(() => direction.value === 'wrap' ? zenonBalance.value : evmBalance.value)
+let balanceRequestId = 0
 
 // Presentational only — derive the two sides of the bridge from `direction`.
 // Wrap moves native ZNN (Zenon) → wrapped wZNN (Ethereum); unwrap reverses it.
-const baseSymbol = computed(() => {
-  const z = selectedPair.value?.zts ?? ''
-  if (z.startsWith('zts1znn')) return 'ZNN'
-  if (z.startsWith('zts1qsr')) return 'QSR'
-  return 'token'
-})
+const baseSymbol = computed(() => selectedPair.value?.symbol ?? 'token')
 const zenonSide = computed(() => ({network: 'Zenon', symbol: baseSymbol.value, accent: 'zenon' as const}))
-const evmSide = computed(() => ({network: 'Ethereum', symbol: `w${baseSymbol.value}`, accent: 'evm' as const}))
+const evmSide = computed(() => ({
+  network: 'Ethereum',
+  symbol: selectedPair.value?.evmSymbol ?? 'token',
+  accent: 'evm' as const,
+}))
 const fromSide = computed(() => (direction.value === 'wrap' ? zenonSide.value : evmSide.value))
 const toSide = computed(() => (direction.value === 'wrap' ? evmSide.value : zenonSide.value))
+const destinationAmount = computed(() => {
+  const pair = selectedPair.value
+  if (!pair || !amount.value) return '0.00'
+  try {
+    const base = parseAmount(amount.value, pair.decimals)
+    const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
+    return formatAmount(base - fee, pair.decimals)
+  } catch {
+    return '0.00'
+  }
+})
 
 function swapDirection(): void {
   direction.value = direction.value === 'wrap' ? 'unwrap' : 'wrap'
@@ -67,42 +94,57 @@ function swapDirection(): void {
 
 const canSubmit = computed<boolean>(() => {
   if (!selectedPair.value || !amount.value) return false
-  if (halted.value) return false
+  if (halted.value || allowKeyGen.value) return false
+  if (evmChainId.value !== config.evmChainId) return false
   let base: bigint
   try {
-    base = BigInt(extractNumberDecimals(amount.value, selectedPair.value.decimals).toString())
+    base = parseAmount(amount.value, selectedPair.value.decimals)
   } catch {
     return false
   }
-  if (base < selectedPair.value.minAmount) return false
 
   if (direction.value === 'unwrap') {
+    if (!selectedPair.value.unwrapEnabled || base < selectedPair.value.unwrapMinAmount) return false
     if (!evmAccount.value || !zenonAddress.value || isUnwrapping.value) return false
     if (evmBalance.value === undefined || base > evmBalance.value) return false
     return true
   }
 
   // wrap
+  if (!selectedPair.value.wrapEnabled || base < selectedPair.value.wrapMinAmount) return false
   if (!zenonAddress.value || !evmAccount.value || isWrapping.value) return false
-  if (evmBalance.value !== undefined && base > evmBalance.value) return false
+  if (zenonBalance.value === undefined || base > zenonBalance.value) return false
   return true
 })
 
-// Live wZNN balance for the unwrap direction; gates submit. For wrap it stays
-// undefined (wrap balance gating is Zenon-side, out of scope here).
-watch(
-  [direction, selectedZts, evmAccount],
-  async () => {
+async function refreshBalances(): Promise<void> {
+    const requestId = ++balanceRequestId
     if (direction.value === 'unwrap' && evmAccount.value && selectedPair.value) {
       try {
-        evmBalance.value = await getTokenBalance(selectedPair.value.tokenAddress as Address)
+        const balance = await getTokenBalance(selectedPair.value.tokenAddress as Address)
+        if (requestId === balanceRequestId) evmBalance.value = balance
       } catch {
-        evmBalance.value = undefined
+        if (requestId === balanceRequestId) evmBalance.value = undefined
       }
     } else {
       evmBalance.value = undefined
     }
-  },
+    if (direction.value === 'wrap' && zenonAddress.value && selectedPair.value) {
+      try {
+        const balance = await getZenonTokenBalance(selectedPair.value.zts)
+        if (requestId === balanceRequestId) zenonBalance.value = balance
+      } catch {
+        if (requestId === balanceRequestId) zenonBalance.value = undefined
+      }
+    } else {
+      zenonBalance.value = undefined
+    }
+}
+
+// The source-chain balance is an execution gate, not just a display value.
+watch(
+  [direction, selectedZts, evmAccount, zenonAddress],
+  refreshBalances,
   {immediate: true},
 )
 
@@ -114,20 +156,40 @@ watch(
   {immediate: true},
 )
 
+watch([evmAccount, zenonAddress], () => {
+  void refreshForAccountChange().catch(() => undefined)
+})
+
 async function onSubmit(): Promise<void> {
   localError.value = null
+  lastSubmitted.value = null
   if (!selectedPair.value || !evmAccount.value) return
   if (direction.value === 'unwrap') return onUnwrapSubmit()
+  const zts = selectedPair.value.zts
   try {
-    await refreshHalted()
-    if (halted.value) {
-      localError.value = 'The bridge is currently halted.'
+    await refreshBridge()
+    if (halted.value || allowKeyGen.value) {
+      localError.value = halted.value
+        ? 'The bridge is currently halted.'
+        : 'Transfers are disabled while bridge key generation is enabled.'
       return
     }
-    await wrap(evmAccount.value, amount.value, selectedPair.value.decimals, selectedPair.value.zts)
+    const pair = tokenPairs.value.find(candidate => candidate.zts === zts)
+    if (!pair || !pair.wrapEnabled) throw new Error('Wrapping is disabled for this token pair')
+    const base = parseAmount(amount.value, pair.decimals)
+    if (base < pair.wrapMinAmount) throw new Error('Amount is below the current wrap minimum')
+    const hash = await wrap(
+      evmAccount.value,
+      amount.value,
+      pair.decimals,
+      pair.zts,
+      pair.symbol,
+    )
     toast.show('Wrap submitted', 'success')
+    lastSubmitted.value = {label: 'View Zenon transaction', url: config.zenonExplorerTxUrl + hash}
     amount.value = ''
-    await refresh()
+    if (zenonBalance.value !== undefined) zenonBalance.value -= base
+    await refreshRequestsSafely()
   } catch (e) {
     localError.value = e instanceof Error ? e.message : 'Failed to submit wrap'
     toast.show(localError.value, 'error')
@@ -136,26 +198,38 @@ async function onSubmit(): Promise<void> {
 
 async function onUnwrapSubmit(): Promise<void> {
   localError.value = null
-  const pair = selectedPair.value
   const bridge = bridgeAddress.value
-  if (!pair || !zenonAddress.value || !bridge) return
+  const zts = selectedPair.value?.zts
+  if (!zts || !zenonAddress.value || !bridge) return
   try {
-    await refreshHalted()
-    if (halted.value) {
-      localError.value = 'The bridge is currently halted.'
+    await refreshBridge()
+    if (halted.value || allowKeyGen.value) {
+      localError.value = halted.value
+        ? 'The bridge is currently halted.'
+        : 'Transfers are disabled while bridge key generation is enabled.'
       return
     }
-    const base = BigInt(extractNumberDecimals(amount.value, pair.decimals).toString())
-    await doUnwrap(
+    const pair = tokenPairs.value.find(candidate => candidate.zts === zts)
+    if (!pair || !pair.unwrapEnabled) throw new Error('Unwrapping is disabled for this token pair')
+    const base = parseAmount(amount.value, pair.decimals)
+    if (base < pair.unwrapMinAmount) throw new Error('Amount is below the current unwrap minimum')
+    const {hash, eventMatched} = await doUnwrap(
       pair.tokenAddress as Address,
       base,
       zenonAddress.value,
       bridge as Address,
       pair.zts,
+      pair.decimals,
+      pair.symbol,
     )
     toast.show('Unwrap submitted', 'success')
+    if (!eventMatched) {
+      toast.show('Transaction confirmed; waiting for the Zenon node to recover its event index.', 'info')
+    }
+    lastSubmitted.value = {label: 'View Ethereum transaction', url: config.evmExplorerTxUrl + hash}
     amount.value = ''
-    await refresh()
+    await refreshBalances()
+    await refreshRequestsSafely()
   } catch (e) {
     localError.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
     toast.show(localError.value, 'error')
@@ -165,9 +239,10 @@ async function onUnwrapSubmit(): Promise<void> {
 async function onUnwrapRedeem(view: UnwrapRequestView): Promise<void> {
   localError.value = null
   try {
-    await redeemZenon(view)
+    const hash = await redeemZenon(view)
     toast.show('Redeem submitted', 'success')
-    await refresh()
+    lastSubmitted.value = {label: 'View Zenon transaction', url: config.zenonExplorerTxUrl + hash}
+    await refreshRequestsSafely()
   } catch (e) {
     localError.value = e instanceof Error ? e.message : 'Failed to redeem'
     toast.show(localError.value, 'error')
@@ -180,16 +255,27 @@ async function onRedeem(view: WrapRequestView): Promise<void> {
   const bridge = bridgeAddress.value
   if (!raw || !bridge) return
   try {
-    await redeemEvm(raw, bridge as `0x${string}`)
+    const hash = await redeemEvm(raw, bridge as `0x${string}`)
     toast.show('Redeem submitted', 'success')
-    await refresh()
+    lastSubmitted.value = {label: 'View Ethereum transaction', url: config.evmExplorerTxUrl + hash}
+    await refreshRequestsSafely()
   } catch (e) {
     localError.value = e instanceof Error ? e.message : 'Failed to redeem'
     toast.show(localError.value, 'error')
   }
 }
 
-const displayError = computed(() => localError.value ?? wrapError.value ?? unwrapError.value)
+async function refreshRequestsSafely(): Promise<void> {
+  try {
+    await refreshRequests()
+  } catch {
+    toast.show('Transaction submitted; request status will retry automatically.', 'info')
+  }
+}
+
+const displayError = computed(
+  () => localError.value ?? bridgeError.value ?? wrapError.value ?? unwrapError.value,
+)
 
 onMounted(async () => {
   try {
@@ -202,6 +288,7 @@ onMounted(async () => {
     () => bridgeAddress.value,
     () => zenonAddress.value,
     () => momentumTime.value,
+    () => tokenPairs.value,
   )
 })
 
@@ -214,12 +301,27 @@ onUnmounted(() => {
   <Card>
     <CardHeader>
       <CardTitle>Bridge</CardTitle>
-      <CardDescription>Move ZNN between Zenon and EVM.</CardDescription>
+      <CardDescription>Move supported tokens between Zenon and Ethereum.</CardDescription>
     </CardHeader>
     <CardContent class="space-y-4">
       <Alert v-if="halted" variant="destructive">
         <AlertTitle>Bridge halted</AlertTitle>
         <AlertDescription>Wrapping and unwrapping are temporarily disabled.</AlertDescription>
+      </Alert>
+
+      <Alert v-else-if="allowKeyGen" variant="destructive">
+        <AlertTitle>Bridge key generation</AlertTitle>
+        <AlertDescription>
+          Transfers are disabled during key generation.
+          <a :href="config.bridgeStatusUrl" target="_blank" rel="noopener noreferrer" class="underline">
+            Check bridge status
+          </a>.
+        </AlertDescription>
+      </Alert>
+
+      <Alert v-if="evmAccount && evmChainId !== config.evmChainId" variant="destructive">
+        <AlertTitle>Wrong Ethereum network</AlertTitle>
+        <AlertDescription>Switch your wallet to Ethereum Mainnet before continuing.</AlertDescription>
       </Alert>
 
       <div class="space-y-2">
@@ -237,9 +339,9 @@ onUnmounted(() => {
               v-if="selectedPair"
               v-model="amount"
               :decimals="selectedPair.decimals"
-              :balance="evmBalance"
+              :balance="sourceBalance"
               :fee-percentage="selectedPair.feePercentage"
-              :min-amount="selectedPair.minAmount"
+              :min-amount="direction === 'wrap' ? selectedPair.wrapMinAmount : selectedPair.unwrapMinAmount"
               :disabled="isWrapping || isUnwrapping"
             />
           </div>
@@ -267,7 +369,7 @@ onUnmounted(() => {
         >
           <div class="flex items-baseline justify-between gap-2">
             <span class="font-mono text-2xl tabular-nums text-muted-foreground">
-              ≈ {{ amount || '0.00' }}
+              ≈ {{ destinationAmount }}
             </span>
             <span class="font-mono text-xs text-muted-foreground">minus bridge fee</span>
           </div>
@@ -283,6 +385,21 @@ onUnmounted(() => {
         <AlertTitle>Error</AlertTitle>
         <AlertDescription>{{ displayError }}</AlertDescription>
       </Alert>
+
+      <Alert v-else-if="pollingError">
+        <AlertTitle>Request status unavailable</AlertTitle>
+        <AlertDescription>{{ pollingError }}</AlertDescription>
+      </Alert>
+
+      <a
+        v-if="lastSubmitted"
+        :href="lastSubmitted.url"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="block text-center text-sm text-primary underline"
+      >
+        {{ lastSubmitted.label }}
+      </a>
 
       <RequestList
         v-if="direction === 'wrap'"

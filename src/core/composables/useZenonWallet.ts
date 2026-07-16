@@ -1,5 +1,6 @@
 import {ref} from 'vue'
 import {ZenonWalletService} from '../zenon-wallet-service'
+import {BridgeService} from '../bridge-service'
 import type {AccountBlockTemplate} from 'znn-typescript-sdk'
 
 const address = ref<string | null>(null)
@@ -9,6 +10,9 @@ const error = ref<string | null>(null)
 const service = ZenonWalletService.getInstance()
 service.onDisconnect = () => {
   address.value = null
+}
+service.onInfoChange = info => {
+  address.value = info.address
 }
 
 export function useZenonWallet() {
@@ -37,5 +41,10 @@ export function useZenonWallet() {
     address.value = null
   }
 
-  return {address, isConnecting, error, connect, send, disconnect}
+  async function getTokenBalance(zts: string): Promise<bigint> {
+    if (!address.value) return 0n
+    return BridgeService.getInstance().getTokenBalance(address.value, zts)
+  }
+
+  return {address, isConnecting, error, connect, send, disconnect, getTokenBalance}
 }

@@ -47,12 +47,18 @@ describe('useWrap.wrap', () => {
     h.trackWrap.mockResolvedValue(undefined)
     const {useWrap} = await import('./useWrap')
 
-    const id = await useWrap().wrap('0xRecipient', '1.5', 8, 'zts1znn')
+    const id = await useWrap().wrap('0xRecipient', '1.5', 8, 'zts1znn', 'ZNN')
 
     expect(h.buildWrapBlock).toHaveBeenCalledWith('0xRecipient', '1.5', 8, 'zts1znn')
     expect(h.send).toHaveBeenCalledWith({__block: true})
     expect(h.trackWrap).toHaveBeenCalledWith(
-      expect.objectContaining({id: 'wraphash', evmToAddress: '0xRecipient', amount: '150000000'}),
+      expect.objectContaining({
+        id: 'wraphash',
+        evmToAddress: '0xRecipient',
+        amount: '150000000',
+        decimals: 8,
+        symbol: 'ZNN',
+      }),
     )
     expect(id).toBe('wraphash')
   })

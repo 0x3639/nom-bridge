@@ -20,7 +20,15 @@ beforeEach(() => {
 })
 
 function wrapFixture(id: string) {
-  return {id, zts: 'zts1znn', amount: '100000000', evmToAddress: '0xRecipient', createdAt: 1}
+  return {
+    id,
+    zts: 'zts1znn',
+    amount: '100000000',
+    decimals: 8,
+    symbol: 'ZNN',
+    evmToAddress: '0xRecipient',
+    createdAt: 1,
+  }
 }
 
 describe('requestStore', () => {
@@ -30,6 +38,7 @@ describe('requestStore', () => {
     const all = await requestStore.getAll()
     expect(all).toHaveLength(1)
     expect(all[0]).toMatchObject({kind: 'wrap', id: 'a', evmToAddress: '0xRecipient'})
+    expect(all[0]).toMatchObject({evmChainId: 1, zenonChainId: 1})
   })
 
   it('loads from storage only once across repeated reads', async () => {
@@ -44,7 +53,7 @@ describe('requestStore', () => {
     const {requestStore} = await import('./request-store')
     await requestStore.trackWrap(wrapFixture('a'))
     expect(h.set).toHaveBeenCalledWith(
-      'nom-bridge:requests',
+      'nom-bridge:requests:v2',
       expect.arrayContaining([expect.objectContaining({id: 'a'})]),
     )
   })

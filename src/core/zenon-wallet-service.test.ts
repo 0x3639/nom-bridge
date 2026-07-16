@@ -24,12 +24,16 @@ const h = vi.hoisted(() => {
     modal,
     initSpy: vi.fn(async () => client),
     fromJson: vi.fn((json: unknown) => ({fromJson: json})),
+    addressParse: vi.fn((address: string) => address),
   }
 })
 
 vi.mock('@walletconnect/sign-client', () => ({SignClient: {init: h.initSpy}}))
 vi.mock('@walletconnect/modal', () => ({WalletConnectModal: vi.fn(() => h.modal)}))
-vi.mock('znn-typescript-sdk', () => ({AccountBlockTemplate: {fromJson: h.fromJson}}))
+vi.mock('znn-typescript-sdk', () => ({
+  AccountBlockTemplate: {fromJson: h.fromJson},
+  Address: {parse: h.addressParse},
+}))
 
 const future = () => Math.floor(Date.now() / 1000) + 3600
 const past = () => Math.floor(Date.now() / 1000) - 3600
@@ -50,6 +54,7 @@ beforeEach(() => {
   h.modal.openModal.mockClear()
   h.modal.closeModal.mockClear()
   h.fromJson.mockClear()
+  h.addressParse.mockClear()
   vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}})
 })
 
@@ -145,6 +150,30 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
   })
 })
 
+describe('ZenonWalletService wallet validation', () => {
+  it('rejects a wallet connected to the wrong Zenon chain', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockResolvedValue({address: 'z1addr', chainId: 3})
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'expected 1',
+    )
+  })
+
+  it('rejects an invalid Zenon address', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.addressParse.mockImplementationOnce(() => {
+      throw new Error('invalid')
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'invalid address',
+    )
+  })
+})
+
 describe('ZenonWalletService request envelope', () => {
   it('always sends topic + chainId + method/params on every request', async () => {
     h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
@@ -175,19 +204,20 @@ describe('ZenonWalletService.send', () => {
     h.client.request.mockReset()
     h.client.request
       .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
       .mockResolvedValueOnce({published: true}) // znn_send result
     const {ZenonWalletService} = await import('./zenon-wallet-service')
     const service = ZenonWalletService.getInstance()
     await service.connect()
 
     const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
-    const result = await service.send('z1from', block as never)
+    const result = await service.send('z1addr', block as never)
 
     expect(block.toJson).toHaveBeenCalled()
     expect(h.client.request).toHaveBeenLastCalledWith({
       topic: 'topic-A',
       chainId: ZENON_CHAIN,
-      request: {method: 'znn_send', params: {fromAddress: 'z1from', accountBlock: {cell: 'serialized'}}},
+      request: {method: 'znn_send', params: {fromAddress: 'z1addr', accountBlock: {cell: 'serialized'}}},
     })
     expect(h.fromJson).toHaveBeenCalledWith({published: true})
     expect(result).toEqual({fromJson: {published: true}})
@@ -241,5 +271,23 @@ describe('ZenonWalletService session lifecycle events', () => {
     h.onHandlers.session_expire()
 
     expect(onDisconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes authoritative wallet info on an addressChange session event', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1})
+      .mockResolvedValueOnce({address: 'z1new', chainId: 1})
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    const onInfoChange = vi.fn()
+    service.onInfoChange = onInfoChange
+    await service.connect()
+
+    h.onHandlers.session_event({
+      topic: 'topic-A',
+      params: {event: {name: 'addressChange', data: 'z1new'}},
+    })
+    await vi.waitFor(() => expect(onInfoChange).toHaveBeenCalledWith({address: 'z1new', chainId: 1}))
   })
 })
