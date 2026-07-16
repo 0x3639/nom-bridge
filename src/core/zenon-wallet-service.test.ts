@@ -47,6 +47,7 @@ const zenonSession = (topic: string, expiry: number) => ({
 })
 
 beforeEach(() => {
+  vi.stubEnv('VITE_WC_PROJECT_ID', 'a'.repeat(32))
   vi.resetModules()
   Object.keys(h.onHandlers).forEach(k => delete h.onHandlers[k])
   h.client.on.mockClear()
@@ -61,11 +62,13 @@ beforeEach(() => {
   h.modalCtor.mockClear()
   h.fromJson.mockClear()
   h.addressParse.mockClear()
+  h.initSpy.mockClear()
   vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}})
 })
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
 })
 
 describe('ZenonWalletService.connect — session reuse', () => {
@@ -495,5 +498,59 @@ describe('ZenonWalletService retry + Syrius error map', () => {
 
     await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow()
     expect(h.client.request).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('ZenonWalletService placeholder guard and restore', () => {
+  it('connect() fails fast with setup instructions when the project id is the placeholder', async () => {
+    vi.stubEnv('VITE_WC_PROJECT_ID', 'REPLACE_ME_WC_PROJECT_ID')
+    vi.resetModules()
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'set VITE_WC_PROJECT_ID in .env',
+    )
+    expect(h.initSpy).not.toHaveBeenCalled()
+  })
+
+  it('restore() returns null when unconfigured, without initializing the client', async () => {
+    vi.stubEnv('VITE_WC_PROJECT_ID', 'REPLACE_ME_WC_PROJECT_ID')
+    vi.resetModules()
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().restore()).resolves.toBeNull()
+    expect(h.initSpy).not.toHaveBeenCalled()
+  })
+
+  it('restore() returns null when there is no live session', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().restore()).resolves.toBeNull()
+    expect(h.client.connect).not.toHaveBeenCalled()
+  })
+
+  it('restore() adopts a live session and returns wallet info', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    const info = await ZenonWalletService.getInstance().restore()
+
+    expect(info).toEqual({address: 'z1addr', chainId: 1})
+    expect(h.client.connect).not.toHaveBeenCalled()
+    expect(h.modal.openModal).not.toHaveBeenCalled()
+  })
+
+  it('restore() swallows znn_info failures and returns null', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockRejectedValue(new Error('node unreachable'))
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.maxAttempts = 1
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+
+    await expect(service.restore()).resolves.toBeNull()
+    // the dead session was dropped: nothing to request on afterwards
+    await expect(service.getInfo()).rejects.toThrow('No active Zenon session')
   })
 })

@@ -10,6 +10,10 @@ const ZENON_NAMESPACE = {
   chains: [ZENON_CHAIN],
 }
 
+function isWcConfigured(): boolean {
+  return Boolean(WC_PROJECT_ID) && WC_PROJECT_ID !== 'REPLACE_ME_WC_PROJECT_ID'
+}
+
 export interface ZenonWalletInfo {
   address: string
   chainId: number
@@ -58,8 +62,28 @@ export class ZenonWalletService {
   }
 
   async connect(): Promise<ZenonWalletInfo> {
+    if (!isWcConfigured()) {
+      throw new Error('WalletConnect is not configured — set VITE_WC_PROJECT_ID in .env (see .env.example)')
+    }
     await this.ensureSession()
     return this.getInfo()
+  }
+
+  // Non-interactive session restore for app startup: adopt a still-live
+  // session so a page refresh doesn't show "disconnected". Never opens the
+  // modal and never throws — absence of a session is a normal outcome.
+  async restore(): Promise<ZenonWalletInfo | null> {
+    if (!isWcConfigured()) return null
+    try {
+      const client = await this.getClient()
+      const existing = this.findLiveZenonSession(client)
+      if (!existing) return null
+      this.session = existing
+      return await this.getInfo()
+    } catch {
+      this.session = null
+      return null
+    }
   }
 
   private findLiveZenonSession(client: SignClientInstance): SessionTypes.Struct | null {
