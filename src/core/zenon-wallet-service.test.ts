@@ -120,6 +120,8 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
       uri: 'wc:deadbeef',
       approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
     })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
 
     await ZenonWalletService.getInstance().connect()
@@ -158,6 +160,8 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
       uri: 'wc:deadbeef',
       approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
     })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
 
     await ZenonWalletService.getInstance().connect()
@@ -179,6 +183,8 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
       uri: 'wc:seam',
       approval: vi.fn().mockResolvedValue(zenonSession('topic-seam', future())),
     })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
     const service = ZenonWalletService.getInstance()
     const seen: string[] = []
@@ -331,5 +337,45 @@ describe('ZenonWalletService session lifecycle events', () => {
       params: {event: {name: 'addressChange', data: 'z1new'}},
     })
     await vi.waitFor(() => expect(onInfoChange).toHaveBeenCalledWith({address: 'z1new', chainId: 1}))
+  })
+})
+
+describe('ZenonWalletService.connect — post-approval settle', () => {
+  it('re-scans the session store after approval and prefers the store copy', async () => {
+    // First scan (reuse check): nothing. Post-approval scan: the store now has
+    // the real session under a different topic than approval() returned.
+    h.client.session.getAll
+      .mockReturnValueOnce([])
+      .mockReturnValue([zenonSession('topic-store', future())])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:settle',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-approval', future())),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-store'}),
+    )
+  })
+
+  it('falls back to the approval() session when the re-scan finds nothing', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:settle2',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-approval', future())),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-approval'}),
+    )
   })
 })

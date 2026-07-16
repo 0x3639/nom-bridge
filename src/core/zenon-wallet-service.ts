@@ -2,6 +2,7 @@ import {SignClient} from '@walletconnect/sign-client'
 import type {SessionTypes} from '@walletconnect/types'
 import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
 import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
+import {delay, WC_TIMING} from './wc-reliability'
 
 const ZENON_NAMESPACE = {
   methods: ['znn_info', 'znn_sign', 'znn_send'],
@@ -105,7 +106,11 @@ export class ZenonWalletService {
           await modal.openModal({uri})
         }
       }
-      this.session = await approval()
+      const approved = await approval()
+      // The SignClient session store lags behind approval(); give it a moment,
+      // then prefer the store's copy of the newest live zenon session.
+      await delay(WC_TIMING.settleMs)
+      this.session = this.findLiveZenonSession(client) ?? approved
     } catch (e) {
       throw mapWcError(e)
     } finally {
