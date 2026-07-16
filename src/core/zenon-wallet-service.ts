@@ -2,7 +2,7 @@ import {SignClient} from '@walletconnect/sign-client'
 import type {SessionTypes} from '@walletconnect/types'
 import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
 import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
-import {delay, WC_TIMING, withTimeout} from './wc-reliability'
+import {classifyWalletError, delay, WC_TIMING, withTimeout} from './wc-reliability'
 
 const ZENON_NAMESPACE = {
   methods: ['znn_info', 'znn_sign', 'znn_send'],
@@ -119,7 +119,7 @@ export class ZenonWalletService {
   }
 
   async getInfo(): Promise<ZenonWalletInfo> {
-    const info = await this.request<ZenonWalletInfo>('znn_info', undefined)
+    const info = await this.requestWithRetry<ZenonWalletInfo>('znn_info', undefined)
     return validateZenonWalletInfo(info)
   }
 
@@ -129,7 +129,7 @@ export class ZenonWalletService {
     if (info.address !== fromAddress) {
       throw new Error('Zenon wallet address changed. Review the recipient and try again.')
     }
-    const result = await this.request<unknown>('znn_send', {
+    const result = await this.requestWithRetry<unknown>('znn_send', {
       fromAddress,
       accountBlock: block.toJson(),
     })
@@ -162,19 +162,43 @@ export class ZenonWalletService {
     const client = await this.getClient()
     if (!this.session) throw new Error('No active Zenon session')
     await this.ensureRelayConnected(client)
-    try {
-      return await withTimeout(
-        client.request<T>({
-          topic: this.session.topic,
-          chainId: ZENON_CHAIN,
-          request: {method, params},
-        }),
-        WC_TIMING.requestTimeoutMs,
-        `Syrius request (${method})`,
-      )
-    } catch (e) {
-      throw mapWcError(e)
+    return withTimeout(
+      client.request<T>({
+        topic: this.session.topic,
+        chainId: ZENON_CHAIN,
+        request: {method, params},
+      }),
+      WC_TIMING.requestTimeoutMs,
+      `Syrius request (${method})`,
+    )
+  }
+
+  private async requestWithRetry<T>(method: string, params: unknown): Promise<T> {
+    let lastError: unknown = null
+    for (let attempt = 1; attempt <= WC_TIMING.maxAttempts; attempt++) {
+      try {
+        return await this.request<T>(method, params)
+      } catch (e) {
+        lastError = e
+        switch (classifyWalletError(e)) {
+          case 'locked':
+            throw new Error('Your wallet is locked — please unlock Syrius')
+          case 'rejected':
+            throw new Error('Request rejected in the wallet')
+          case 'reconnect':
+            // Known Syrius desync ("Bad state: No element"): drop the session
+            // and re-acquire before the next attempt.
+            this.session = null
+            await this.ensureSession()
+            break
+          case 'retry':
+            break
+          case 'fatal':
+            throw mapWcError(e)
+        }
+      }
     }
+    throw mapWcError(lastError)
   }
 
   private clearSession(): void {

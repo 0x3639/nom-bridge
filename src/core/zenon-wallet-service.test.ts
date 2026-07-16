@@ -434,3 +434,66 @@ describe('ZenonWalletService relay guard and timeouts', () => {
     expect(h.modal.closeModal).toHaveBeenCalled()
   })
 })
+
+describe('ZenonWalletService retry + Syrius error map', () => {
+  const wcError = (code: number, message: string) => Object.assign(new Error(message), {code})
+
+  it('surfaces wallet-locked immediately without retrying', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockRejectedValue(wcError(9000, 'Wallet is locked'))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'Your wallet is locked — please unlock Syrius',
+    )
+    expect(h.client.request).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces rejection immediately without retrying', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockRejectedValue(wcError(5000, 'User rejected'))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
+      'Request rejected in the wallet',
+    )
+    expect(h.client.request).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries after "No matching key" and succeeds', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request
+      .mockRejectedValueOnce(wcError(-32602, 'No matching key. session topic doesn\'t exist'))
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1})
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    const info = await ZenonWalletService.getInstance().connect()
+
+    expect(info.address).toBe('z1addr')
+    expect(h.client.request).toHaveBeenCalledTimes(2)
+  })
+
+  it('re-acquires the session after "Bad state: No element" and retries', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request
+      .mockRejectedValueOnce(wcError(-32602, 'Bad state: No element'))
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1})
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    const info = await ZenonWalletService.getInstance().connect()
+
+    expect(info.address).toBe('z1addr')
+    // reuse-scan on connect + re-acquire scan after the bad-state error
+    expect(h.client.session.getAll.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(h.client.request).toHaveBeenCalledTimes(2)
+  })
+
+  it('gives up after maxAttempts retryable failures', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockRejectedValue(wcError(-32602, 'No matching key. nope'))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow()
+    expect(h.client.request).toHaveBeenCalledTimes(3)
+  })
+})
