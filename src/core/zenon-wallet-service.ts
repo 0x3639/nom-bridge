@@ -1,5 +1,4 @@
 import {SignClient} from '@walletconnect/sign-client'
-import {WalletConnectModal} from '@walletconnect/modal'
 import type {SessionTypes} from '@walletconnect/types'
 import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
 import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
@@ -24,6 +23,9 @@ export class ZenonWalletService {
   private session: SessionTypes.Struct | null = null
   onDisconnect: (() => void) | null = null
   onInfoChange: ((info: ZenonWalletInfo) => void) | null = null
+  // When set, fresh pairings hand the URI to this callback instead of opening
+  // the WalletConnect modal (used by the integration test harness).
+  onPairingUri: ((uri: string) => void) | null = null
 
   static getInstance(): ZenonWalletService {
     if (!ZenonWalletService.instance) {
@@ -55,34 +57,59 @@ export class ZenonWalletService {
   }
 
   async connect(): Promise<ZenonWalletInfo> {
-    const client = await this.getClient()
+    await this.ensureSession()
+    return this.getInfo()
+  }
+
+  private findLiveZenonSession(client: SignClientInstance): SessionTypes.Struct | null {
     // findLast over live zenon sessions (manual reverse scan — `Array.findLast`
     // needs lib ES2023, but this project targets ES2020).
     const sessions = client.session.getAll()
-    let existing: SessionTypes.Struct | undefined
     for (let i = sessions.length - 1; i >= 0; i--) {
       const s = sessions[i]
-      if (s.namespaces.zenon && s.expiry * 1000 > Date.now()) {
-        existing = s
-        break
-      }
+      if (s.namespaces.zenon && s.expiry * 1000 > Date.now()) return s
     }
+    return null
+  }
+
+  private async ensureSession(): Promise<void> {
+    const client = await this.getClient()
+    const existing = this.findLiveZenonSession(client)
     if (existing) {
       this.session = existing
-      return this.getInfo()
+      return
     }
-    const modal = new WalletConnectModal({projectId: WC_PROJECT_ID, chains: [ZENON_CHAIN]})
+    let modal: {openModal: (opts: {uri: string}) => Promise<unknown>; closeModal: () => void} | null = null
     try {
       const {uri, approval} = await client.connect({
         requiredNamespaces: {zenon: ZENON_NAMESPACE},
       })
-      if (uri) await modal.openModal({uri})
+      if (uri) {
+        if (this.onPairingUri) {
+          this.onPairingUri(uri)
+        } else {
+          const {WalletConnectModal} = await import('@walletconnect/modal')
+          modal = new WalletConnectModal({
+            projectId: WC_PROJECT_ID,
+            chains: [ZENON_CHAIN],
+            enableExplorer: false, // the WC explorer can never list Syrius
+            mobileWallets: [],
+            desktopWallets: [
+              {
+                id: 'syrius',
+                name: 'Syrius',
+                links: {native: 'syrius:', universal: 'https://zenon.network'},
+              },
+            ],
+          })
+          await modal.openModal({uri})
+        }
+      }
       this.session = await approval()
-      return this.getInfo()
     } catch (e) {
       throw mapWcError(e)
     } finally {
-      modal.closeModal()
+      modal?.closeModal()
     }
   }
 

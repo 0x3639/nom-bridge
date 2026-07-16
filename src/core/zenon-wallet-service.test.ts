@@ -18,10 +18,12 @@ const h = vi.hoisted(() => {
     disconnect: vi.fn().mockResolvedValue(undefined),
   }
   const modal = {openModal: vi.fn().mockResolvedValue(undefined), closeModal: vi.fn()}
+  const modalCtor = vi.fn(() => modal)
   return {
     onHandlers,
     client,
     modal,
+    modalCtor,
     initSpy: vi.fn(async () => client),
     fromJson: vi.fn((json: unknown) => ({fromJson: json})),
     addressParse: vi.fn((address: string) => address),
@@ -29,7 +31,7 @@ const h = vi.hoisted(() => {
 })
 
 vi.mock('@walletconnect/sign-client', () => ({SignClient: {init: h.initSpy}}))
-vi.mock('@walletconnect/modal', () => ({WalletConnectModal: vi.fn(() => h.modal)}))
+vi.mock('@walletconnect/modal', () => ({WalletConnectModal: h.modalCtor}))
 vi.mock('znn-typescript-sdk', () => ({
   AccountBlockTemplate: {fromJson: h.fromJson},
   Address: {parse: h.addressParse},
@@ -53,6 +55,7 @@ beforeEach(() => {
   h.client.disconnect.mockClear()
   h.modal.openModal.mockClear()
   h.modal.closeModal.mockClear()
+  h.modalCtor.mockClear()
   h.fromJson.mockClear()
   h.addressParse.mockClear()
   vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}})
@@ -147,6 +150,45 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
       'Request rejected in the wallet',
     )
     expect(h.modal.closeModal).toHaveBeenCalled()
+  })
+
+  it('configures the modal for Syrius: explorer off, syrius desktop deep-link', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:deadbeef',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect()
+
+    expect(h.modalCtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enableExplorer: false,
+        mobileWallets: [],
+        desktopWallets: [
+          expect.objectContaining({id: 'syrius', name: 'Syrius', links: expect.objectContaining({native: 'syrius:'})}),
+        ],
+      }),
+    )
+  })
+
+  it('hands the uri to onPairingUri and skips the modal entirely when the seam is set', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:seam',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-seam', future())),
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    const seen: string[] = []
+    service.onPairingUri = uri => seen.push(uri)
+
+    await service.connect()
+
+    expect(seen).toEqual(['wc:seam'])
+    expect(h.modalCtor).not.toHaveBeenCalled()
+    expect(h.modal.openModal).not.toHaveBeenCalled()
   })
 })
 
