@@ -1,8 +1,15 @@
 <script setup lang="ts">
-import {Button} from 'nom-ui'
+import {Button, useToast} from 'nom-ui'
 import {useZenonWallet} from '@/core'
 
 const {address, isConnecting, connect, disconnect} = useZenonWallet()
+const toast = useToast()
+
+function onConnect(): void {
+  connect().catch(e => {
+    toast.show(e instanceof Error ? e.message : 'Failed to connect Zenon wallet', 'error')
+  })
+}
 
 function truncate(a: string): string {
   return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a
@@ -10,7 +17,7 @@ function truncate(a: string): string {
 </script>
 
 <template>
-  <Button v-if="!address" :disabled="isConnecting" @click="connect().catch(() => {})">
+  <Button v-if="!address" :disabled="isConnecting" @click="onConnect">
     {{ isConnecting ? 'Connecting…' : 'Connect Zenon' }}
   </Button>
   <Button v-else variant="outline" @click="disconnect().catch(() => {})">
