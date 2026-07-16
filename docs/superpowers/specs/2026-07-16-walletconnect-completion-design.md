@@ -37,9 +37,11 @@ correct against Syrius and MUST NOT change.
 
 Additions:
 
-- **Timeout wrapper** — every `client.request()` and the `approval()` promise
-  race a 30 s timeout. On expiry the user sees a "Request timed out — check
-  Syrius" style error rather than an infinite spinner.
+- **Timeout wrapper** — every `client.request()` races a 30 s timeout. The
+  pairing `approval()` promise instead races a ~5 min timeout (matching the
+  WalletConnect pairing-URI expiry): manually pasting the URI into Syrius
+  routinely takes longer than 30 s. On expiry the user sees a "Request timed
+  out — check Syrius" style error rather than an infinite spinner.
 - **Relay guard** — before each request, if `client.core.relayer.connected` is
   false, reopen the transport (`transportOpen()`) and settle ~2 s. Prevents
   requests sent into a dead relay (e.g. after laptop sleep).
