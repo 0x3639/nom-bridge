@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto'
 // dApp's Address.parse validation passes. Node-only module: used by the CLI
 // harness (scripts/fake-syrius.ts) and the integration test — never bundled
 // into the app.
-export const FAKE_SYRIUS_ADDRESS = 'z1qxemdeddedxplasmaxxxxxxxxxxxxxxxsctrp'
+export const FAKE_SYRIUS_ADDRESS = 'z1qxemdeddedxplasmaxxxxxxxxxxxxxxxxsctrp'
 
 export interface FakeSyriusFlags {
   reject?: boolean
