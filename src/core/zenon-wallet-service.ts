@@ -40,7 +40,15 @@ export class ZenonWalletService {
   }
 
   private async getClient(): Promise<SignClientInstance> {
-    if (!this.clientPromise) this.clientPromise = this.initClient()
+    if (!this.clientPromise) {
+      const promise = this.initClient()
+      this.clientPromise = promise
+      // A failed init must not poison future attempts; clear the memo so the
+      // next call retries (unless a newer attempt already replaced it).
+      promise.catch(() => {
+        if (this.clientPromise === promise) this.clientPromise = null
+      })
+    }
     return this.clientPromise
   }
 
@@ -89,6 +97,10 @@ export class ZenonWalletService {
       // A session established concurrently by connect() (e.g. while this
       // restore() was still in flight) must survive a restore failure — only
       // clear the session if it's still the one restore() itself set.
+      // Not airtight: if that concurrent connect() reused this SAME session
+      // object (e.g. adopted the same live session restore() found), a late
+      // restore failure still clears it out from under connect(). Accepted
+      // residual window — the next reconnect self-heals.
       if (this.session === existing) this.session = null
       console.debug('[wc] restore failed:', e instanceof Error ? e.message : String(e))
       return null

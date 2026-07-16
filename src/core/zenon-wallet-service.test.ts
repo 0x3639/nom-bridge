@@ -642,3 +642,18 @@ describe('ZenonWalletService.getClient concurrency', () => {
     expect(h.client.connect).not.toHaveBeenCalled()
   })
 })
+
+describe('ZenonWalletService.getClient retry after failure', () => {
+  it('retries SignClient.init after a failed attempt instead of caching the rejection', async () => {
+    h.initSpy.mockRejectedValueOnce(new Error('relay unreachable'))
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+
+    await expect(service.connect()).rejects.toThrow('relay unreachable')
+    const info = await service.connect()
+
+    expect(info.address).toBe('z1addr')
+    expect(h.initSpy).toHaveBeenCalledTimes(2)
+  })
+})
