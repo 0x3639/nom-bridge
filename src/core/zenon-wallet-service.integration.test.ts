@@ -53,7 +53,9 @@ describe.skipIf(!configured)('ZenonWalletService ↔ fake Syrius over the live r
     const service = ZenonWalletService.getInstance()
     const onDisconnect = vi.fn()
     service.onDisconnect = onDisconnect
-    service.onPairingUri = uri => void wallet.pair(uri)
+    service.onPairingUri = uri => {
+      wallet.pair(uri).catch(e => console.error('[integration] pair failed:', e))
+    }
 
     // Pairing + approval: only succeeds if the wallet can approve our
     // requiredNamespaces verbatim.

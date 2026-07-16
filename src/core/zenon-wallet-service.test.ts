@@ -276,6 +276,26 @@ describe('ZenonWalletService.send', () => {
     expect(h.fromJson).toHaveBeenCalledWith({published: true})
     expect(result).toEqual({fromJson: {published: true}})
   })
+
+  it('races znn_send against the longer sendTimeoutMs, not requestTimeoutMs', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
+      .mockReturnValueOnce(new Promise(() => {})) // znn_send hangs
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.sendTimeoutMs = 10
+    WC_TIMING.requestTimeoutMs = 10_000
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    await expect(service.send('z1addr', block as never)).rejects.toThrow(
+      'Syrius request (znn_send) timed out',
+    )
+  })
 })
 
 describe('ZenonWalletService.disconnect', () => {
@@ -499,6 +519,26 @@ describe('ZenonWalletService retry + Syrius error map', () => {
     await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow()
     expect(h.client.request).toHaveBeenCalledTimes(3)
   })
+
+  it('does not re-acquire a session after the final retry attempt', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    h.client.session.getAll.mockClear()
+    h.client.connect.mockClear()
+    h.client.request.mockReset()
+    h.client.request.mockRejectedValue(wcError(-32602, 'Bad state: No element'))
+
+    await expect(service.getInfo()).rejects.toThrow('Bad state: No element')
+
+    // 3 attempts total; reconnect (session=null + re-scan) only happens
+    // ahead of attempts 2 and 3 — never after the final (3rd) failure.
+    expect(h.client.request).toHaveBeenCalledTimes(3)
+    expect(h.client.connect).not.toHaveBeenCalled()
+    expect(h.client.session.getAll).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('ZenonWalletService placeholder guard and restore', () => {
@@ -552,5 +592,53 @@ describe('ZenonWalletService placeholder guard and restore', () => {
     await expect(service.restore()).resolves.toBeNull()
     // the dead session was dropped: nothing to request on afterwards
     await expect(service.getInfo()).rejects.toThrow('No active Zenon session')
+  })
+
+  it('does not clobber a session established concurrently by connect() when restore() fails', async () => {
+    let rejectRestoreRequest: (e: unknown) => void = () => {}
+    const pendingRestoreRequest = new Promise((_resolve, reject) => {
+      rejectRestoreRequest = reject
+    })
+    h.client.session.getAll
+      .mockReturnValueOnce([zenonSession('topic-restore', future())]) // restore's scan
+      .mockReturnValue([zenonSession('topic-connect', future())]) // connect's scan
+    h.client.request
+      .mockReturnValueOnce(pendingRestoreRequest) // restore's znn_info: hangs, rejected later
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect's znn_info
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.maxAttempts = 1
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+
+    const restorePromise = service.restore()
+    // Let restore() reach its in-flight znn_info request before racing connect().
+    await vi.waitFor(() => expect(h.client.request).toHaveBeenCalledTimes(1))
+
+    await service.connect()
+
+    // Now fail restore()'s stale request — it must not tear down the session
+    // connect() just established on a different topic.
+    rejectRestoreRequest(new Error('node unreachable'))
+    await expect(restorePromise).resolves.toBeNull()
+
+    h.client.request.mockClear()
+    h.client.request.mockResolvedValue({address: 'z1addr', chainId: 1})
+    await service.getInfo()
+    expect(h.client.request).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'topic-connect'}),
+    )
+  })
+})
+
+describe('ZenonWalletService.getClient concurrency', () => {
+  it('memoizes SignClient initialization across concurrent restore() and connect() calls', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+
+    await Promise.all([service.restore(), service.connect()])
+
+    expect(h.initSpy).toHaveBeenCalledTimes(1)
+    expect(h.client.connect).not.toHaveBeenCalled()
   })
 })

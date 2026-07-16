@@ -41,7 +41,10 @@ Additions:
   pairing `approval()` promise instead races a ~5 min timeout (matching the
   WalletConnect pairing-URI expiry): manually pasting the URI into Syrius
   routinely takes longer than 30 s. On expiry the user sees a "Request timed
-  out — check Syrius" style error rather than an infinite spinner.
+  out — check Syrius" style error rather than an infinite spinner. `znn_send`
+  races its own 2 min timeout for the same human-paced reason as approval —
+  reviewing and signing a transaction in Syrius routinely takes longer than
+  30 s.
 - **Relay guard** — before each request, if `client.core.relayer.connected` is
   false, reopen the transport (`transportOpen()`) and settle ~2 s. Prevents
   requests sent into a dead relay (e.g. after laptop sleep).

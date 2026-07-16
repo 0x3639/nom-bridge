@@ -58,6 +58,7 @@ describe('WC_TIMING', () => {
   it('ships the spec values', () => {
     expect(WC_TIMING).toEqual({
       requestTimeoutMs: 30_000,
+      sendTimeoutMs: 120_000,
       approvalTimeoutMs: 300_000,
       settleMs: 5_000,
       relaySettleMs: 2_000,

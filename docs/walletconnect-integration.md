@@ -176,10 +176,11 @@ specific message instead of a generic failure.
 
 The bridge now enforces the following on its side; wallets should be aware:
 
-- Every request is raced against a **30 s timeout**; pairing approval against
-  **5 min** (the pairing-URI lifetime). A hung request surfaces to the user as
-  a timeout — respond or error, never go silent.
-- `znn_info`/`znn_send` are attempted up to **3 times**. Two error shapes get
+- Every request is raced against a **30 s timeout**, except `znn_send`, which
+  races a **2 min timeout because signing is human-paced**; pairing approval
+  races **5 min** (the pairing-URI lifetime). A hung request surfaces to the
+  user as a timeout — respond or error, never go silent.
+- `znn_info`/`znn_send` are attempted up to **3 times**. Three error shapes get
   special handling, matching known Syrius behavior:
   - `code 9000` + message containing `Wallet is locked` → surfaced as
     "unlock your wallet", no retry.

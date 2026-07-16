@@ -24,7 +24,7 @@ type SignClientInstance = Awaited<ReturnType<typeof SignClient.init>>
 
 export class ZenonWalletService {
   private static instance: ZenonWalletService | null = null
-  private client: SignClientInstance | null = null
+  private clientPromise: Promise<SignClientInstance> | null = null
   private session: SessionTypes.Struct | null = null
   onDisconnect: (() => void) | null = null
   onInfoChange: ((info: ZenonWalletInfo) => void) | null = null
@@ -40,8 +40,12 @@ export class ZenonWalletService {
   }
 
   private async getClient(): Promise<SignClientInstance> {
-    if (this.client) return this.client
-    this.client = await SignClient.init({
+    if (!this.clientPromise) this.clientPromise = this.initClient()
+    return this.clientPromise
+  }
+
+  private async initClient(): Promise<SignClientInstance> {
+    const client = await SignClient.init({
       projectId: WC_PROJECT_ID,
       metadata: {
         name: 'NoM Bridge',
@@ -50,15 +54,15 @@ export class ZenonWalletService {
         icons: [window.location.origin + '/logo.svg'],
       },
     })
-    this.client.on('session_delete', () => this.clearSession())
-    this.client.on('session_expire', () => this.clearSession())
-    this.client.on('session_event', event => {
+    client.on('session_delete', () => this.clearSession())
+    client.on('session_expire', () => this.clearSession())
+    client.on('session_event', event => {
       if (!this.session || event.topic !== this.session.topic) return
       const name = event.params.event.name
       if (name !== 'chainIdChange' && name !== 'addressChange') return
       void this.refreshInfoFromEvent()
     })
-    return this.client
+    return client
   }
 
   async connect(): Promise<ZenonWalletInfo> {
@@ -74,14 +78,19 @@ export class ZenonWalletService {
   // modal and never throws — absence of a session is a normal outcome.
   async restore(): Promise<ZenonWalletInfo | null> {
     if (!isWcConfigured()) return null
+    let existing: SessionTypes.Struct | null = null
     try {
       const client = await this.getClient()
-      const existing = this.findLiveZenonSession(client)
+      existing = this.findLiveZenonSession(client)
       if (!existing) return null
       this.session = existing
       return await this.getInfo()
-    } catch {
-      this.session = null
+    } catch (e) {
+      // A session established concurrently by connect() (e.g. while this
+      // restore() was still in flight) must survive a restore failure — only
+      // clear the session if it's still the one restore() itself set.
+      if (this.session === existing) this.session = null
+      console.debug('[wc] restore failed:', e instanceof Error ? e.message : String(e))
       return null
     }
   }
@@ -160,9 +169,10 @@ export class ZenonWalletService {
   }
 
   async disconnect(): Promise<void> {
-    if (this.client && this.session) {
+    if (this.clientPromise && this.session) {
       try {
-        await this.client.disconnect({
+        const client = await this.clientPromise
+        await client.disconnect({
           topic: this.session.topic,
           reason: {code: 6000, message: 'User disconnected'},
         })
@@ -185,13 +195,14 @@ export class ZenonWalletService {
     const client = await this.getClient()
     if (!this.session) throw new Error('No active Zenon session')
     await this.ensureRelayConnected(client)
+    const timeoutMs = method === 'znn_send' ? WC_TIMING.sendTimeoutMs : WC_TIMING.requestTimeoutMs
     return withTimeout(
       client.request<T>({
         topic: this.session.topic,
         chainId: ZENON_CHAIN,
         request: {method, params},
       }),
-      WC_TIMING.requestTimeoutMs,
+      timeoutMs,
       `Syrius request (${method})`,
     )
   }
@@ -210,9 +221,12 @@ export class ZenonWalletService {
             throw new Error('Request rejected in the wallet')
           case 'reconnect':
             // Known Syrius desync ("Bad state: No element"): drop the session
-            // and re-acquire before the next attempt.
-            this.session = null
-            await this.ensureSession()
+            // and re-acquire before the next attempt — but not after the
+            // final attempt, since there won't be a next attempt to use it.
+            if (attempt < WC_TIMING.maxAttempts) {
+              this.session = null
+              await this.ensureSession()
+            }
             break
           case 'retry':
             break

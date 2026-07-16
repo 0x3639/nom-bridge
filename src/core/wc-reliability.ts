@@ -4,6 +4,7 @@
 // behavior. WC_TIMING is a mutable object so tests can shrink the waits.
 export const WC_TIMING = {
   requestTimeoutMs: 30_000,
+  sendTimeoutMs: 120_000, // znn_send is human-paced (review + sign in Syrius)
   approvalTimeoutMs: 300_000, // pairing approval is human-paced (manual URI paste)
   settleMs: 5_000, // SignClient's session store lags behind approval()
   relaySettleMs: 2_000,
