@@ -172,6 +172,25 @@ The bridge interprets WalletConnect JSON-RPC error codes:
 Returning the conventional rejection codes gives the user the correct,
 specific message instead of a generic failure.
 
+### dApp-side reliability behavior (v2)
+
+The bridge now enforces the following on its side; wallets should be aware:
+
+- Every request is raced against a **30 s timeout**; pairing approval against
+  **5 min** (the pairing-URI lifetime). A hung request surfaces to the user as
+  a timeout — respond or error, never go silent.
+- `znn_info`/`znn_send` are attempted up to **3 times**. Two error shapes get
+  special handling, matching known Syrius behavior:
+  - `code 9000` + message containing `Wallet is locked` → surfaced as
+    "unlock your wallet", no retry.
+  - `code -32602` + `Bad state: No element` → the bridge drops the session,
+    re-pairs/reuses, and retries.
+  - `code -32602` + `No matching key` → retried as-is.
+- If the relay transport is down when a request is made, the bridge reopens it
+  and waits ~2 s before sending.
+- After session approval the bridge waits ~5 s and re-reads its session store
+  (SignClient's store can lag behind approval).
+
 ---
 
 ## 6. dApp metadata you'll receive
