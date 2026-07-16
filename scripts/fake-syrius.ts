@@ -6,7 +6,7 @@ function readProjectId(): string {
   try {
     const env = readFileSync(new URL('../.env', import.meta.url), 'utf8')
     const match = env.match(/^VITE_WC_PROJECT_ID=(.+)$/m)
-    if (match) return match[1].trim()
+    if (match) return match[1].trim().replace(/^(['"])(.*)\1$/, '$2')
   } catch {
     // no .env — fall through
   }

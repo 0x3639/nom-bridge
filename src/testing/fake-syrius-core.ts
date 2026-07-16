@@ -16,6 +16,7 @@ export interface FakeSyriusFlags {
 
 export interface FakeSyrius {
   pair(uri: string): Promise<void>
+  /** Replaces the full flag set — flags omitted from `flags` are reset to false. */
   setFlags(flags: FakeSyriusFlags): void
   disconnectAll(): Promise<void>
   close(): Promise<void>
@@ -46,20 +47,27 @@ export async function createFakeSyrius(
 
   client.on('session_proposal', proposal => {
     void (async () => {
-      const zenon = proposal.params.requiredNamespaces.zenon
-      const chains = zenon?.chains ?? ['zenon:1']
-      const {acknowledged} = await client.approve({
-        id: proposal.id,
-        namespaces: {
-          zenon: {
-            accounts: chains.map(chain => `${chain}:${FAKE_SYRIUS_ADDRESS}`),
-            methods: zenon?.methods ?? ['znn_info', 'znn_sign', 'znn_send'],
-            events: zenon?.events ?? ['chainIdChange', 'addressChange'],
+      try {
+        const zenon = proposal.params.requiredNamespaces.zenon
+        const chains = zenon?.chains ?? ['zenon:1']
+        const {acknowledged} = await client.approve({
+          id: proposal.id,
+          namespaces: {
+            zenon: {
+              accounts: chains.map(chain => `${chain}:${FAKE_SYRIUS_ADDRESS}`),
+              methods: zenon?.methods ?? ['znn_info', 'znn_sign', 'znn_send'],
+              events: zenon?.events ?? ['chainIdChange', 'addressChange'],
+            },
           },
-        },
-      })
-      await acknowledged()
-      console.log('[fake-syrius] session approved')
+        })
+        await acknowledged()
+        console.log('[fake-syrius] session approved')
+      } catch (error) {
+        console.error(
+          '[fake-syrius] session_proposal error:',
+          error instanceof Error ? error.message : String(error),
+        )
+      }
     })()
   })
 
@@ -71,34 +79,46 @@ export async function createFakeSyrius(
       client.respond({topic, response: {id, jsonrpc: '2.0', error: {code, message}}})
 
     void (async () => {
-      const method = params.request.method
-      console.log(`[fake-syrius] ${method} requested`)
-      if (flags.hang) return // exercise the dApp's request timeout
-      if (flags.locked) return respondError(9000, 'Wallet is locked')
-      if (flags.reject) return respondError(5000, 'User rejected')
-      if (flags.badState && !badStateFired) {
-        badStateFired = true
-        return respondError(-32602, 'Bad state: No element')
+      try {
+        const method = params.request.method
+        console.log(`[fake-syrius] ${method} requested`)
+        if (flags.hang) return // exercise the dApp's request timeout
+        if (flags.locked) return respondError(9000, 'Wallet is locked')
+        if (flags.reject) return respondError(5000, 'User rejected')
+        if (flags.badState && !badStateFired) {
+          badStateFired = true
+          return respondError(-32602, 'Bad state: No element')
+        }
+        if (method === 'znn_info') {
+          return respond({address: FAKE_SYRIUS_ADDRESS, chainId: 1, nodeUrl: 'wss://fake.node.invalid'})
+        }
+        if (method === 'znn_send') {
+          const block = (params.request.params as {accountBlock: Record<string, unknown>}).accountBlock
+          // Echo the block back "published": deterministic fake hash, filled
+          // publicKey/signature. No signing, no broadcast.
+          const hash = createHash('sha256').update(JSON.stringify(block)).digest('hex')
+          return respond({
+            ...block,
+            hash,
+            publicKey: (block.publicKey as string) || 'ZmFrZS1wdWJrZXk=',
+            signature: (block.signature as string) || 'ZmFrZS1zaWduYXR1cmU=',
+          })
+        }
+        if (method === 'znn_sign') {
+          return respond('ZmFrZS1zaWduYXR1cmU=')
+        }
+        return respondError(4001, `Unsupported method ${method}`)
+      } catch (error) {
+        console.error(
+          '[fake-syrius] session_request error:',
+          error instanceof Error ? error.message : String(error),
+        )
+        try {
+          await respondError(-32603, 'Internal fake-wallet error')
+        } catch {
+          // best-effort only — ignore secondary failure
+        }
       }
-      if (method === 'znn_info') {
-        return respond({address: FAKE_SYRIUS_ADDRESS, chainId: 1, nodeUrl: 'wss://fake.node.invalid'})
-      }
-      if (method === 'znn_send') {
-        const block = (params.request.params as {accountBlock: Record<string, unknown>}).accountBlock
-        // Echo the block back "published": deterministic fake hash, filled
-        // publicKey/signature. No signing, no broadcast.
-        const hash = createHash('sha256').update(JSON.stringify(block)).digest('hex')
-        return respond({
-          ...block,
-          hash,
-          publicKey: (block.publicKey as string) || 'ZmFrZS1wdWJrZXk=',
-          signature: (block.signature as string) || 'ZmFrZS1zaWduYXR1cmU=',
-        })
-      }
-      if (method === 'znn_sign') {
-        return respond('ZmFrZS1zaWduYXR1cmU=')
-      }
-      return respondError(4001, `Unsupported method ${method}`)
     })()
   })
 
@@ -107,8 +127,11 @@ export async function createFakeSyrius(
       await client.core.pairing.pair({uri})
     },
     setFlags(next: FakeSyriusFlags): void {
-      Object.assign(flags, next)
-      badStateFired = false
+      flags.reject = next.reject ?? false
+      flags.locked = next.locked ?? false
+      flags.hang = next.hang ?? false
+      flags.badState = next.badState ?? false
+      if (next.badState) badStateFired = false
     },
     async disconnectAll(): Promise<void> {
       for (const session of client.session.getAll()) {
