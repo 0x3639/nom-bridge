@@ -64,9 +64,13 @@ jobs:
         with:
           fail-on-severity: high
 
-  # NOTE: CodeQL results are ADVISORY unless branch protection additionally
-  # requires the code-scanning check — the analyze step exits 0 even when it
-  # finds alerts. Configure branch protection to require it to make it a gate.
+  # NOTE: CodeQL results are ADVISORY. The analyze step exits 0 even when it
+  # finds alerts, and requiring this workflow's status check only guarantees
+  # the analysis COMPLETED — it does not block alert-bearing PRs. To gate on
+  # alerts, configure a branch RULESET with "Require code scanning results"
+  # and explicit CodeQL severity thresholds (this is separate from required
+  # status checks):
+  # https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/manage-your-configuration/set-merge-protection
   codeql:
     name: CodeQL
     if: vars.ENABLE_GHAS_CHECKS == 'true'

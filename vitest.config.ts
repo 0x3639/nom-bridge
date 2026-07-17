@@ -14,6 +14,10 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/*.integration.test.ts'],
+    // The heavier async composable suites can exceed vitest's 5s default on
+    // loaded CI runners, and a timed-out test leaks unfinished async work
+    // into the next one. 10s keeps full parallel runs deterministic.
+    testTimeout: 10_000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'lcov'],
@@ -47,6 +51,9 @@ export default defineConfig({
         'src/core/composables/useUnwrap.ts': {statements: 88, branches: 85, functions: 60, lines: 88},
         'src/core/composables/useWrap.ts': {statements: 88, branches: 85, functions: 70, lines: 88},
         'src/core/composables/useRequests.ts': {statements: 15, branches: 90, functions: 35, lines: 15},
+        'src/core/bridge-service.ts': {statements: 60, branches: 75, functions: 60, lines: 60},
+        'src/core/zenon-service.ts': {statements: 70, branches: 60, functions: 80, lines: 70},
+        'src/core/composables/useBridge.ts': {statements: 90, branches: 75, functions: 95, lines: 90},
       },
     },
   },
