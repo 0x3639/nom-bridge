@@ -31,8 +31,8 @@ export class ZenonService {
 
   private constructor(
     private nodeUrl: string = config.nodeUrl,
-    private chainId: number = 1,
-    private networkId: number = 1
+    private chainId: number = config.zenonChainId,
+    private networkId: number = config.zenonNetworkId
   ) {
     // Configure network settings BEFORE getting the Zenon instance
     if (!ZenonService.networkConfigured) {
@@ -85,8 +85,8 @@ export class ZenonService {
     if (!ZenonService.instance) {
       ZenonService.instance = new ZenonService(
         nodeUrl ?? config.nodeUrl,
-        chainId ?? 1,
-        networkId ?? 1
+        chainId ?? config.zenonChainId,
+        networkId ?? config.zenonNetworkId
       )
     } else if (
       (nodeUrl !== undefined && nodeUrl !== ZenonService.instance.nodeUrl) ||

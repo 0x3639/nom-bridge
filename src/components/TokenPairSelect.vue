@@ -17,12 +17,6 @@ const emit = defineEmits<{
   'update:modelValue': [value: string]
 }>()
 
-function labelFor(zts: string): string {
-  if (zts.startsWith('zts1znn')) return 'ZNN'
-  if (zts.startsWith('zts1qsr')) return 'QSR'
-  return zts
-}
-
 function onUpdate(value: unknown): void {
   if (typeof value === 'string') emit('update:modelValue', value)
 }
@@ -35,7 +29,7 @@ function onUpdate(value: unknown): void {
     </SelectTrigger>
     <SelectContent>
       <SelectItem v-for="pair in props.pairs" :key="pair.zts" :value="pair.zts">
-        {{ labelFor(pair.zts) }}
+        {{ pair.symbol }}
       </SelectItem>
     </SelectContent>
   </Select>

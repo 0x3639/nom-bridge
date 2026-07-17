@@ -1,30 +1,43 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
-// Mock the service so the composable never touches a real Zenon node.
-// getNetworkInfo's return value is set per-test via the mock below.
 const getNetworkInfo = vi.fn()
 const getBridgeInfo = vi.fn()
 const getOrchestratorInfo = vi.fn()
+const getNativeTokenMetadata = vi.fn()
+const getEvmTokenMetadata = vi.fn()
+const getEvmTokenInfo = vi.fn()
+
 vi.mock('../bridge-service', () => ({
   BridgeService: {
-    getInstance: () => ({getNetworkInfo, getBridgeInfo, getOrchestratorInfo}),
+    getInstance: () => ({
+      getNetworkInfo,
+      getBridgeInfo,
+      getOrchestratorInfo,
+      getTokenMetadata: getNativeTokenMetadata,
+    }),
   },
 }))
 
-// A minimal BridgeNetworkInfo-shaped fixture. TokenPair.tokenStandard and
-// minAmount are objects exposing toString() (as the SDK's TokenStandard /
-// BigNumber do).
+vi.mock('../evm-service', () => ({
+  EvmService: {
+    getInstance: () => ({
+      getTokenMetadata: getEvmTokenMetadata,
+      getTokenInfo: getEvmTokenInfo,
+    }),
+  },
+}))
+
 function networkInfoFixture() {
   return {
     networkClass: 2,
     chainId: 1,
     name: 'Ethereum',
-    contractAddress: '0xBridgeContract',
+    contractAddress: '0xa98706106f7710d743186031be2245f33acea106',
     metadata: '{}',
     tokenPairs: [
       {
         tokenStandard: {toString: () => 'zts1znnxxxxxxxxxxxxx9z4ulx'},
-        tokenAddress: '0xToken0',
+        tokenAddress: '0xb2e96a63479c2edd2fd62b382c89d5ca79f572d3',
         bridgeable: true,
         redeemable: true,
         owned: false,
@@ -34,9 +47,9 @@ function networkInfoFixture() {
         metadata: '{}',
       },
       {
-        tokenStandard: {toString: () => 'zts1qsrxxxxxxxxxxxxxxmrhjll'},
-        tokenAddress: '0xToken1',
-        bridgeable: true,
+        tokenStandard: {toString: () => 'zts1qsrxxxxxxxxxxxxxmrhjll'},
+        tokenAddress: '0x96546afe4a21515a3a30cd3fd64a70eb478dc174',
+        bridgeable: false,
         redeemable: true,
         owned: false,
         minAmount: {toString: () => '5000000000'},
@@ -48,72 +61,94 @@ function networkInfoFixture() {
   }
 }
 
-// useBridge holds module-level state (loads once). Reset modules between tests
-// so each test starts from a clean, unloaded composable.
 beforeEach(() => {
   vi.resetModules()
-  getNetworkInfo.mockReset()
-  getBridgeInfo.mockReset().mockResolvedValue({halted: false})
+  getNetworkInfo.mockReset().mockResolvedValue(networkInfoFixture())
+  getBridgeInfo.mockReset().mockResolvedValue({halted: false, allowKeyGen: false})
   getOrchestratorInfo.mockReset().mockResolvedValue({estimatedMomentumTime: 10})
+  getNativeTokenMetadata.mockReset().mockImplementation(async (zts: string) => ({
+    symbol: zts.includes('qsr') ? 'QSR' : 'ZNN',
+    decimals: 8,
+  }))
+  getEvmTokenMetadata.mockReset().mockImplementation(async (address: string) => ({
+    symbol: address.toLowerCase().includes('96546') ? 'wQSR' : 'wZNN',
+    decimals: 8,
+  }))
+  getEvmTokenInfo.mockReset().mockResolvedValue({
+    minAmount: 25000000n,
+    redeemDelay: 90,
+    bridgeable: true,
+    redeemable: true,
+    owned: true,
+  })
 })
 
-describe('useBridge tokenPairs mapping', () => {
-  it('maps TokenPair[] to TokenPairView[] with the expected fields', async () => {
-    getNetworkInfo.mockResolvedValue(networkInfoFixture())
+describe('useBridge token metadata and safety mapping', () => {
+  it('resolves native/EVM metadata and direction-specific limits', async () => {
     const {useBridge} = await import('./useBridge')
     const {tokenPairs, load} = useBridge()
     await load()
 
-    expect(tokenPairs.value).toHaveLength(2)
     expect(tokenPairs.value[0]).toEqual({
       zts: 'zts1znnxxxxxxxxxxxxx9z4ulx',
-      tokenAddress: '0xToken0',
+      tokenAddress: '0xb2e96a63479c2edd2fd62b382c89d5ca79f572d3',
+      symbol: 'ZNN',
+      evmSymbol: 'wZNN',
       decimals: 8,
-      minAmount: 100000000n,
+      wrapMinAmount: 100000000n,
+      unwrapMinAmount: 25000000n,
       feePercentage: 25,
       redeemDelay: 6,
+      wrapEnabled: true,
+      unwrapEnabled: true,
+      owned: false,
     })
-    expect(tokenPairs.value[1].zts).toBe('zts1qsrxxxxxxxxxxxxxxmrhjll')
-    expect(tokenPairs.value[1].minAmount).toBe(5000000000n)
-    expect(tokenPairs.value[1].redeemDelay).toBe(10)
+    expect(tokenPairs.value[1].wrapEnabled).toBe(false)
+    expect(tokenPairs.value[1].unwrapEnabled).toBe(true)
   })
 
-  it('stubs decimals to 8 for every pair (Phase 1 deferral)', async () => {
-    getNetworkInfo.mockResolvedValue(networkInfoFixture())
+  it('fails closed when native and EVM decimals differ', async () => {
+    getEvmTokenMetadata.mockResolvedValue({symbol: 'wZNN', decimals: 18})
     const {useBridge} = await import('./useBridge')
-    const {tokenPairs, load} = useBridge()
+    await expect(useBridge().load()).rejects.toThrow('Decimal mismatch')
+  })
+
+  it('rejects a node-supplied bridge address mismatch', async () => {
+    getNetworkInfo.mockResolvedValue({...networkInfoFixture(), contractAddress: '0xattacker'})
+    const {useBridge} = await import('./useBridge')
+    await expect(useBridge().load()).rejects.toThrow('Bridge address mismatch')
+  })
+
+  it('rejects a node-supplied token address mismatch', async () => {
+    const fixture = networkInfoFixture()
+    fixture.tokenPairs[0].tokenAddress = '0xattacker'
+    getNetworkInfo.mockResolvedValue(fixture)
+    const {useBridge} = await import('./useBridge')
+    await expect(useBridge().load()).rejects.toThrow('Token address mismatch')
+  })
+
+  it('retains halted and key-generation state', async () => {
+    getBridgeInfo.mockResolvedValue({halted: true, allowKeyGen: true})
+    const {useBridge} = await import('./useBridge')
+    const {halted, allowKeyGen, load} = useBridge()
     await load()
-    expect(tokenPairs.value.every(p => p.decimals === 8)).toBe(true)
+    expect(halted.value).toBe(true)
+    expect(allowKeyGen.value).toBe(true)
   })
 
-  it('converts minAmount via BigInt and exposes bridgeAddress', async () => {
-    getNetworkInfo.mockResolvedValue(networkInfoFixture())
+  it('loads once normally and refreshes the full configuration on demand', async () => {
     const {useBridge} = await import('./useBridge')
-    const {tokenPairs, bridgeAddress, load} = useBridge()
-    await load()
-    expect(typeof tokenPairs.value[0].minAmount).toBe('bigint')
-    expect(bridgeAddress.value).toBe('0xBridgeContract')
-  })
-
-  it('starts empty before load and exposes a null bridgeAddress', async () => {
-    const {useBridge} = await import('./useBridge')
-    const {tokenPairs, bridgeAddress} = useBridge()
-    expect(tokenPairs.value).toEqual([])
-    expect(bridgeAddress.value).toBeNull()
-  })
-
-  it('loads getNetworkInfo only once across repeated load() calls', async () => {
-    getNetworkInfo.mockResolvedValue(networkInfoFixture())
-    const {useBridge} = await import('./useBridge')
-    const {load} = useBridge()
+    const {load, refresh} = useBridge()
     await load()
     await load()
     expect(getNetworkInfo).toHaveBeenCalledTimes(1)
+    await refresh()
+    expect(getNetworkInfo).toHaveBeenCalledTimes(2)
   })
 })
 
 describe('useBridge failure handling', () => {
-  it('sets error and rethrows when getNetworkInfo rejects', async () => {
+  it('sets error and rethrows when the node rejects', async () => {
     getNetworkInfo.mockRejectedValue(new Error('node unreachable'))
     const {useBridge} = await import('./useBridge')
     const {error, isLoading, load} = useBridge()

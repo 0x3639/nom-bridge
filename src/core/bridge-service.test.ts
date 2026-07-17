@@ -10,6 +10,8 @@ const h = vi.hoisted(() => {
   const getAllUnwrapTokenRequestsByToAddress = vi.fn()
   const wrapToken = vi.fn()
   const redeem = vi.fn()
+  const getByZts = vi.fn()
+  const getAccountInfoByAddress = vi.fn()
   const ensureInitialized = vi.fn().mockResolvedValue(undefined)
   const zenon = {
     embedded: {
@@ -20,12 +22,15 @@ const h = vi.hoisted(() => {
         wrapToken,
         redeem,
       },
+      token: {getByZts},
     },
+    ledger: {getAccountInfoByAddress},
   }
   const zenonService = {ensureInitialized, getZenon: vi.fn(() => zenon)}
   const extractNumberDecimals = vi.fn()
   const parse = vi.fn()
   const hashParse = vi.fn()
+  const addressParse = vi.fn()
   return {
     getNetworkInfo,
     getAllWrapTokenRequestsByToAddress,
@@ -37,6 +42,9 @@ const h = vi.hoisted(() => {
     extractNumberDecimals,
     parse,
     hashParse,
+    addressParse,
+    getByZts,
+    getAccountInfoByAddress,
   }
 })
 
@@ -48,6 +56,7 @@ vi.mock('znn-typescript-sdk', () => ({
   extractNumberDecimals: h.extractNumberDecimals,
   TokenStandard: {parse: h.parse},
   Hash: {parse: h.hashParse},
+  Address: {parse: h.addressParse},
 }))
 
 beforeEach(() => {
@@ -60,6 +69,9 @@ beforeEach(() => {
   h.extractNumberDecimals.mockReset()
   h.parse.mockReset()
   h.hashParse.mockReset()
+  h.addressParse.mockReset()
+  h.getByZts.mockReset()
+  h.getAccountInfoByAddress.mockReset()
   h.ensureInitialized.mockClear()
 })
 
@@ -119,9 +131,36 @@ describe('BridgeService.getWrapRequests', () => {
   })
 })
 
+describe('BridgeService token reads', () => {
+  it('resolves symbol and decimals from the Zenon token registry', async () => {
+    const parsed = {zts: true}
+    h.parse.mockReturnValue(parsed)
+    h.getByZts.mockResolvedValue({symbol: 'ZNN', decimals: 8})
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().getTokenMetadata('zts1znn')).resolves.toEqual({
+      symbol: 'ZNN',
+      decimals: 8,
+    })
+    expect(h.getByZts).toHaveBeenCalledWith(parsed)
+  })
+
+  it('reads a scoped account balance by token standard', async () => {
+    const parsed = {address: true}
+    h.addressParse.mockReturnValue(parsed)
+    h.getAccountInfoByAddress.mockResolvedValue({
+      balanceInfoMap: {zts1znn: {balance: 123n}},
+    })
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().getTokenBalance('z1owner', 'zts1znn')).resolves.toBe(123n)
+    expect(h.getAccountInfoByAddress).toHaveBeenCalledWith(parsed)
+  })
+})
+
 describe('BridgeService.buildWrapBlock', () => {
-  it('builds the SDK BigNumber via extractNumberDecimals and passes it to wrapToken', async () => {
-    const bn = {__bigNumber: true}
+  it('parses an exact bigint amount and passes it to wrapToken', async () => {
+    const bn = 150000000n
     const parsed = {__tokenStandard: true}
     h.extractNumberDecimals.mockReturnValue(bn)
     h.parse.mockReturnValue(parsed)
@@ -137,10 +176,10 @@ describe('BridgeService.buildWrapBlock', () => {
       config.networkClass,
       config.evmChainId,
       '0xRecipient',
-      bn, // the extractNumberDecimals return — NOT a raw string / `as never`
+      bn,
       parsed,
     )
-    // the amount arg is the BigNumber object, never the human string
+    // The amount is exact base units, never the human string.
     expect(h.wrapToken.mock.calls[0][3]).toBe(bn)
     expect(h.wrapToken.mock.calls[0][3]).not.toBe('1.5')
     expect(block).toEqual({__block: true})

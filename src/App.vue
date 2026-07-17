@@ -40,6 +40,14 @@ onMounted(() => {
         </div>
       </div>
     </header>
+    <nav class="container mx-auto flex max-w-md gap-4 px-6 pt-4 text-sm">
+      <router-link to="/" class="text-muted-foreground hover:text-foreground" active-class="text-foreground font-medium">
+        Bridge
+      </router-link>
+      <router-link to="/requests" class="text-muted-foreground hover:text-foreground" active-class="text-foreground font-medium">
+        History
+      </router-link>
+    </nav>
     <main class="container mx-auto max-w-md p-6">
       <router-view />
     </main>

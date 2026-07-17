@@ -1,6 +1,7 @@
 import {ZenonService} from './zenon-service'
 import {config} from '@/config'
-import {extractNumberDecimals, Hash, TokenStandard} from 'znn-typescript-sdk'
+import {Address, Hash, TokenStandard} from 'znn-typescript-sdk'
+import {parseAmount} from './amount'
 import type {
   AccountBlockTemplate,
   BridgeInfo,
@@ -43,6 +44,23 @@ export class BridgeService {
     return this.zenonService.getZenon().embedded.bridge.getOrchestratorInfo()
   }
 
+  async getTokenMetadata(zts: string): Promise<{symbol: string; decimals: number}> {
+    await this.ensureInitialized()
+    const token = await this.zenonService
+      .getZenon()
+      .embedded.token.getByZts(TokenStandard.parse(zts))
+    if (!token) throw new Error(`Unknown Zenon token ${zts}`)
+    return {symbol: token.symbol, decimals: token.decimals}
+  }
+
+  async getTokenBalance(address: string, zts: string): Promise<bigint> {
+    await this.ensureInitialized()
+    const account = await this.zenonService
+      .getZenon()
+      .ledger.getAccountInfoByAddress(Address.parse(address))
+    return account?.balanceInfoMap[zts]?.balance ?? 0n
+  }
+
   async getWrapRequests(
     evmToAddress: string,
     page = 0,
@@ -82,7 +100,7 @@ export class BridgeService {
     decimals: number,
     zts: string,
   ): AccountBlockTemplate {
-    const amount = extractNumberDecimals(humanAmount, decimals)
+    const amount = parseAmount(humanAmount, decimals)
     return this.zenonService.getZenon().embedded.bridge.wrapToken(
       config.networkClass,
       config.evmChainId,

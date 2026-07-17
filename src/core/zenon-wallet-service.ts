@@ -1,8 +1,8 @@
 import {SignClient} from '@walletconnect/sign-client'
 import {WalletConnectModal} from '@walletconnect/modal'
 import type {SessionTypes} from '@walletconnect/types'
-import {AccountBlockTemplate} from 'znn-typescript-sdk'
-import {WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
+import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
+import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
 
 const ZENON_NAMESPACE = {
   methods: ['znn_info', 'znn_sign', 'znn_send'],
@@ -23,6 +23,7 @@ export class ZenonWalletService {
   private client: SignClientInstance | null = null
   private session: SessionTypes.Struct | null = null
   onDisconnect: (() => void) | null = null
+  onInfoChange: ((info: ZenonWalletInfo) => void) | null = null
 
   static getInstance(): ZenonWalletService {
     if (!ZenonWalletService.instance) {
@@ -44,6 +45,12 @@ export class ZenonWalletService {
     })
     this.client.on('session_delete', () => this.clearSession())
     this.client.on('session_expire', () => this.clearSession())
+    this.client.on('session_event', event => {
+      if (!this.session || event.topic !== this.session.topic) return
+      const name = event.params.event.name
+      if (name !== 'chainIdChange' && name !== 'addressChange') return
+      void this.refreshInfoFromEvent()
+    })
     return this.client
   }
 
@@ -80,11 +87,16 @@ export class ZenonWalletService {
   }
 
   async getInfo(): Promise<ZenonWalletInfo> {
-    return this.request<ZenonWalletInfo>('znn_info', undefined)
+    const info = await this.request<ZenonWalletInfo>('znn_info', undefined)
+    return validateZenonWalletInfo(info)
   }
 
   // WIRED now, first USED in Phase 3. Do not call it this phase.
   async send(fromAddress: string, block: AccountBlockTemplate): Promise<AccountBlockTemplate> {
+    const info = await this.getInfo()
+    if (info.address !== fromAddress) {
+      throw new Error('Zenon wallet address changed. Review the recipient and try again.')
+    }
     const result = await this.request<unknown>('znn_send', {
       fromAddress,
       accountBlock: block.toJson(),
@@ -124,6 +136,27 @@ export class ZenonWalletService {
     this.session = null
     this.onDisconnect?.()
   }
+
+  private async refreshInfoFromEvent(): Promise<void> {
+    try {
+      const info = await this.getInfo()
+      this.onInfoChange?.(info)
+    } catch {
+      this.clearSession()
+    }
+  }
+}
+
+export function validateZenonWalletInfo(info: ZenonWalletInfo): ZenonWalletInfo {
+  if (info.chainId !== config.zenonChainId) {
+    throw new Error(`Zenon wallet is connected to chain ${info.chainId}; expected ${config.zenonChainId}`)
+  }
+  try {
+    Address.parse(info.address)
+  } catch {
+    throw new Error('Zenon wallet returned an invalid address')
+  }
+  return info
 }
 
 // WalletConnect JSON-RPC error codes in the 5000 range are user/wallet rejections.

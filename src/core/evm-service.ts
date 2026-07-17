@@ -2,6 +2,7 @@ import {
   createPublicClient,
   createWalletClient,
   custom,
+  fallback,
   getAddress,
   http,
   parseAbi,
@@ -22,12 +23,13 @@ const erc20Abi = parseAbi([
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
   'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
 ])
 
 const bridgeAbi = parseAbi([
   'function redeem(address to, address token, uint256 amount, uint256 nonce, bytes signature)',
   'function unwrap(address token, uint256 amount, string to)',
-  'function tokensInfo(address) view returns (uint256 minAmount, uint32 redeemDelay, bool allowed)',
+  'function tokensInfo(address) view returns (uint256 minAmount, uint256 redeemDelay, bool bridgeable, bool redeemable, bool owned)',
   'function redeemsInfo(uint256 nonce) view returns (uint256 blockNumber, bytes32 paramsHash)',
   'function estimatedBlockTime() view returns (uint64)',
   'event Unwrapped(address indexed from, address indexed token, string to, uint256 amount)',
@@ -55,25 +57,38 @@ export function computeRemainingSeconds(
 }
 
 // Pure selection of the display-only provisional logIndex from decoded
-// `Unwrapped` logs. The node value is authoritative for the actual redeem, so a
-// wrong pick here is harmless. Filters on the connected account (checksum-
-// insensitive) and the exact Zenon recipient; falls back to the first log.
+// `Unwrapped` logs. The node value is authoritative for the actual redeem.
+// Filters on the connected account (checksum-insensitive) and the exact Zenon
+// recipient; an unmatched receipt is recovered later from the Zenon node.
 export function selectProvisionalLogIndex(
-  logs: Array<{logIndex: number; args: {from?: string; to?: string}}>,
+  logs: Array<{
+    logIndex: number
+    args: {from?: string; to?: string; token?: string; amount?: bigint}
+  }>,
   account: string,
   zenonAddress: string,
-): number {
-  if (logs.length === 0) return 0
+  token?: string,
+  amount?: bigint,
+): number | null {
   const match = logs.find(log => {
     if (log.args.to !== zenonAddress) return false
     if (!log.args.from) return false
     try {
-      return getAddress(log.args.from) === getAddress(account)
+      if (getAddress(log.args.from) !== getAddress(account)) return false
+      if (token !== undefined) {
+        if (!log.args.token || getAddress(log.args.token) !== getAddress(token)) return false
+      }
+      if (amount !== undefined && log.args.amount !== amount) return false
+      return true
     } catch {
       return false
     }
   })
-  return match ? match.logIndex : logs[0].logIndex
+  return match?.logIndex ?? null
+}
+
+function assertSuccessfulReceipt(receipt: {status: string}, action: string): void {
+  if (receipt.status !== 'success') throw new Error(`${action} transaction reverted`)
 }
 
 export class EvmService {
@@ -82,7 +97,10 @@ export class EvmService {
   private walletClient: WalletClient | null = null
 
   private constructor() {
-    this.publicClient = createPublicClient({chain: CHAIN, transport: http()})
+    this.publicClient = createPublicClient({
+      chain: CHAIN,
+      transport: fallback(config.evmRpcUrls.map(url => http(url))),
+    })
   }
 
   static getInstance(): EvmService {
@@ -122,6 +140,22 @@ export class EvmService {
     })
   }
 
+  async getTokenMetadata(token: Address): Promise<{decimals: number; symbol: string}> {
+    const [decimals, symbol] = await Promise.all([
+      this.publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'decimals',
+      }),
+      this.publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'symbol',
+      }),
+    ])
+    return {decimals, symbol}
+  }
+
   async getBlockNumber(): Promise<bigint> {
     return this.publicClient.getBlockNumber()
   }
@@ -137,14 +171,22 @@ export class EvmService {
   async getTokenInfo(
     bridge: Address,
     token: Address,
-  ): Promise<{minAmount: bigint; redeemDelay: number; allowed: boolean}> {
-    const [minAmount, redeemDelay, allowed] = await this.publicClient.readContract({
+  ): Promise<{
+    minAmount: bigint
+    redeemDelay: number
+    bridgeable: boolean
+    redeemable: boolean
+    owned: boolean
+  }> {
+    const [minAmount, redeemDelay, bridgeable, redeemable, owned] = await this.publicClient.readContract({
       address: bridge,
       abi: bridgeAbi,
       functionName: 'tokensInfo',
       args: [token],
     })
-    return {minAmount, redeemDelay, allowed}
+    const redeemDelayNumber = Number(redeemDelay)
+    if (!Number.isSafeInteger(redeemDelayNumber)) throw new Error('Token redeem delay is out of range')
+    return {minAmount, redeemDelay: redeemDelayNumber, bridgeable, redeemable, owned}
   }
 
   async getWrapRedeemProgress(
@@ -178,6 +220,7 @@ export class EvmService {
     const wallet = this.getWalletClient()
     try {
       const [account] = await wallet.requestAddresses()
+      await this.assertWalletChain(wallet)
       const allowance = await this.publicClient.readContract({
         address: token,
         abi: erc20Abi,
@@ -185,7 +228,7 @@ export class EvmService {
         args: [account, bridge],
       })
       if (allowance >= amount) return
-      const hash = await wallet.writeContract({
+      const {request} = await this.publicClient.simulateContract({
         address: token,
         abi: erc20Abi,
         functionName: 'approve',
@@ -193,7 +236,9 @@ export class EvmService {
         chain: CHAIN,
         account,
       })
-      await this.publicClient.waitForTransactionReceipt({hash})
+      const hash = await wallet.writeContract(request)
+      const receipt = await this.publicClient.waitForTransactionReceipt({hash})
+      assertSuccessfulReceipt(receipt, 'Approval')
     } catch (e) {
       throw mapEvmError(e)
     }
@@ -204,11 +249,12 @@ export class EvmService {
     token: Address,
     amount: bigint,
     zenonAddress: string,
-  ): Promise<{hash: Hex; provisionalLogIndex: number}> {
+  ): Promise<{hash: Hex; provisionalLogIndex: number; eventMatched: boolean}> {
     const wallet = this.getWalletClient()
     try {
       const [account] = await wallet.requestAddresses()
-      const hash = await wallet.writeContract({
+      await this.assertWalletChain(wallet)
+      const {request} = await this.publicClient.simulateContract({
         address: bridge,
         abi: bridgeAbi,
         functionName: 'unwrap',
@@ -216,14 +262,25 @@ export class EvmService {
         chain: CHAIN,
         account,
       })
+      const hash = await wallet.writeContract(request)
       const receipt = await this.publicClient.waitForTransactionReceipt({hash})
+      assertSuccessfulReceipt(receipt, 'Unwrap')
       const decoded = parseEventLogs({abi: bridgeAbi, logs: receipt.logs, eventName: 'Unwrapped'})
       const provisionalLogIndex = selectProvisionalLogIndex(
-        decoded as unknown as Array<{logIndex: number; args: {from?: string; to?: string}}>,
+        decoded as unknown as Array<{
+          logIndex: number
+          args: {from?: string; to?: string; token?: string; amount?: bigint}
+        }>,
         account,
         zenonAddress,
+        token,
+        amount,
       )
-      return {hash, provisionalLogIndex}
+      return {
+        hash,
+        provisionalLogIndex: provisionalLogIndex ?? -1,
+        eventMatched: provisionalLogIndex !== null,
+      }
     } catch (e) {
       throw mapEvmError(e)
     }
@@ -240,7 +297,8 @@ export class EvmService {
     const wallet = this.getWalletClient()
     try {
       const [account] = await wallet.requestAddresses()
-      return await wallet.writeContract({
+      await this.assertWalletChain(wallet)
+      const {request} = await this.publicClient.simulateContract({
         address: bridge,
         abi: bridgeAbi,
         functionName: 'redeem',
@@ -248,15 +306,27 @@ export class EvmService {
         chain: CHAIN,
         account,
       })
+      const hash = await wallet.writeContract(request)
+      const receipt = await this.publicClient.waitForTransactionReceipt({hash})
+      assertSuccessfulReceipt(receipt, 'Redeem')
+      return hash
     } catch (e) {
       throw mapEvmError(e)
     }
+  }
+
+  private async assertWalletChain(wallet: WalletClient): Promise<void> {
+    const chainId = await wallet.getChainId()
+    if (chainId !== CHAIN.id) throw new Error(`Please switch MetaMask to ${CHAIN.name}`)
   }
 }
 
 export function tssSignatureToHex(base64Sig: string): Hex {
   const sig = Buffer.from(base64Sig, 'base64')
-  sig[sig.length - 1] += 27 // v: 0/1 → 27/28
+  if (sig.length !== 65) throw new Error('Invalid TSS signature length')
+  const recovery = sig[64]
+  if (recovery !== 0 && recovery !== 1) throw new Error('Invalid TSS signature recovery byte')
+  sig[64] = recovery + 27 // v: 0/1 → 27/28
   return `0x${sig.toString('hex')}`
 }
 

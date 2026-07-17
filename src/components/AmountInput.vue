@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {computed} from 'vue'
-import {addNumberDecimals, extractNumberDecimals} from 'znn-typescript-sdk'
+import {addNumberDecimals} from 'znn-typescript-sdk'
 import {
   Field,
   FieldDescription,
@@ -12,6 +12,7 @@ import {
 } from 'nom-ui'
 import {FEE_DENOMINATOR} from '@/config'
 import {formatAmount} from '@/core/composables/utils/formatters'
+import {parseAmount} from '@/core/amount'
 
 const props = defineProps<{
   modelValue: string
@@ -38,7 +39,7 @@ function setMax(): void {
 const parsedBase = computed<bigint>(() => {
   if (!props.modelValue) return 0n
   try {
-    return BigInt(extractNumberDecimals(props.modelValue, props.decimals).toString())
+    return parseAmount(props.modelValue, props.decimals)
   } catch {
     return 0n
   }
