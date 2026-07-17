@@ -34,6 +34,10 @@ describe('classifyWalletError', () => {
     expect(classifyWalletError(err(5999, 'nope'))).toBe('rejected')
   })
 
+  it('classifies EIP-1193-style 4001 as rejected', () => {
+    expect(classifyWalletError(err(4001, 'User rejected the request'))).toBe('rejected')
+  })
+
   it('classifies 9000 wallet-locked as locked', () => {
     expect(classifyWalletError(err(9000, 'Wallet is locked'))).toBe('locked')
   })

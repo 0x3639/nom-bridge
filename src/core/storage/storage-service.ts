@@ -56,6 +56,36 @@ class StorageService implements StorageAdapter {
     return this.adapter.remove(key)
   }
 
+  subscribe<T>(key: string, listener: (value: T | null) => void): () => void {
+    if (
+      this.adapter instanceof ChromeStorageAdapter &&
+      typeof chrome !== 'undefined' &&
+      chrome.storage?.onChanged
+    ) {
+      const onChanged = (
+        changes: Record<string, chrome.storage.StorageChange>,
+        areaName: string,
+      ) => {
+        if (areaName !== 'local' || !changes[key]) return
+        listener((changes[key].newValue as T | undefined) ?? null)
+      }
+      chrome.storage.onChanged.addListener(onChanged)
+      return () => chrome.storage.onChanged.removeListener(onChanged)
+    }
+
+    if (typeof window === 'undefined') return () => undefined
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== localStorage || event.key !== key) return
+      try {
+        listener(event.newValue ? JSON.parse(event.newValue) as T : null)
+      } catch {
+        listener(null)
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }
+
   /**
    * Get the current adapter type for debugging purposes
    */

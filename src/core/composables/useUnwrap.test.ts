@@ -3,11 +3,19 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 // Mock external boundaries: the services, the Zenon wallet send, the request
 // store.
 const h = vi.hoisted(() => ({
-  ensureAllowance: vi.fn(),
+  getAllowance: vi.fn(),
+  approveAllowance: vi.fn(),
   unwrap: vi.fn(),
   buildRedeemBlock: vi.fn(),
   send: vi.fn(),
   trackUnwrap: vi.fn(),
+  prune: vi.fn(),
+  setPendingZenonRedeem: vi.fn(),
+  clearPendingZenonRedeem: vi.fn(),
+  getTransactionOutcome: vi.fn(),
+  getAuthoritativeOutcome: vi.fn(),
+  getSnapshot: vi.fn(),
+  withCrossContextLock: vi.fn(),
 }))
 
 vi.mock('../bridge-service', () => ({
@@ -15,7 +23,18 @@ vi.mock('../bridge-service', () => ({
 }))
 
 vi.mock('../evm-service', () => ({
-  EvmService: {getInstance: () => ({ensureAllowance: h.ensureAllowance, unwrap: h.unwrap})},
+  EvmSubmissionError: class EvmSubmissionError extends Error {
+    constructor(public kind: string, public hash: string, message: string) { super(message) }
+  },
+  EvmService: {
+    getInstance: () => ({
+      getAllowance: h.getAllowance,
+      approveAllowance: h.approveAllowance,
+      unwrap: h.unwrap,
+      getTransactionOutcome: h.getTransactionOutcome,
+      getAuthoritativeOutcome: h.getAuthoritativeOutcome,
+    }),
+  },
 }))
 
 vi.mock('./useZenonWallet', () => ({
@@ -23,18 +42,33 @@ vi.mock('./useZenonWallet', () => ({
 }))
 
 vi.mock('../request-store', () => ({
-  requestStore: {trackUnwrap: h.trackUnwrap},
+  requestStore: {
+    trackUnwrap: h.trackUnwrap,
+    prune: h.prune,
+    setPendingZenonRedeem: h.setPendingZenonRedeem,
+    clearPendingZenonRedeem: h.clearPendingZenonRedeem,
+    getSnapshot: h.getSnapshot,
+    withCrossContextLock: h.withCrossContextLock,
+  },
 }))
 
 beforeEach(() => {
   vi.resetModules()
   Object.values(h).forEach(fn => fn.mockReset())
+  h.setPendingZenonRedeem.mockResolvedValue(true)
+  h.clearPendingZenonRedeem.mockResolvedValue(undefined)
+  h.getSnapshot.mockResolvedValue({zenonRedeems: {}})
+  h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
 })
 
 describe('useUnwrap.unwrap', () => {
-  it('ensures allowance, unwraps, then tracks with id `${hash}:${provisionalLogIndex}`', async () => {
-    h.ensureAllowance.mockResolvedValue(undefined)
-    h.unwrap.mockResolvedValue({hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true})
+  it('skips approval when allowance is sufficient, unwraps, and records a two-approval path', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xunwraptx')
+      return {hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true}
+    })
     h.trackUnwrap.mockResolvedValue(undefined)
     const {useUnwrap} = await import('./useUnwrap')
 
@@ -42,28 +76,49 @@ describe('useUnwrap.unwrap', () => {
     const bridge = '0xBridge00000000000000000000000000000000' as `0x${string}`
     const result = await useUnwrap().unwrap(token, 500n, 'z1qrecipient', bridge, 'zts1znn', 8, 'ZNN')
 
-    expect(h.ensureAllowance).toHaveBeenCalledWith(token, bridge, 500n)
-    expect(h.unwrap).toHaveBeenCalledWith(bridge, token, 500n, 'z1qrecipient')
+    expect(h.getAllowance).toHaveBeenCalledWith(token, bridge)
+    expect(h.approveAllowance).not.toHaveBeenCalled()
+    expect(h.unwrap).toHaveBeenCalledWith(
+      bridge,
+      token,
+      500n,
+      'z1qrecipient',
+      expect.any(Function),
+    )
     expect(h.trackUnwrap).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: '0xunwraptx:3',
+        id: '0xunwraptx:-1',
         zts: 'zts1znn',
         amount: '500',
         decimals: 8,
         symbol: 'ZNN',
         zenonToAddress: 'z1qrecipient',
+        approvalCount: 2,
       }),
     )
-    expect(result).toEqual({hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true})
+    expect(result).toEqual({
+      kind: 'confirmed',
+      hash: '0xunwraptx',
+      provisionalLogIndex: 3,
+      eventMatched: true,
+      trackingFailed: false,
+    })
   })
 
-  it('ensures allowance BEFORE the unwrap call', async () => {
+  it('approves an insufficient allowance before unwrap and records a three-approval path', async () => {
     const order: string[] = []
-    h.ensureAllowance.mockImplementation(async () => {
+    h.getAllowance.mockImplementation(async () => {
       order.push('allowance')
+      return 0n
     })
-    h.unwrap.mockImplementation(async () => {
+    h.approveAllowance.mockImplementation(async () => {
+      order.push('approve')
+      return '0xapprove'
+    })
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
       order.push('unwrap')
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xtx')
       return {hash: '0xtx', provisionalLogIndex: 0, eventMatched: true}
     })
     h.trackUnwrap.mockResolvedValue(undefined)
@@ -79,7 +134,106 @@ describe('useUnwrap.unwrap', () => {
       'ZNN',
     )
 
-    expect(order).toEqual(['allowance', 'unwrap'])
+    expect(order).toEqual(['allowance', 'approve', 'unwrap'])
+    expect(h.trackUnwrap).toHaveBeenCalledWith(expect.objectContaining({approvalCount: 3}))
+  })
+
+  it('does not submit unwrap when token approval is rejected', async () => {
+    h.getAllowance.mockResolvedValue(0n)
+    h.approveAllowance.mockRejectedValue(new Error('Request rejected in MetaMask'))
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+    )).rejects.toThrow('Request rejected in MetaMask')
+
+    expect(h.unwrap).not.toHaveBeenCalled()
+    expect(useUnwrap().phase.value).toMatchObject({kind: 'failed', stage: 'token-approval'})
+    useUnwrap().resetPhase()
+    expect(useUnwrap().phase.value).toEqual({kind: 'idle'})
+    expect(useUnwrap().error.value).toBeNull()
+  })
+
+  it('does not expose retry when receipt confirmation fails after broadcast', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.trackUnwrap.mockResolvedValue(undefined)
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xbroadcast')
+      throw new Error('RPC connection dropped')
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+    )).resolves.toEqual({kind: 'submitted-unconfirmed', hash: '0xbroadcast', trackingFailed: false})
+    expect(useUnwrap().phase.value).toMatchObject({
+      kind: 'submitted-unconfirmed',
+      hash: '0xbroadcast',
+    })
+  })
+
+  it('reports tracking failure without failing a confirmed bridge transfer', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.trackUnwrap.mockRejectedValue(new Error('quota exceeded'))
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xconfirmed')
+      return {hash: '0xconfirmed', provisionalLogIndex: 7, eventMatched: true}
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    const result = await useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+    )
+
+    expect(result).toMatchObject({kind: 'confirmed', hash: '0xconfirmed', trackingFailed: true})
+    expect(useUnwrap().phase.value).toMatchObject({kind: 'submitted-untracked'})
+  })
+
+  it('removes provisional tracking and allows retry after a definitive revert', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.trackUnwrap.mockResolvedValue(undefined)
+    h.prune.mockImplementation(async (predicate: (request: {kind: string; id: string}) => boolean) => {
+      expect(predicate({kind: 'unwrap', id: '0xreverted:-1'})).toBe(true)
+    })
+    const {EvmSubmissionError} = await import('../evm-service')
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xreverted')
+      throw new EvmSubmissionError('reverted', '0xreverted', 'Unwrap transaction reverted')
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+    )).rejects.toThrow('Unwrap transaction reverted')
+    expect(h.prune).toHaveBeenCalled()
+    expect(useUnwrap().phase.value).toMatchObject({kind: 'failed', stage: 'bridge-transfer'})
   })
 })
 
@@ -89,9 +243,10 @@ describe('useUnwrap.redeemZenon', () => {
     h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
     const {useUnwrap} = await import('./useUnwrap')
 
+    const transactionHash = `0x${'ab'.repeat(32)}`
     const view = {
-      id: '0xtx:9',
-      transactionHash: '0xtx',
+      id: `${transactionHash}:9`,
+      transactionHash,
       logIndex: 9,
       zts: 'zts1znn',
       amount: 100n,
@@ -103,7 +258,189 @@ describe('useUnwrap.redeemZenon', () => {
 
     await expect(useUnwrap().redeemZenon(view)).resolves.toBe('zenonhash')
 
-    expect(h.buildRedeemBlock).toHaveBeenCalledWith('0xtx', 9)
+    expect(h.buildRedeemBlock).toHaveBeenCalledWith('ab'.repeat(32), 9)
     expect(h.send).toHaveBeenCalledWith({__block: true})
+    expect(h.setPendingZenonRedeem).toHaveBeenCalledWith(view.id, 'zenonhash')
+    expect(useUnwrap().pendingRedeems.value[view.id]).toBe('confirming')
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+  })
+
+  it('keeps the durable and local locks after an ambiguous znn_send timeout', async () => {
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    const {ZenonSubmissionError} = await import('../zenon-wallet-service')
+    h.send.mockRejectedValue(new ZenonSubmissionError('ambiguous', 'result unavailable'))
+    const {useUnwrap} = await import('./useUnwrap')
+    const transactionHash = `0x${'cd'.repeat(32)}`
+    const view = {
+      id: `${transactionHash}:4`,
+      transactionHash,
+      logIndex: 4,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    await expect(useUnwrap().redeemZenon(view)).rejects.toMatchObject({kind: 'ambiguous'})
+    expect(h.setPendingZenonRedeem).toHaveBeenCalledWith(view.id, 'awaiting-wallet-result')
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+    expect(useUnwrap().pendingRedeems.value[view.id]).toBe('confirming')
+    // The durable lock is upgraded from the reclaimable pre-prompt placeholder
+    // to the never-reclaimed ambiguous marker: Syrius may still broadcast.
+    expect(h.setPendingZenonRedeem).toHaveBeenLastCalledWith(view.id, 'ambiguous-wallet-result')
+  })
+
+  it('reclaims only a stale orphaned placeholder, never a fresh or ambiguous lock', async () => {
+    // Syrius runs outside the browser: its prompt can outlive a crashed dApp
+    // context, so an orphaned placeholder is reclaimable only after the
+    // staleness window has passed.
+    const {PLACEHOLDER_LOCK_STALE_MS} = await import('../approval-ux')
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
+    const transactionHash = `0x${'dd'.repeat(32)}`
+    const view = {
+      id: `${transactionHash}:5`,
+      transactionHash,
+      logIndex: 5,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    const {useUnwrap} = await import('./useUnwrap')
+    // Fresh placeholder → refuse.
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[transactionHash]: {hash: 'awaiting-wallet-result', updatedAt: Date.now()}},
+    })
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    // Ambiguous marker → refuse regardless of age.
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[transactionHash]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
+    })
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    expect(h.send).not.toHaveBeenCalled()
+    // Stale orphaned placeholder → reclaim.
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {
+        [transactionHash]: {
+          hash: 'awaiting-wallet-result',
+          updatedAt: Date.now() - PLACEHOLDER_LOCK_STALE_MS - 1,
+        },
+      },
+    })
+    await expect(useUnwrap().redeemZenon(view)).resolves.toBe('zenonhash')
+  })
+
+  it('falls back to the ambiguous marker when persisting the published block hash fails', async () => {
+    // The block IS published. Leaving the durable lock as the reclaimable
+    // pre-prompt placeholder would let a new flow overwrite it after reload +
+    // staleness, resubmitting a live redemption.
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
+    h.setPendingZenonRedeem.mockReset()
+      .mockResolvedValueOnce(true) // pre-prompt placeholder
+      .mockRejectedValueOnce(new Error('storage quota exceeded')) // real hash
+      .mockResolvedValue(true) // ambiguous fallback
+    const {useUnwrap} = await import('./useUnwrap')
+    const transactionHash = `0x${'ee'.repeat(32)}`
+    const view = {
+      id: `${transactionHash}:2`,
+      transactionHash,
+      logIndex: 2,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    await expect(useUnwrap().redeemZenon(view)).resolves.toBe('zenonhash')
+    expect(useUnwrap().pendingRedeems.value[view.id]).toBe('confirming')
+    expect(h.setPendingZenonRedeem).toHaveBeenLastCalledWith(view.id, 'ambiguous-wallet-result')
+  })
+
+  it('locks the redemption locally before waiting on another context\'s cross-context lock', async () => {
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
+    let releaseLock: () => void = () => undefined
+    h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
+      await new Promise<void>(resolve => {
+        releaseLock = resolve
+      })
+      return action()
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+    const transactionHash = `0x${'aa'.repeat(32)}`
+    const view = {
+      id: `${transactionHash}:1`,
+      transactionHash,
+      logIndex: 1,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    const first = useUnwrap().redeemZenon(view)
+    // Feedback exists while blocked on the Web Lock, and a second click must
+    // refuse instead of queuing a duplicate Syrius prompt behind the lock.
+    expect(useUnwrap().pendingRedeems.value[view.id]).toBeTruthy()
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    releaseLock()
+    await expect(first).resolves.toBe('zenonhash')
+    expect(h.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears the local marker when the flow fails before any wallet prompt', async () => {
+    const transactionHash = `0x${'bb'.repeat(32)}`
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[transactionHash]: {hash: 'other-tab'}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+    const view = {
+      id: `${transactionHash}:3`,
+      transactionHash,
+      logIndex: 3,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    expect(useUnwrap().pendingRedeems.value[view.id]).toBeUndefined()
+  })
+
+  it('refuses a Zenon redemption when another context already persisted its lock', async () => {
+    const transactionHash = `0x${'ef'.repeat(32)}`
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[transactionHash]: {hash: 'other-tab'}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+    const view = {
+      id: `${transactionHash}:2`,
+      transactionHash,
+      logIndex: 2,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
   })
 })

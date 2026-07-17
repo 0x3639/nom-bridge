@@ -10,36 +10,29 @@ import {
   ItemTitle,
 } from 'nom-ui'
 import {formatAmount, formatCountdown, truncateAddress} from '@/core/composables/utils/formatters'
+import {wrapRequestProgress, type PendingRedeemPhase} from '@/core/approval-ux'
 import type {WrapRequestView} from '@/types'
 
 const props = defineProps<{
   request: WrapRequestView
+  pending?: PendingRedeemPhase
 }>()
 
 const emit = defineEmits<{
   redeem: [request: WrapRequestView]
+  recheck: [request: WrapRequestView]
 }>()
 
-type BadgeVariant = 'default' | 'secondary' | 'outline'
-
-const badge = computed<{variant: BadgeVariant; label: string}>(() => {
-  switch (props.request.status) {
-    case 'signing':
-      return {variant: 'secondary', label: 'Signing'}
-    case 'redeemable':
-      return {variant: 'default', label: 'Redeem'}
-    case 'waiting-delay':
-      return {variant: 'outline', label: formatCountdown(props.request.remainingSeconds ?? 0)}
-    case 'redeemable-2':
-      return {variant: 'default', label: 'Redeem (2/2)'}
-    case 'redeemed':
-      return {variant: 'secondary', label: 'Redeemed'}
-  }
-})
-
-const canRedeem = computed(
-  () => props.request.status === 'redeemable' || props.request.status === 'redeemable-2',
+const progress = computed(() => wrapRequestProgress(props.request.status, props.pending))
+const badgeLabel = computed(() =>
+  props.request.status === 'waiting-delay'
+    ? `Security delay · ${formatCountdown(props.request.remainingSeconds ?? 0)}`
+    : progress.value.badge,
 )
+
+function redeem(): void {
+  if (progress.value.actionable && !props.pending) emit('redeem', props.request)
+}
 </script>
 
 <template>
@@ -47,19 +40,35 @@ const canRedeem = computed(
     <ItemContent>
       <ItemTitle>
         {{ formatAmount(props.request.amount, props.request.decimals) }} {{ props.request.symbol }}
-        <Badge :variant="badge.variant">{{ badge.label }}</Badge>
+        <Badge :variant="progress.actionable ? 'default' : 'secondary'">{{ badgeLabel }}</Badge>
       </ItemTitle>
-      <ItemDescription>To {{ truncateAddress(props.request.toAddress) }}</ItemDescription>
+      <ItemDescription class="space-y-1">
+        <span class="block font-medium text-foreground">{{ progress.title }}</span>
+        <span class="block">{{ progress.description }}</span>
+        <span class="block">To {{ truncateAddress(props.request.toAddress) }}</span>
+      </ItemDescription>
     </ItemContent>
-    <ItemActions>
-      <Button
-        type="button"
-        size="sm"
-        :disabled="!canRedeem"
-        @click="emit('redeem', props.request)"
-      >
-        Redeem
-      </Button>
+    <ItemActions v-if="progress.action">
+      <div class="flex flex-wrap justify-end gap-2">
+        <Button
+          v-if="pending === 'confirming'"
+          type="button"
+          size="sm"
+          variant="outline"
+          @click="emit('recheck', request)"
+        >
+          Recheck status
+        </Button>
+        <Button
+          v-if="pending !== 'confirming'"
+          type="button"
+          size="sm"
+          :disabled="!progress.actionable || Boolean(pending)"
+          @click="redeem"
+        >
+          {{ progress.action }}
+        </Button>
+      </div>
     </ItemActions>
   </Item>
 </template>

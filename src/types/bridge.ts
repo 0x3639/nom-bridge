@@ -6,6 +6,7 @@ export type WrapStatus =
   | 'redeemed'
 
 export type UnwrapStatus =
+  | 'submitted'
   | 'pending'
   | 'signing'
   | 'waiting'
@@ -38,6 +39,8 @@ export interface WrapRequestView {
   toAddress: string      // EVM recipient
   status: WrapStatus
   remainingSeconds?: number
+  pendingClaimHash?: string
+  pendingClaimStage?: 1 | 2
 }
 
 export interface UnwrapRequestView {
@@ -51,6 +54,8 @@ export interface UnwrapRequestView {
   toAddress: string      // Zenon recipient
   status: UnwrapStatus
   remainingSeconds?: number
+  totalApprovals?: 2 | 3
+  pendingZenonRedeemHash?: string
 }
 
 export interface TrackedRequest {
@@ -64,5 +69,6 @@ export interface TrackedRequest {
   symbol: string
   evmToAddress?: string
   zenonToAddress?: string
+  approvalCount?: 2 | 3
   createdAt: number
 }

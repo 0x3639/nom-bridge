@@ -163,14 +163,22 @@ the WalletConnect session-event mechanism.)
 
 The bridge interprets WalletConnect JSON-RPC error codes:
 
-- **Codes `5000`–`5999`** → treated as a **user/wallet rejection** and shown as
-  *"Request rejected in the wallet."* Use a code in this range (e.g. `5000`)
-  when the user declines a `znn_send`/`znn_sign` prompt.
+- **Codes `5000`–`5999`** and **`4001`** (EIP-1193 `userRejectedRequest`) →
+  treated as a **user/wallet rejection** and shown as *"Request rejected in the
+  wallet."* Use a code in one of these when the user declines a
+  `znn_send`/`znn_sign` prompt.
 - Any other error code or thrown error → generic *"WalletConnect request
   failed."*
 
-Returning the conventional rejection codes gives the user the correct,
-specific message instead of a generic failure.
+**The rejection code is load-bearing for `znn_send`.** The bridge persists a
+redemption safety lock *before* sending `znn_send` and only releases it on
+failure when the error is provably a rejection (a code above — nothing was
+signed or broadcast). Any other `znn_send` failure is treated as **ambiguous**
+(the wallet may still sign and broadcast late, e.g. after a relay timeout) and
+the safety lock is deliberately kept until the node's authoritative state
+resolves it. A wallet that reports user rejections with a non-rejection code
+will therefore leave the user's redemption locked until the node confirms
+nothing was published — always return `4001` or a `5xxx` code for declines.
 
 ### dApp-side reliability behavior (v2)
 
@@ -223,7 +231,8 @@ A wallet is bridge-ready when:
       **plasma/PoW**, **signs**, **broadcasts**, and returns the finalized block
       **with its `hash`** — without modifying `toAddress`/`tokenStandard`/
       `amount`/`data`.
-- [ ] User rejections return a **5xxx** error code.
+- [ ] User rejections return a **5xxx** (or `4001`) error code — required for
+      the bridge to release its pre-send redemption safety lock on a decline.
 - [ ] **`session_delete`** is emitted on wallet-side disconnect; `expiry` is
       honored.
 

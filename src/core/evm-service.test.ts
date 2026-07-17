@@ -9,6 +9,8 @@ const h = vi.hoisted(() => ({
     getBlockNumber: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
     simulateContract: vi.fn(),
+    getTransactionReceipt: vi.fn(),
+    getTransaction: vi.fn(),
   },
   walletClient: {
     requestAddresses: vi.fn(),
@@ -33,6 +35,8 @@ beforeEach(() => {
   h.publicClient.getBlockNumber.mockReset()
   h.publicClient.waitForTransactionReceipt.mockReset()
   h.publicClient.simulateContract.mockReset().mockResolvedValue({request: {}})
+  h.publicClient.getTransactionReceipt.mockReset()
+  h.publicClient.getTransaction.mockReset()
   h.walletClient.requestAddresses.mockReset()
   h.walletClient.switchChain.mockReset()
   h.walletClient.writeContract.mockReset()
@@ -97,6 +101,155 @@ describe('EvmService.getBalance', () => {
     expect(h.publicClient.readContract).toHaveBeenCalledWith(
       expect.objectContaining({address: token, functionName: 'balanceOf', args: [owner]}),
     )
+  })
+})
+
+describe('EvmService.getTransactionOutcome', () => {
+  const hash = `0x${'ab'.repeat(32)}` as const
+
+  it('classifies successful and reverted receipts authoritatively', async () => {
+    const {EvmService} = await import('./evm-service')
+    h.publicClient.getTransactionReceipt.mockResolvedValueOnce({status: 'success'})
+    await expect(EvmService.getInstance().getTransactionOutcome(hash)).resolves.toBe('success')
+    h.publicClient.getTransactionReceipt.mockResolvedValueOnce({status: 'reverted'})
+    await expect(EvmService.getInstance().getTransactionOutcome(hash)).resolves.toBe('reverted')
+  })
+
+  it('distinguishes a pending transaction from one not found', async () => {
+    const {EvmService} = await import('./evm-service')
+    const {TransactionNotFoundError, TransactionReceiptNotFoundError} = await import('viem')
+    h.publicClient.getTransactionReceipt.mockRejectedValue(new TransactionReceiptNotFoundError({hash}))
+    h.publicClient.getTransaction.mockResolvedValueOnce({hash})
+    await expect(EvmService.getInstance().getTransactionOutcome(hash)).resolves.toBe('pending')
+    h.publicClient.getTransaction.mockRejectedValueOnce(new TransactionNotFoundError({hash}))
+    await expect(EvmService.getInstance().getTransactionOutcome(hash)).resolves.toBe('not-found')
+  })
+})
+
+describe('collapseAuthoritativeOutcomes', () => {
+  it('never treats negative RPC evidence as proof of failure', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'pending', 'unavailable'])).toBe('unknown')
+  })
+
+  it('accepts a success receipt from any configured RPC as authoritative', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'success', 'unavailable'])).toBe('confirmed')
+  })
+
+  it('fails closed if RPCs return conflicting receipts', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['success', 'reverted'])).toBe('unknown')
+  })
+
+  it('does not let a single RPC fabricate a revert while others disagree', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    // One node serving a reverted receipt from an orphaned block must not beat
+    // peers that still see the transaction live or unknown.
+    expect(collapseAuthoritativeOutcomes(['reverted', 'pending', 'not-found'])).toBe('unknown')
+    expect(collapseAuthoritativeOutcomes(['reverted', 'not-found', 'not-found'])).toBe('unknown')
+    expect(collapseAuthoritativeOutcomes(['reverted', 'unavailable'])).toBe('unknown')
+  })
+
+  it('accepts a revert only as the consensus of responsive RPCs', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['reverted', 'reverted'])).toBe('reverted')
+    expect(collapseAuthoritativeOutcomes(['reverted', 'reverted', 'unavailable'])).toBe('reverted')
+    // A single-RPC deployment has no peer to corroborate with.
+    expect(collapseAuthoritativeOutcomes(['reverted'])).toBe('reverted')
+  })
+
+  it('reports universal not-found as absent, never as reverted or unknown', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'not-found'])).toBe('absent')
+    expect(collapseAuthoritativeOutcomes(['not-found'])).toBe('absent')
+  })
+
+  it('does not report absent unless every RPC answered not-found', async () => {
+    const {collapseAuthoritativeOutcomes} = await import('./evm-service')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'unavailable'])).toBe('unknown')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'pending'])).toBe('unknown')
+    expect(collapseAuthoritativeOutcomes([])).toBe('unknown')
+  })
+})
+
+describe('dropped-transaction evidence', () => {
+  it('treats a nonce as consumed only when the confirmed count has passed it', async () => {
+    // getTransactionCount('latest') is the next unused nonce, so count > nonce
+    // means the nonce was consumed on-chain — by this tx (then it would not be
+    // absent) or by a replacement. Absence alone is never proof of death.
+    const {isNonceConsumed} = await import('./evm-service')
+    expect(isNonceConsumed(7, 8)).toBe(true)
+    expect(isNonceConsumed(7, 7)).toBe(false)
+    expect(isNonceConsumed(7, 6)).toBe(false)
+  })
+
+  it('accepts sender/nonce facts only when corroborated by a second RPC', async () => {
+    const {corroborateTxFacts} = await import('./evm-service')
+    // Two RPCs agreeing on identical facts → corroborated.
+    expect(corroborateTxFacts(
+      [{from: '0xA', nonce: 7}, {from: '0xA', nonce: 7}, {}],
+      3,
+    )).toEqual({from: '0xA', nonce: 7})
+    // A single RPC's claim — or disagreeing RPCs — is not release evidence.
+    expect(corroborateTxFacts([{from: '0xA', nonce: 7}, {}, {}], 3)).toBeUndefined()
+    expect(corroborateTxFacts([{from: '0xA', nonce: 7}, {from: '0xB', nonce: 7}], 2)).toBeUndefined()
+    // A single-RPC deployment has no peer to corroborate with.
+    expect(corroborateTxFacts([{from: '0xA', nonce: 7}], 1)).toEqual({from: '0xA', nonce: 7})
+  })
+
+  it('takes the MINIMUM confirmed count across at least two responsive RPCs', async () => {
+    const {collapseConfirmedCounts} = await import('./evm-service')
+    // Minimum defeats a single RPC inflating the count to force a release; a
+    // lagging honest RPC only fails closed.
+    expect(collapseConfirmedCounts([9, 8, null], 3)).toBe(8)
+    // Fewer than two responsive RPCs (multi-RPC config) → no evidence.
+    expect(collapseConfirmedCounts([9, null, null], 3)).toBeNull()
+    expect(collapseConfirmedCounts([null, null], 2)).toBeNull()
+    // Single-RPC deployment: its answer stands.
+    expect(collapseConfirmedCounts([9], 1)).toBe(9)
+    expect(collapseConfirmedCounts([null], 1)).toBeNull()
+  })
+})
+
+describe('EvmService.getAuthoritativeOutcomeWithFacts', () => {
+  const hash = `0x${'ad'.repeat(32)}` as const
+
+  it('captures the sender and nonce while any RPC can still see the transaction', async () => {
+    const {TransactionReceiptNotFoundError} = await import('viem')
+    h.publicClient.getTransactionReceipt.mockRejectedValue(new TransactionReceiptNotFoundError({hash}))
+    h.publicClient.getTransaction.mockResolvedValue({hash, from: '0xSender', nonce: 7})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().getAuthoritativeOutcomeWithFacts(hash)).resolves.toEqual({
+      outcome: 'unknown',
+      from: '0xSender',
+      nonce: 7,
+    })
+  })
+
+  it('returns no facts when the transaction is nowhere to be seen', async () => {
+    const {TransactionNotFoundError, TransactionReceiptNotFoundError} = await import('viem')
+    h.publicClient.getTransactionReceipt.mockRejectedValue(new TransactionReceiptNotFoundError({hash}))
+    h.publicClient.getTransaction.mockRejectedValue(new TransactionNotFoundError({hash}))
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().getAuthoritativeOutcomeWithFacts(hash)).resolves.toEqual({
+      outcome: 'absent',
+    })
+  })
+})
+
+describe('EvmService.getAuthoritativeOutcome', () => {
+  const hash = `0x${'ac'.repeat(32)}` as const
+
+  it('consults every configured RPC and accepts a confirmed receipt', async () => {
+    h.publicClient.getTransactionReceipt.mockResolvedValue({status: 'success'})
+    const {EvmService} = await import('./evm-service')
+    const {config} = await import('@/config')
+
+    await expect(EvmService.getInstance().getAuthoritativeOutcome(hash)).resolves.toBe('confirmed')
+    expect(h.publicClient.getTransactionReceipt).toHaveBeenCalledTimes(config.evmRpcUrls.length)
   })
 })
 
@@ -316,46 +469,39 @@ describe('selectProvisionalLogIndex', () => {
   })
 })
 
-describe('EvmService.ensureAllowance', () => {
+describe('EvmService allowance stages', () => {
   const token = '0xToken0000000000000000000000000000000001' as const
   const bridge = '0xBridge00000000000000000000000000000000' as const
 
-  it('does NOT approve when allowance >= amount', async () => {
+  it('reads the current allowance without writing', async () => {
     h.walletClient.requestAddresses.mockResolvedValue(['0xOwner000000000000000000000000000000001'])
     h.publicClient.readContract.mockResolvedValue(1000n)
     const {EvmService} = await import('./evm-service')
 
-    await EvmService.getInstance().ensureAllowance(token, bridge, 500n)
+    await expect(EvmService.getInstance().getAllowance(token, bridge)).resolves.toBe(1000n)
 
     expect(h.walletClient.writeContract).not.toHaveBeenCalled()
     expect(h.publicClient.waitForTransactionReceipt).not.toHaveBeenCalled()
   })
 
-  it('does NOT approve at the boundary allowance === amount', async () => {
-    h.walletClient.requestAddresses.mockResolvedValue(['0xOwner000000000000000000000000000000001'])
-    h.publicClient.readContract.mockResolvedValue(500n)
-    const {EvmService} = await import('./evm-service')
-
-    await EvmService.getInstance().ensureAllowance(token, bridge, 500n)
-
-    expect(h.walletClient.writeContract).not.toHaveBeenCalled()
-    expect(h.publicClient.waitForTransactionReceipt).not.toHaveBeenCalled()
-  })
-
-  it('approves and awaits the receipt when allowance < amount', async () => {
+  it('approves the exact amount, reports the hash, and awaits the receipt', async () => {
     h.walletClient.requestAddresses.mockResolvedValue(['0xOwner000000000000000000000000000000001'])
     h.publicClient.readContract.mockResolvedValue(100n)
     h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'approve'}})
     h.walletClient.writeContract.mockResolvedValue('0xapprovetx')
     h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success'})
     const {EvmService} = await import('./evm-service')
+    const submitted = vi.fn()
 
-    await EvmService.getInstance().ensureAllowance(token, bridge, 500n)
+    await expect(
+      EvmService.getInstance().approveAllowance(token, bridge, 500n, submitted),
+    ).resolves.toBe('0xapprovetx')
 
     expect(h.publicClient.simulateContract).toHaveBeenCalledWith(
       expect.objectContaining({address: token, functionName: 'approve', args: [bridge, 500n]}),
     )
     expect(h.walletClient.writeContract).toHaveBeenCalledWith({simulated: 'approve'})
+    expect(submitted).toHaveBeenCalledWith('0xapprovetx')
     expect(h.publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({hash: '0xapprovetx'})
   })
 
@@ -364,7 +510,7 @@ describe('EvmService.ensureAllowance', () => {
     h.walletClient.getChainId.mockResolvedValue(10)
     const {EvmService} = await import('./evm-service')
 
-    await expect(EvmService.getInstance().ensureAllowance(token, bridge, 500n)).rejects.toThrow(
+    await expect(EvmService.getInstance().getAllowance(token, bridge)).rejects.toThrow(
       'Please switch MetaMask',
     )
     expect(h.publicClient.readContract).not.toHaveBeenCalled()
