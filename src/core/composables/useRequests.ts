@@ -14,7 +14,7 @@ import {
   hasWrapProtocolAdvanced,
   isAuthoritativeLockHash,
 } from '../approval-ux'
-import {isNonceConsumed} from '../evm-service'
+import {isNonceConsumed, type UnwrappedEventRecord} from '../evm-service'
 export {normalizeEvmHash} from '../evm-hash'
 
 const wrapRequests = ref<WrapRequestView[]>([])
@@ -72,16 +72,45 @@ export function findTrackedUnwrapByHash(
   )
 }
 
+// Whether a bridge Unwrapped event corresponds to a tracked unwrap whose
+// original hash was replaced (wallet speed-up). Requires the exact Zenon
+// destination, amount, and the pinned pair's ERC-20 token address; an unknown
+// pair mapping fails closed.
+export function matchesTrackedUnwrapEvent(
+  tracked: {zts: string; amount: string; zenonToAddress?: string},
+  pairTokenAddress: string | undefined,
+  event: UnwrappedEventRecord,
+): boolean {
+  if (!pairTokenAddress) return false
+  return (
+    event.to === tracked.zenonToAddress &&
+    event.amount.toString() === tracked.amount &&
+    event.token.toLowerCase() === pairTokenAddress.toLowerCase()
+  )
+}
+
 // Reconciliation for ambiguous (hashless) wrap submissions against the
 // ORIGINATING account chain: an operation is proven published only by a wrap
-// send on its own Zenon account above its own pre-send frontier height with
-// the exact token and amount. Candidate blocks are consumed one-to-one
-// (oldest operation first) so a single published block can never clear
-// multiple ambiguous operations. A null frontier (pre-send read failed) never
+// send on its own Zenon account above its own pre-send frontier height whose
+// decoded WrapToken calldata targets the operation's exact EVM destination on
+// the expected network/chain, with the exact token and amount. An identical-
+// amount wrap to another destination, an undecodable payload, or a wrong
+// chain never matches. Candidate blocks are consumed one-to-one (oldest
+// operation first) so a single published block can never clear multiple
+// ambiguous operations. A null frontier (pre-send read failed) never
 // auto-reconciles. Returns the ids of proven operations.
 export function reconcileUnknownWrapOperations(
   operations: Array<{id: string} & UnknownWrapOperation>,
-  accountChainWrapSends: Array<{hash: string; height: number; zts: string; amount: string}>,
+  accountChainWrapSends: Array<{
+    hash: string
+    height: number
+    zts: string
+    amount: string
+    evmToAddress: string | null
+    networkClass: number | null
+    chainId: number | null
+  }>,
+  expected: {networkClass: number; evmChainId: number},
 ): string[] {
   const availableBlocks = [...accountChainWrapSends]
   const proven: string[] = []
@@ -91,7 +120,11 @@ export function reconcileUnknownWrapOperations(
     const index = availableBlocks.findIndex(block =>
       block.height > (operation.frontierHeight as number) &&
       block.zts === operation.zts &&
-      block.amount === operation.amount,
+      block.amount === operation.amount &&
+      block.evmToAddress !== null &&
+      block.evmToAddress.toLowerCase() === operation.evmToAddress.toLowerCase() &&
+      block.networkClass === expected.networkClass &&
+      block.chainId === expected.evmChainId,
     )
     if (index === -1) continue
     availableBlocks.splice(index, 1)
@@ -263,7 +296,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
         .findWrapSendsAfter(account, minFrontier)
         .catch(() => null)
       if (!wrapSends) continue
-      for (const provenId of reconcileUnknownWrapOperations(operations, wrapSends)) {
+      const proven = reconcileUnknownWrapOperations(operations, wrapSends, {
+        networkClass: config.networkClass,
+        evmChainId: config.evmChainId,
+      })
+      for (const provenId of proven) {
         await requestStore.clearUnknownWrap(provenId)
       }
     }
@@ -302,6 +339,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           const normalizedClaimHash = normalizeEvmHash(pendingClaimHash)
           const outcome = outcomes.get(normalizedClaimHash)
           const protocolAdvanced = hasWrapProtocolAdvanced(pendingClaimStage, status)
+          // `dropped` is sound for claim locks WITHOUT event reconciliation:
+          // if a speed-up replacement executed the same claim, this pass's
+          // freshly read redeem progress would show the protocol advanced (and
+          // clear the lock via that branch); dropped + un-advanced progress
+          // means the claim provably did not execute under any hash.
           const dropped = droppedHashes.has(normalizedClaimHash)
           if (outcome === 'reverted' || protocolAdvanced || dropped) {
             await requestStore.clearPendingEvmClaim(id)
@@ -406,16 +448,72 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
         const id = `${hash}:${idx}`
         if (nodeIds.has(id)) continue
         const outcome = outcomes.get(hash) ?? 'unknown'
-        // Prune on a consensus revert, or on positive dropped evidence
-        // (universally absent AND its nonce consumed by another transaction).
-        // Either way this transfer can never exist on-chain under this hash.
-        if (outcome === 'reverted' || droppedHashes.has(hash)) {
+        // A consensus revert proves the transfer never happened under any hash.
+        if (outcome === 'reverted') {
           await requestStore.prune(request =>
             request.kind === 'unwrap' &&
             normalizeEvmHash(request.id.split(':')[0]) === hash,
           )
           await requestStore.clearEvmTxFacts(hash)
           continue
+        }
+        // A dropped hash (absent + nonce consumed) proves only that THIS HASH
+        // is dead — a wallet speed-up replacement may have executed the
+        // identical unwrap. Resolve via the bridge's Unwrapped events before
+        // touching the record: a matching event migrates tracking to the
+        // replacement hash; a quorum-backed absence of any match proves the
+        // operation never executed; anything less keeps the row (fail closed).
+        if (droppedHashes.has(hash)) {
+          const facts = evmTxFacts[hash]
+          const pair = pairs.get(t.zts)
+          if (bridge && facts?.from && t.createdAt) {
+            const currentBlock = await EvmService.getInstance().getBlockNumber().catch(() => null)
+            if (currentBlock !== null) {
+              const blocksSinceSubmission =
+                BigInt(Math.ceil((Date.now() - t.createdAt) / 12_000) + 300)
+              const fromBlock =
+                currentBlock > blocksSinceSubmission ? currentBlock - blocksSinceSubmission : 0n
+              const {events, responsiveClients} = await EvmService.getInstance()
+                .findUnwrappedEvents(bridge as Address, facts.from as Address, fromBlock)
+              const trackedHashes = new Set(
+                allTracked
+                  .filter(request => request.kind === 'unwrap')
+                  .map(request => normalizeEvmHash(request.id.split(':')[0])),
+              )
+              const replacement = events.find(event =>
+                !nodeHashes.has(normalizeEvmHash(event.transactionHash)) &&
+                !trackedHashes.has(normalizeEvmHash(event.transactionHash)) &&
+                matchesTrackedUnwrapEvent(t, pair?.tokenAddress, event),
+              )
+              if (replacement) {
+                await requestStore.trackUnwrap({
+                  id: `${normalizeEvmHash(replacement.transactionHash)}:${replacement.logIndex}`,
+                  zts: t.zts,
+                  amount: t.amount,
+                  decimals: t.decimals,
+                  symbol: t.symbol,
+                  zenonToAddress: t.zenonToAddress,
+                  approvalCount: t.approvalCount,
+                  createdAt: t.createdAt,
+                })
+                await requestStore.prune(request =>
+                  request.kind === 'unwrap' &&
+                  normalizeEvmHash(request.id.split(':')[0]) === hash,
+                )
+                await requestStore.clearEvmTxFacts(hash)
+                continue
+              }
+              const requiredResponsive = config.evmRpcUrls.length === 1 ? 1 : 2
+              if (responsiveClients >= requiredResponsive) {
+                await requestStore.prune(request =>
+                  request.kind === 'unwrap' &&
+                  normalizeEvmHash(request.id.split(':')[0]) === hash,
+                )
+                await requestStore.clearEvmTxFacts(hash)
+                continue
+              }
+            }
+          }
         }
         unwrapViews.push({
           id,

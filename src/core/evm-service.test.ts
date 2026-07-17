@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
     simulateContract: vi.fn(),
     getTransactionReceipt: vi.fn(),
     getTransaction: vi.fn(),
+    getTransactionCount: vi.fn(),
+    getLogs: vi.fn(),
   },
   walletClient: {
     requestAddresses: vi.fn(),
@@ -37,6 +39,8 @@ beforeEach(() => {
   h.publicClient.simulateContract.mockReset().mockResolvedValue({request: {}})
   h.publicClient.getTransactionReceipt.mockReset()
   h.publicClient.getTransaction.mockReset()
+  h.publicClient.getTransactionCount.mockReset()
+  h.publicClient.getLogs.mockReset()
   h.walletClient.requestAddresses.mockReset()
   h.walletClient.switchChain.mockReset()
   h.walletClient.writeContract.mockReset()
@@ -209,6 +213,93 @@ describe('dropped-transaction evidence', () => {
     // Single-RPC deployment: its answer stands.
     expect(collapseConfirmedCounts([9], 1)).toBe(9)
     expect(collapseConfirmedCounts([null], 1)).toBeNull()
+  })
+})
+
+describe('EvmService receipt-path revert quorum', () => {
+  const account = '0xAbC0000000000000000000000000000000000001'
+
+  function armUnwrapFlow() {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {}})
+    h.walletClient.writeContract.mockResolvedValue(`0x${'aa'.repeat(32)}`)
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'reverted', logs: []})
+  }
+
+  it('classifies a receipt revert as reverted only when the RPC quorum corroborates it', async () => {
+    armUnwrapFlow()
+    // Every outcome client sees the reverted receipt → consensus revert.
+    h.publicClient.getTransactionReceipt.mockResolvedValue({status: 'reverted'})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+    )).rejects.toMatchObject({name: 'EvmSubmissionError', kind: 'reverted'})
+  })
+
+  it('downgrades an uncorroborated receipt revert to confirmation-unknown', async () => {
+    // The fallback transport's first responder said reverted, but the quorum
+    // still sees the transaction pending — a stale/forked RPC must not be able
+    // to release safety locks and authorize a retry.
+    armUnwrapFlow()
+    const {TransactionReceiptNotFoundError} = await import('viem')
+    h.publicClient.getTransactionReceipt.mockRejectedValue(
+      new TransactionReceiptNotFoundError({hash: `0x${'aa'.repeat(32)}`}),
+    )
+    h.publicClient.getTransaction.mockResolvedValue({from: account, nonce: 1})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+    )).rejects.toMatchObject({name: 'EvmSubmissionError', kind: 'confirmation-unknown'})
+  })
+})
+
+describe('EvmService.findUnwrappedEvents', () => {
+  it('unions events across RPCs and reports how many responded', async () => {
+    h.publicClient.getLogs.mockResolvedValue([
+      {
+        transactionHash: `0x${'ab'.repeat(32)}`,
+        logIndex: 3,
+        args: {from: '0xSender', token: '0xToken', to: 'z1qrecipient', amount: 100n},
+      },
+    ])
+    const {EvmService} = await import('./evm-service')
+    const {config} = await import('@/config')
+
+    const result = await EvmService.getInstance().findUnwrappedEvents(
+      '0xB000000000000000000000000000000000000002',
+      '0xSender' as never,
+      1n,
+    )
+    expect(result.responsiveClients).toBe(config.evmRpcUrls.length)
+    expect(result.events).toEqual([
+      {
+        transactionHash: `0x${'ab'.repeat(32)}`,
+        logIndex: 3,
+        token: '0xToken',
+        to: 'z1qrecipient',
+        amount: 100n,
+      },
+    ])
+  })
+
+  it('reports zero responsive clients when every RPC fails', async () => {
+    h.publicClient.getLogs.mockRejectedValue(new Error('rpc down'))
+    const {EvmService} = await import('./evm-service')
+
+    const result = await EvmService.getInstance().findUnwrappedEvents(
+      '0xB000000000000000000000000000000000000002',
+      '0xSender' as never,
+      1n,
+    )
+    expect(result).toEqual({events: [], responsiveClients: 0})
   })
 })
 
@@ -535,11 +626,12 @@ describe('EvmService write verification', () => {
     expect(h.walletClient.writeContract).toHaveBeenCalledWith({simulated: 'unwrap'})
   })
 
-  it('rejects a reverted unwrap receipt', async () => {
+  it('rejects a reverted unwrap receipt once the quorum corroborates the revert', async () => {
     h.walletClient.requestAddresses.mockResolvedValue([account])
     h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'unwrap'}})
     h.walletClient.writeContract.mockResolvedValue('0xunwraptx')
     h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'reverted', logs: []})
+    h.publicClient.getTransactionReceipt.mockResolvedValue({status: 'reverted'})
     const {EvmService} = await import('./evm-service')
 
     await expect(

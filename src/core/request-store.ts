@@ -136,6 +136,42 @@ async function persist(): Promise<void> {
   await storageService.set(STORAGE_KEY, mirror ?? [])
 }
 
+// Tracked-request mutations are read-apply-write like the lock document:
+// re-read the latest stored list under a cross-context write lock, apply, and
+// persist — a whole-document write from a stale mirror would silently drop
+// another tab's submitted transfer. Rolls back on persist failure.
+let requestsDirty = false
+let requestsWriteQueue: Promise<unknown> = Promise.resolve()
+
+function mutateRequests(
+  mutate: (list: TrackedRequest[]) => TrackedRequest[] | null,
+): Promise<void> {
+  const run = () => requestStore.withCrossContextLock('tracked-requests-write', async () => {
+    const stored = (await storageService.get<TrackedRequest[]>(STORAGE_KEY)) ?? []
+    const next = mutate(stored)
+    if (next === null) {
+      mirror = stored
+      return
+    }
+    requestsDirty = true
+    mirror = next
+    bumpRevision()
+    try {
+      await storageService.set(STORAGE_KEY, next)
+    } catch (e) {
+      // A rejected mutation must leave no trace (mutation applied iff resolved).
+      mirror = stored
+      bumpRevision()
+      throw e
+    } finally {
+      requestsDirty = false
+    }
+  })
+  const nextPromise = requestsWriteQueue.then(run, run)
+  requestsWriteQueue = nextPromise.catch(() => undefined)
+  return nextPromise
+}
+
 async function ensureLocksLoaded(): Promise<PendingActionLocks> {
   if (locksMirror === null) {
     locksMirror = normalizeLocks(await storageService.get<PendingActionLocks>(LOCKS_STORAGE_KEY))
@@ -219,6 +255,17 @@ function notifyLocksChanged(): void {
   }
 }
 
+;(storageService as SubscribableStorage).subscribe?.<TrackedRequest[]>(
+  STORAGE_KEY,
+  incoming => {
+    // Our own in-flight write is authoritative over any event racing it; the
+    // event's content predates the fresh read taken under the write lock.
+    if (requestsDirty) return
+    mirror = incoming ?? []
+    bumpRevision()
+  },
+)
+
 ;(storageService as SubscribableStorage).subscribe?.<PendingActionLocks>(
   LOCKS_STORAGE_KEY,
   incoming => {
@@ -244,35 +291,31 @@ export const requestStore = {
   },
 
   async trackWrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
-    const list = await ensureLoaded()
-    if (list.some(e => e.id === r.id)) return
-    list.push({
-      kind: 'wrap',
-      evmChainId: config.evmChainId,
-      zenonChainId: config.zenonChainId,
-      ...r,
-    })
-    bumpRevision()
-    await persist()
+    await mutateRequests(list => list.some(e => e.id === r.id)
+      ? null
+      : [...list, {
+          kind: 'wrap' as const,
+          evmChainId: config.evmChainId,
+          zenonChainId: config.zenonChainId,
+          ...r,
+        }])
   },
 
   async trackUnwrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
-    const list = await ensureLoaded()
     const transactionHash = normalizeEvmHash(r.id.split(':')[0])
-    if (list.some(e =>
+    await mutateRequests(list => list.some(e =>
       e.kind === 'unwrap' &&
       e.evmChainId === config.evmChainId &&
       e.zenonChainId === config.zenonChainId &&
       normalizeEvmHash(e.id.split(':')[0]) === transactionHash,
-    )) return
-    list.push({
-      kind: 'unwrap',
-      evmChainId: config.evmChainId,
-      zenonChainId: config.zenonChainId,
-      ...r,
-    })
-    bumpRevision()
-    await persist()
+    )
+      ? null
+      : [...list, {
+          kind: 'unwrap' as const,
+          evmChainId: config.evmChainId,
+          zenonChainId: config.zenonChainId,
+          ...r,
+        }])
   },
 
   async getAll(): Promise<TrackedRequest[]> {
@@ -357,11 +400,9 @@ export const requestStore = {
   },
 
   async prune(predicate: (r: TrackedRequest) => boolean): Promise<void> {
-    const list = await ensureLoaded()
-    const next = list.filter(r => !predicate(r))
-    if (next.length === list.length) return
-    mirror = next
-    bumpRevision()
-    await persist()
+    await mutateRequests(list => {
+      const next = list.filter(r => !predicate(r))
+      return next.length === list.length ? null : next
+    })
   },
 }

@@ -52,12 +52,18 @@ vi.mock('./zenon-service', () => ({
   ZenonService: {getInstance: vi.fn(() => h.zenonService)},
 }))
 
-vi.mock('znn-typescript-sdk', () => ({
-  extractNumberDecimals: h.extractNumberDecimals,
-  TokenStandard: {parse: h.parse},
-  Hash: {parse: h.hashParse},
-  Address: {parse: h.addressParse},
-}))
+vi.mock('znn-typescript-sdk', async importOriginal => {
+  const actual = await importOriginal<typeof import('znn-typescript-sdk')>()
+  return {
+    extractNumberDecimals: h.extractNumberDecimals,
+    TokenStandard: {parse: h.parse},
+    Hash: {parse: h.hashParse},
+    Address: {parse: h.addressParse},
+    // Real ABI machinery: the WrapToken calldata decode must be genuine.
+    BridgeContract: actual.BridgeContract,
+    BRIDGE_ADDRESS: actual.BRIDGE_ADDRESS,
+  }
+})
 
 beforeEach(() => {
   vi.resetModules()
@@ -209,5 +215,30 @@ describe('BridgeService.buildRedeemBlock', () => {
     expect(h.hashParse).toHaveBeenCalledWith('0xevmtxhash')
     expect(h.redeem).toHaveBeenCalledWith(parsedHash, 4)
     expect(block).toEqual({__block: true})
+  })
+})
+
+describe('decodeWrapTokenCall', () => {
+  it('decodes a genuine WrapToken payload and fails closed on everything else', async () => {
+    const {decodeWrapTokenCall} = await import('./bridge-service')
+    const {BridgeContract} = await vi.importActual<typeof import('znn-typescript-sdk')>('znn-typescript-sdk')
+    const encoded = BridgeContract.encodeCall('WrapToken', [2, 1, '0xRecipient'])
+    const data = Buffer.from(encoded.replace(/^0x/i, ''), 'hex')
+
+    expect(decodeWrapTokenCall(data)).toEqual({
+      evmToAddress: '0xRecipient',
+      networkClass: 2,
+      chainId: 1,
+    })
+    expect(decodeWrapTokenCall(undefined)).toEqual({
+      evmToAddress: null,
+      networkClass: null,
+      chainId: null,
+    })
+    expect(decodeWrapTokenCall(Buffer.from('deadbeef', 'hex'))).toEqual({
+      evmToAddress: null,
+      networkClass: null,
+      chainId: null,
+    })
   })
 })

@@ -73,7 +73,7 @@ beforeEach(() => {
   h.setUnknownWrap.mockResolvedValue(undefined)
   h.clearUnknownWrap.mockResolvedValue(undefined)
   h.getAccountFrontierHeight.mockResolvedValue(0)
-  h.getSnapshot.mockResolvedValue({evmClaims: {}})
+  h.getSnapshot.mockResolvedValue({evmClaims: {}, unknownWraps: {}, requests: []})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
 })
 
@@ -134,6 +134,86 @@ describe('useWrap.wrap', () => {
       kind: 'rejected',
     })
     expect(useWrap().phase.value).toMatchObject({kind: 'failed'})
+  })
+
+  it('serializes the submission under an account-scoped cross-context lock', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.send.mockResolvedValue({hash: {toString: () => 'wraphash'}})
+    const {useWrap} = await import('./useWrap')
+
+    await useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender')
+
+    expect(h.withCrossContextLock).toHaveBeenCalledWith(
+      'wrap-submit:z1qsender',
+      expect.any(Function),
+    )
+  })
+
+  it('refuses inside the lock when another context holds an unknown-wrap intent for the account', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.getSnapshot.mockResolvedValue({
+      evmClaims: {},
+      requests: [],
+      unknownWraps: {
+        'other-tab-op': {
+          evmToAddress: '0xRecipient',
+          zenonFromAddress: 'z1qsender',
+          frontierHeight: 1,
+          zts: 'zts1znn',
+          amount: '100000000',
+          decimals: 8,
+          symbol: 'ZNN',
+          createdAt: 1,
+        },
+      },
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('in progress')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.setUnknownWrap).not.toHaveBeenCalled()
+  })
+
+  it('refuses a queued submission when a wrap was recorded after this click', async () => {
+    // Tab B clicked while tab A was submitting; B queued on the Web Lock and
+    // must not re-submit once A's transfer is durably recorded.
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.getSnapshot.mockResolvedValue({
+      evmClaims: {},
+      unknownWraps: {},
+      requests: [{kind: 'wrap', id: 'a-just-submitted', createdAt: Date.now() + 60_000}],
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('another context')
+    expect(h.send).not.toHaveBeenCalled()
+  })
+
+  it('synchronously refuses a second wrap while one is in flight', async () => {
+    // The duplicate check must not depend on any awaited work: two rapid
+    // submissions racing a network request must never both reach the wallet.
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    let finishSend: (value: unknown) => void = () => undefined
+    h.send.mockReturnValue(new Promise(resolve => {
+      finishSend = resolve
+    }))
+    const {useWrap} = await import('./useWrap')
+
+    const first = useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender')
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('already in progress')
+    finishSend({hash: {toString: () => 'wraphash'}})
+    await expect(first).resolves.toEqual({id: 'wraphash', trackingFailed: false})
+    expect(h.send).toHaveBeenCalledTimes(1)
   })
 
   it('persists the safety intent BEFORE the wallet call and keeps it on ambiguity', async () => {
@@ -220,6 +300,38 @@ describe('useWrap.wrap', () => {
       useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
     ).resolves.toEqual({id: 'wraphash', trackingFailed: true})
     expect(h.clearUnknownWrap).not.toHaveBeenCalled()
+  })
+})
+
+describe('useWrap.recoverClaimPlaceholder', () => {
+  it('releases an orphaned pre-prompt placeholder through the recovery action', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'awaiting-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('released')
+    expect(h.clearPendingEvmClaim).toHaveBeenCalledWith('1a2b')
+  })
+
+  it('keeps ambiguous and real-hash locks', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'ambiguous-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: '0xrealhash', stage: 1, updatedAt: 1}},
+    })
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+    expect(h.clearPendingEvmClaim).not.toHaveBeenCalled()
   })
 })
 

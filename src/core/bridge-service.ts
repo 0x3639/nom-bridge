@@ -1,15 +1,42 @@
 import {ZenonService} from './zenon-service'
 import {config} from '@/config'
-import {Address, BRIDGE_ADDRESS, Hash, TokenStandard} from 'znn-typescript-sdk'
+import {Address, BRIDGE_ADDRESS, BridgeContract, Hash, TokenStandard} from 'znn-typescript-sdk'
 import {parseAmount} from './amount'
 import type {
   AccountBlockTemplate,
   BridgeInfo,
   BridgeNetworkInfo,
   OrchestratorInfo,
+  UnwrapTokenRequest,
   UnwrapTokenRequestList,
   WrapTokenRequestList,
 } from 'znn-typescript-sdk'
+
+// Decode an account block's payload as the embedded bridge's WrapToken call.
+// Anything that fails to decode — or decodes to a different method — yields
+// nulls, which reconciliation treats as not-a-match (fail closed).
+export function decodeWrapTokenCall(data: Buffer | Uint8Array | undefined): {
+  evmToAddress: string | null
+  networkClass: number | null
+  chainId: number | null
+} {
+  const empty = {evmToAddress: null, networkClass: null, chainId: null}
+  if (!data || data.length === 0) return empty
+  try {
+    const hex = '0x' + Buffer.from(data).toString('hex')
+    const decoded = BridgeContract.decodeCallData(hex, true)
+    if (decoded.name !== 'WrapToken') return empty
+    const args = decoded.args as {networkClass?: unknown; chainId?: unknown; toAddress?: unknown}
+    if (typeof args.toAddress !== 'string') return empty
+    return {
+      evmToAddress: args.toAddress,
+      networkClass: Number(args.networkClass),
+      chainId: Number(args.chainId),
+    }
+  } catch {
+    return empty
+  }
+}
 
 export class BridgeService {
   private static instance: BridgeService | null = null
@@ -106,16 +133,35 @@ export class BridgeService {
 
   // Sends from `address` to the embedded bridge contract with height above
   // `afterHeight` — the authoritative account-chain evidence that a wrap was
-  // published. Pages are newest-first; scanning stops once heights fall to or
-  // below the recorded frontier.
+  // published. The WrapToken calldata is decoded so callers can verify the
+  // exact EVM destination and chain; a payload that does not decode as
+  // WrapToken yields null fields (which reconciliation treats as no match).
+  // Pages are newest-first; scanning stops once heights fall to or below the
+  // recorded frontier.
   async findWrapSendsAfter(
     address: string,
     afterHeight: number,
-  ): Promise<Array<{hash: string; height: number; zts: string; amount: string}>> {
+  ): Promise<Array<{
+    hash: string
+    height: number
+    zts: string
+    amount: string
+    evmToAddress: string | null
+    networkClass: number | null
+    chainId: number | null
+  }>> {
     await this.ensureInitialized()
     const ledger = this.zenonService.getZenon().ledger
     const parsed = Address.parse(address)
-    const results: Array<{hash: string; height: number; zts: string; amount: string}> = []
+    const results: Array<{
+      hash: string
+      height: number
+      zts: string
+      amount: string
+      evmToAddress: string | null
+      networkClass: number | null
+      chainId: number | null
+    }> = []
     for (let page = 0; page < 20; page += 1) {
       const response = await ledger.getAccountBlocksByPage(parsed, page, 50)
       const blocks = response.list ?? []
@@ -132,11 +178,41 @@ export class BridgeService {
           height: block.height,
           zts: block.tokenStandard.toString(),
           amount: block.amount.toString(),
+          ...decodeWrapTokenCall(block.data),
         })
       }
       if (reachedBaseline) break
     }
     return results
+  }
+
+  // Fresh single-request read (redeemed/revoked flags) for evidence checks.
+  // Returns null when the node does not know the request.
+  async getUnwrapRequest(txHash: string, logIndex: number): Promise<UnwrapTokenRequest | null> {
+    await this.ensureInitialized()
+    try {
+      return await this.zenonService
+        .getZenon()
+        .embedded.bridge.getUnwrapTokenRequestByHashAndLog(Hash.parse(txHash), logIndex)
+    } catch {
+      return null
+    }
+  }
+
+  // Outcome of a published account block, for resolving a Zenon redeem whose
+  // embedded call may have failed on-chain: 'processed' — the block confirmed
+  // AND the contract's receive block exists (the embedded call ran, so if the
+  // request is still redeemable the call failed); 'pending' — published but
+  // not yet received by the contract; 'not-found' — the node does not know
+  // the hash.
+  async getAccountBlockOutcome(hash: string): Promise<'processed' | 'pending' | 'not-found'> {
+    await this.ensureInitialized()
+    const block = await this.zenonService
+      .getZenon()
+      .ledger.getAccountBlockByHash(Hash.parse(hash))
+    if (!block) return 'not-found'
+    if (block.confirmationDetail && block.pairedAccountBlock) return 'processed'
+    return 'pending'
   }
 
   buildWrapBlock(

@@ -68,6 +68,7 @@ const {
   clearPendingRedeem: clearPendingWrapRedeem,
   clearLocalPendingRedeem: clearLocalPendingWrapRedeem,
   recheckPendingRedeem: recheckPendingWrapRedeem,
+  recoverClaimPlaceholder: recoverWrapClaimPlaceholder,
   resetPhase: resetWrapPhase,
   clearPhase: clearWrapPhase,
   error: wrapError,
@@ -80,6 +81,7 @@ const {
   pendingRedeems: pendingUnwrapRedeems,
   clearPendingRedeem: clearPendingUnwrapRedeem,
   clearLocalPendingRedeem: clearLocalPendingUnwrapRedeem,
+  recheckZenonRedeem,
   recheckSubmittedUnwrap,
   resetPhase: resetUnwrapPhase,
   clearPhase: clearUnwrapPhase,
@@ -597,7 +599,22 @@ watch([wrapRequests, unwrapRequests], () => {
   }
 }, {immediate: true})
 
+// Synchronous submit mutex: both submit paths await refreshBridge() before the
+// composables set their in-flight flags, so a second click during that network
+// request would otherwise start a second source transfer.
+let submitInFlight = false
+
 async function onSubmit(): Promise<void> {
+  if (submitInFlight) return
+  submitInFlight = true
+  try {
+    await onSubmitLocked()
+  } finally {
+    submitInFlight = false
+  }
+}
+
+async function onSubmitLocked(): Promise<void> {
   localError.value = null
   lastSubmitted.value = null
   lastCompleted.value = null
@@ -653,7 +670,8 @@ async function onUnwrapSubmit(): Promise<void> {
   localError.value = null
   const bridge = bridgeAddress.value
   const zts = selectedPair.value?.zts
-  if (!zts || !zenonAddress.value || !bridge) return
+  const evmFrom = evmAccount.value
+  if (!zts || !zenonAddress.value || !bridge || !evmFrom) return
   try {
     await refreshBridge()
     if (halted.value || allowKeyGen.value) {
@@ -674,6 +692,7 @@ async function onUnwrapSubmit(): Promise<void> {
       pair.zts,
       pair.decimals,
       pair.symbol,
+      evmFrom,
     )
     const {hash} = result
     toast.show(
@@ -792,7 +811,7 @@ async function onRecheckSubmittedUnwrap(): Promise<void> {
       toast.show('Ethereum confirms the transaction reverted. It is safe to retry.', 'info')
       await refreshRequestsSafely()
     } else if (outcome === 'absent') {
-      toast.show('No configured RPC knows this transaction yet. The safety lock remains active; if it stays unknown, the tracked transfer is released automatically.', 'info')
+      toast.show('No configured RPC knows this transaction yet. The safety lock remains active until its outcome can be proven.', 'info')
     } else {
       toast.show('Ethereum could not confirm success or failure across the configured RPCs. The safety lock remains active.', 'info')
     }
@@ -810,12 +829,19 @@ async function onRecheckWrap(request: WrapRequestView): Promise<void> {
     ? persisted
     : pendingWrapRedeemHashes.value[request.id]
   if (!hash) {
-    // Placeholder-only or no lock: polling releases an orphaned placeholder
-    // automatically once no context holds its Web Lock.
-    if (!persisted) clearLocalPendingWrapRedeem(request.id)
+    if (!persisted) {
+      clearLocalPendingWrapRedeem(request.id)
+      await refreshRequestsSafely()
+      return
+    }
+    // Placeholder-only lock: recover it here, under the claim's Web Lock —
+    // this is the only UI-reachable path for a crash-orphaned placeholder.
+    const recovery = await recoverWrapClaimPlaceholder(request.id)
     await refreshRequestsSafely()
-    if (persisted) {
-      toast.show('No transaction was recorded for this claim. If the wallet prompt was abandoned, the lock releases automatically.', 'info')
+    if (recovery === 'released') {
+      toast.show('The abandoned claim attempt was cleared. You can claim again.', 'info')
+    } else if (recovery === 'kept') {
+      toast.show('The previous claim attempt is still unresolved; the safety lock remains active.', 'info')
     }
     return
   }
@@ -826,7 +852,7 @@ async function onRecheckWrap(request: WrapRequestView): Promise<void> {
   } else if (outcome === 'confirmed') {
     toast.show('The claim transaction is confirmed; refreshing bridge state.', 'success')
   } else if (outcome === 'absent') {
-    toast.show('No configured RPC knows this transaction. The safety lock remains active; if the transaction stays unknown, the lock releases automatically.', 'info')
+    toast.show('No configured RPC knows this transaction. The safety lock remains active until its outcome can be proven.', 'info')
   } else {
     toast.show('The claim could not be confirmed or reverted across the configured RPCs. Its safety lock remains active.', 'info')
   }
@@ -834,9 +860,26 @@ async function onRecheckWrap(request: WrapRequestView): Promise<void> {
 
 async function onRecheckUnwrap(request: UnwrapRequestView): Promise<void> {
   await refreshRequestsSafely()
-  const current = unwrapRequests.value.find(candidate => candidate.id === request.id)
-  if (current?.status === 'redeemed') toast.show('Zenon confirms the redemption completed.', 'success')
-  else toast.show('Zenon has not confirmed completion. The safety lock remains active.', 'info')
+  const current = unwrapRequests.value.find(candidate => candidate.id === request.id) ?? request
+  if (current.status === 'redeemed') {
+    toast.show('Zenon confirms the redemption completed.', 'success')
+    return
+  }
+  if (current.pendingZenonRedeemHash) {
+    // Evidence-based lock resolution: probes the published block's outcome on
+    // the account chain, or recovers a crash-orphaned placeholder.
+    const result = await recheckZenonRedeem(current)
+    await refreshRequestsSafely()
+    if (result === 'released-failed') {
+      toast.show('Zenon confirms the redemption failed on-chain. It is safe to retry.', 'info')
+    } else if (result === 'released-orphan') {
+      toast.show('The abandoned redemption attempt was cleared. You can redeem again.', 'info')
+    } else {
+      toast.show('The redemption is not confirmed yet. The safety lock remains active.', 'info')
+    }
+    return
+  }
+  toast.show('Zenon has not confirmed completion. The safety lock remains active.', 'info')
 }
 
 function dismissSubmittedNotice(): void {

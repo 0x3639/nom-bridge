@@ -54,12 +54,15 @@ describe('requestStore', () => {
     expect(all[0]).toMatchObject({evmChainId: 1, zenonChainId: 1})
   })
 
-  it('loads from storage only once across repeated reads', async () => {
+  it('serves repeated reads from the mirror; only writes re-read storage', async () => {
     const {requestStore} = await import('./request-store')
     await requestStore.getAll()
     await requestStore.getAll()
-    await requestStore.trackWrap(wrapFixture('a'))
     expect(h.get).toHaveBeenCalledTimes(1)
+    // A mutation performs its own fresh read under the write lock (read-apply-
+    // write), so it may add exactly one more.
+    await requestStore.trackWrap(wrapFixture('a'))
+    expect(h.get).toHaveBeenCalledTimes(2)
   })
 
   it('persists via set on each mutation', async () => {
@@ -370,6 +373,52 @@ describe('requestStore', () => {
     expect((await requestStore.getSnapshot()).unknownWraps['op-1']).toEqual(operation)
     await requestStore.clearUnknownWrap('op-1')
     expect((await requestStore.getSnapshot()).unknownWraps['op-1']).toBeUndefined()
+  })
+
+  it('does not clobber another context\'s tracked request written between mutations', async () => {
+    const {requestStore} = await import('./request-store')
+    await requestStore.trackWrap(wrapFixture('mine'))
+
+    // Another context appends its own tracked transfer directly to storage;
+    // no storage event is delivered (worst case).
+    const stored = (h.values.get('nom-bridge:requests:v2') ?? []) as unknown[]
+    h.values.set('nom-bridge:requests:v2', [
+      ...stored,
+      {kind: 'wrap', evmChainId: 1, zenonChainId: 1, ...wrapFixture('theirs')},
+    ])
+
+    await requestStore.trackWrap(wrapFixture('mine-2'))
+
+    const final = h.values.get('nom-bridge:requests:v2') as Array<{id: string}>
+    expect(final.map(entry => entry.id).sort()).toEqual(['mine', 'mine-2', 'theirs'])
+  })
+
+  it('refreshes tracked requests written by another browser context', async () => {
+    const {requestStore} = await import('./request-store')
+    expect(await requestStore.getAll()).toEqual([])
+
+    const external = [{kind: 'unwrap', evmChainId: 1, zenonChainId: 1, ...wrapFixture('0xabc:-1')}]
+    h.values.set('nom-bridge:requests:v2', external)
+    h.listeners.get('nom-bridge:requests:v2')?.(external)
+
+    expect(await requestStore.getAll()).toHaveLength(1)
+    expect((await requestStore.getSnapshot()).requests[0]).toMatchObject({id: '0xabc:-1'})
+  })
+
+  it('serializes tracked-request mutations through a cross-context write lock when available', async () => {
+    const lockNames: string[] = []
+    const request = vi.fn(
+      async (name: string, _options: unknown, action: () => Promise<unknown>) => {
+        lockNames.push(name)
+        return action()
+      },
+    )
+    vi.stubGlobal('navigator', {locks: {request}})
+    const {requestStore} = await import('./request-store')
+
+    await requestStore.trackWrap(wrapFixture('a'))
+
+    expect(lockNames).toContain('nom-bridge:tracked-requests-write')
   })
 
   it('notifies lock listeners on local mutations and cross-context storage events', async () => {
