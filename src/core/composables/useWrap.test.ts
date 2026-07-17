@@ -19,6 +19,8 @@ const h = vi.hoisted(() => ({
   getAuthoritativeOutcome: vi.fn(),
   getSnapshot: vi.fn(),
   withCrossContextLock: vi.fn(),
+  withExclusiveSourceLock: vi.fn(),
+  hasCrossContextLocks: vi.fn(),
   extractNumberDecimals: vi.fn(),
 }))
 
@@ -57,6 +59,8 @@ vi.mock('../request-store', () => ({
     clearUnknownWrap: h.clearUnknownWrap,
     getSnapshot: h.getSnapshot,
     withCrossContextLock: h.withCrossContextLock,
+    withExclusiveSourceLock: h.withExclusiveSourceLock,
+    hasCrossContextLocks: h.hasCrossContextLocks,
   },
 }))
 
@@ -75,6 +79,8 @@ beforeEach(() => {
   h.getAccountFrontierHeight.mockResolvedValue(0)
   h.getSnapshot.mockResolvedValue({evmClaims: {}, unknownWraps: {}, requests: []})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withExclusiveSourceLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.hasCrossContextLocks.mockReturnValue(true)
 })
 
 describe('useWrap.wrap', () => {
@@ -136,7 +142,10 @@ describe('useWrap.wrap', () => {
     expect(useWrap().phase.value).toMatchObject({kind: 'failed'})
   })
 
-  it('serializes the submission under an account-scoped cross-context lock', async () => {
+  it('submits under a NON-QUEUING account-scoped exclusive lock', async () => {
+    // Queuing is unsafe for source transfers: a queued click would execute
+    // after another tab's completed submission, against state the user never
+    // saw, and could transfer twice.
     h.buildWrapBlock.mockReturnValue({__block: true})
     h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
     h.send.mockResolvedValue({hash: {toString: () => 'wraphash'}})
@@ -144,10 +153,26 @@ describe('useWrap.wrap', () => {
 
     await useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender')
 
-    expect(h.withCrossContextLock).toHaveBeenCalledWith(
+    expect(h.withExclusiveSourceLock).toHaveBeenCalledWith(
       'wrap-submit:z1qsender',
       expect.any(Function),
     )
+  })
+
+  it('surfaces an occupied source lock as a failure without opening the wallet', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.withExclusiveSourceLock.mockRejectedValue(
+      new Error('A submission for this account is already in progress in another tab or window'),
+    )
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('another tab')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(useWrap().phase.value).toMatchObject({kind: 'failed'})
+    expect(useWrap().isWrapping.value).toBe(false)
   })
 
   it('refuses inside the lock when another context holds an unknown-wrap intent for the account', async () => {
@@ -331,6 +356,34 @@ describe('useWrap.recoverClaimPlaceholder', () => {
       evmClaims: {'1a2b': {hash: '0xrealhash', stage: 1, updatedAt: 1}},
     })
     await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+    expect(h.clearPendingEvmClaim).not.toHaveBeenCalled()
+  })
+
+  it('never reclaims a placeholder without real cross-context exclusion', async () => {
+    // Reclaim's proof is "we hold the Web Lock, so the writer is dead" — with
+    // no Web Locks API that proof does not exist and the writer may be live.
+    h.hasCrossContextLocks.mockReturnValue(false)
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'awaiting-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+    const request = {
+      id: {toString: () => '1a2b'},
+      toAddress: '0xTo00000000000000000000000000000000000001',
+      tokenAddress: '0xToken00000000000000000000000000000000002',
+      amount: {toString: () => '100000000'},
+      fee: {toString: () => '250000'},
+      signature: 'c2lnbmF0dXJl',
+      tokenStandard: {toString: () => 'zts1znn'},
+    }
+    await expect(useWrap().redeemEvm(
+      request as never,
+      '0xBridge00000000000000000000000000000000',
+    )).rejects.toThrow('already in progress')
     expect(h.clearPendingEvmClaim).not.toHaveBeenCalled()
   })
 })

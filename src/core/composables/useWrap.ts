@@ -98,9 +98,11 @@ async function wrap(
   phase.value = {kind: 'submitting-wrap'}
   let lockedFlowRan = false
   try {
-    // Account-scoped cross-context lock: two tabs can otherwise both pass
-    // their UI gates and open two Syrius prompts for the same transfer.
-    return await requestStore.withCrossContextLock(
+    // Account-scoped NON-QUEUING exclusive lock: two tabs can otherwise both
+    // pass their UI gates and open two Syrius prompts for the same transfer,
+    // and a QUEUED click would run after the other tab's completed submission
+    // against state the user never saw. Fails closed without Web Locks.
+    return await requestStore.withExclusiveSourceLock(
       `wrap-submit:${zenonFromAddress}`,
       () => {
         lockedFlowRan = true
@@ -234,13 +236,15 @@ async function redeemEvmLocked(
     // A leftover pre-prompt placeholder is reclaimable here: this flow holds
     // the exclusive Web Lock, so the flow that wrote it has terminated, and a
     // terminating flow always clears or upgrades its placeholder — a survivor
-    // means it died mid-prompt, taking its MetaMask popup with it. Real-hash
-    // and ambiguous locks always refuse.
+    // means it died mid-prompt, taking its MetaMask popup with it. That proof
+    // requires the Web Locks API to actually exist (without it the writer may
+    // be live in another tab). Real-hash and ambiguous locks always refuse.
     const existingLock = evmClaims[requestId]
-    if (
-      existingLock &&
-      !canReclaimPlaceholderLock(existingLock.hash, existingLock.updatedAt, Date.now(), 0)
-    ) throw new Error('A claim for this request is already in progress')
+    const reclaimable =
+      requestStore.hasCrossContextLocks() &&
+      existingLock !== undefined &&
+      canReclaimPlaceholderLock(existingLock.hash, existingLock.updatedAt, Date.now(), 0)
+    if (existingLock && !reclaimable) throw new Error('A claim for this request is already in progress')
     const progress = await EvmService.getInstance().getWrapRedeemProgress(bridge, token, wrapId)
     if (progress.kind === 'fully-redeemed') return {kind: 'already-redeemed'}
     if (progress.kind === 'waiting-delay' && progress.remainingSeconds > 0) {
@@ -351,6 +355,8 @@ async function recoverClaimPlaceholder(requestId: string): Promise<'released' | 
     const {evmClaims} = await requestStore.getSnapshot()
     const lock = evmClaims[requestId]
     if (!lock) return 'no-lock'
+    // Without the Web Locks API the "writer is dead" proof does not exist.
+    if (!requestStore.hasCrossContextLocks()) return 'kept'
     if (!canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), 0)) return 'kept'
     await requestStore.clearPendingEvmClaim(requestId)
     setPendingRedeem(requestId)

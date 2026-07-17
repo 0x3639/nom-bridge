@@ -103,6 +103,24 @@ export interface AuthoritativeOutcomeWithFacts {
   nonce?: number
 }
 
+// On-chain redeem state for a wrap request id: 'unredeemed' — no claim ever
+// landed; 'partial' — the first claim landed, the final one has not;
+// 'fully-redeemed' — both claims done.
+export type RedeemState = 'unredeemed' | 'partial' | 'fully-redeemed'
+
+// Release evidence requires a unanimous responsive quorum (≥2 unless only one
+// RPC is configured): one stale RPC reporting "unadvanced" progress must not
+// authorize releasing a claim lock whose replacement claim actually landed.
+export function collapseRedeemStates(
+  states: Array<RedeemState | null>,
+  totalClients: number,
+): RedeemState | null {
+  const responsive = states.filter((state): state is RedeemState => state !== null)
+  const required = totalClients === 1 ? 1 : 2
+  if (responsive.length < required) return null
+  return responsive.every(state => state === responsive[0]) ? responsive[0] : null
+}
+
 export interface UnwrappedEventRecord {
   transactionHash: string
   logIndex: number
@@ -295,6 +313,27 @@ export class EvmService {
       ),
     )
     return collapseConfirmedCounts(counts, this.outcomeClients.length)
+  }
+
+  // Quorum-corroborated redeem state for a wrap request, read directly from
+  // redeemsInfo on every configured RPC. Null when the quorum cannot be met —
+  // callers must then keep their locks (fail closed).
+  async getCorroboratedRedeemState(bridge: Address, wrapRequestId: Hex): Promise<RedeemState | null> {
+    const states = await Promise.all(
+      this.outcomeClients.map(client =>
+        client.readContract({
+          address: bridge,
+          abi: bridgeAbi,
+          functionName: 'redeemsInfo',
+          args: [BigInt(wrapRequestId)],
+        }).then(([blockNumber]): RedeemState => {
+          if (blockNumber === 0n) return 'unredeemed'
+          if (blockNumber === UINT256_MAX) return 'fully-redeemed'
+          return 'partial'
+        }).catch(() => null),
+      ),
+    )
+    return collapseRedeemStates(states, this.outcomeClients.length)
   }
 
   // Unwrapped events emitted by the bridge for `from` since `fromBlock`,

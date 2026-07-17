@@ -77,9 +77,11 @@ async function unwrap(
   phase.value = {kind: 'checking-allowance'}
   let lockedFlowRan = false
   try {
-    // Account-scoped cross-context lock: two tabs can otherwise both pass
-    // their UI gates and open two MetaMask prompts for the same transfer.
-    return await requestStore.withCrossContextLock(
+    // Account-scoped NON-QUEUING exclusive lock: two tabs can otherwise both
+    // pass their UI gates and open two MetaMask prompts for the same transfer,
+    // and a QUEUED click would run after the other tab's completed submission
+    // against state the user never saw. Fails closed without Web Locks.
+    return await requestStore.withExclusiveSourceLock(
       `unwrap-submit:${evmFromAddress.toLowerCase()}`,
       () => {
         lockedFlowRan = true
@@ -216,15 +218,16 @@ async function redeemZenonLocked(request: UnwrapRequestView): Promise<string> {
     // the placeholder must be older than any plausible prompt lifetime before
     // a new flow may overwrite it. Real-hash and ambiguous locks always refuse.
     const existingLock = snapshot.zenonRedeems[transactionHash]
-    if (
-      existingLock &&
-      !canReclaimPlaceholderLock(
+    const reclaimable =
+      requestStore.hasCrossContextLocks() &&
+      existingLock !== undefined &&
+      canReclaimPlaceholderLock(
         existingLock.hash,
         existingLock.updatedAt,
         Date.now(),
         PLACEHOLDER_LOCK_STALE_MS,
       )
-    ) {
+    if (existingLock && !reclaimable) {
       throw new Error('A Zenon redemption for this request is already in progress')
     }
     ownsLock = true
@@ -302,7 +305,11 @@ async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRede
     const lock = snapshot.zenonRedeems[transactionHash]
     if (!lock) return 'no-lock'
     if (lock.hash === AWAITING_WALLET_RESULT) {
-      if (canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)) {
+      // The orphan proof requires real Web Lock exclusion to exist at all.
+      if (
+        requestStore.hasCrossContextLocks() &&
+        canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)
+      ) {
         await requestStore.clearPendingZenonRedeem(transactionHash)
         setPendingRedeem(request.id)
         return 'released-orphan'

@@ -440,6 +440,50 @@ describe('requestStore', () => {
     expect(listener).toHaveBeenCalledTimes(2)
   })
 
+  it('rejects an exclusive source lock immediately when another context holds it', async () => {
+    // Source submissions must NOT queue: a queued click would execute later
+    // against state the user never saw and could submit a second transfer.
+    const request = vi.fn(
+      async (_name: string, _options: unknown, action: (lock: unknown) => unknown) => action(null),
+    )
+    vi.stubGlobal('navigator', {locks: {request}})
+    const {requestStore} = await import('./request-store')
+
+    await expect(
+      requestStore.withExclusiveSourceLock('wrap-submit:z1q', async () => 'ran'),
+    ).rejects.toThrow('already in progress')
+    expect(request).toHaveBeenCalledWith(
+      'nom-bridge:wrap-submit:z1q',
+      expect.objectContaining({ifAvailable: true}),
+      expect.any(Function),
+    )
+  })
+
+  it('runs the exclusive source action when the lock is granted', async () => {
+    const request = vi.fn(
+      async (_name: string, _options: unknown, action: (lock: unknown) => unknown) => action({granted: true}),
+    )
+    vi.stubGlobal('navigator', {locks: {request}})
+    const {requestStore} = await import('./request-store')
+
+    await expect(
+      requestStore.withExclusiveSourceLock('wrap-submit:z1q', async () => 'ran'),
+    ).resolves.toBe('ran')
+  })
+
+  it('fails closed for source submissions when the Web Locks API is unavailable', async () => {
+    vi.stubGlobal('navigator', {})
+    const {requestStore} = await import('./request-store')
+
+    await expect(
+      requestStore.withExclusiveSourceLock('wrap-submit:z1q', async () => 'ran'),
+    ).rejects.toThrow(/does not support/)
+    expect(requestStore.hasCrossContextLocks()).toBe(false)
+
+    vi.stubGlobal('navigator', {locks: {request: vi.fn()}})
+    expect(requestStore.hasCrossContextLocks()).toBe(true)
+  })
+
   it('serializes lock mutations through the cross-context write lock when available', async () => {
     const lockNames: string[] = []
     const request = vi.fn(

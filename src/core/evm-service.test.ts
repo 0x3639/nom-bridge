@@ -202,6 +202,19 @@ describe('dropped-transaction evidence', () => {
     expect(corroborateTxFacts([{from: '0xA', nonce: 7}], 1)).toEqual({from: '0xA', nonce: 7})
   })
 
+  it('accepts a redeem state as release evidence only on unanimous responsive quorum', async () => {
+    const {collapseRedeemStates} = await import('./evm-service')
+    expect(collapseRedeemStates(['unredeemed', 'unredeemed', null], 3)).toBe('unredeemed')
+    expect(collapseRedeemStates(['partial', 'partial'], 2)).toBe('partial')
+    // Disagreement or a lone answer in a multi-RPC config is not evidence: a
+    // single stale RPC must not authorize releasing a claim lock.
+    expect(collapseRedeemStates(['unredeemed', 'partial'], 2)).toBeNull()
+    expect(collapseRedeemStates(['unredeemed', null, null], 3)).toBeNull()
+    expect(collapseRedeemStates([null, null], 2)).toBeNull()
+    // Single-RPC deployment: its answer stands.
+    expect(collapseRedeemStates(['fully-redeemed'], 1)).toBe('fully-redeemed')
+  })
+
   it('takes the MINIMUM confirmed count across at least two responsive RPCs', async () => {
     const {collapseConfirmedCounts} = await import('./evm-service')
     // Minimum defeats a single RPC inflating the count to force a release; a

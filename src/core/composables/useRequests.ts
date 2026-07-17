@@ -339,13 +339,22 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           const normalizedClaimHash = normalizeEvmHash(pendingClaimHash)
           const outcome = outcomes.get(normalizedClaimHash)
           const protocolAdvanced = hasWrapProtocolAdvanced(pendingClaimStage, status)
-          // `dropped` is sound for claim locks WITHOUT event reconciliation:
-          // if a speed-up replacement executed the same claim, this pass's
-          // freshly read redeem progress would show the protocol advanced (and
-          // clear the lock via that branch); dropped + un-advanced progress
-          // means the claim provably did not execute under any hash.
-          const dropped = droppedHashes.has(normalizedClaimHash)
-          if (outcome === 'reverted' || protocolAdvanced || dropped) {
+          // `dropped` alone is not release evidence for claim locks: a
+          // speed-up replacement may have executed the same claim, and the
+          // poll's progress read came from the single fallback client. Require
+          // a QUORUM-corroborated redeem state proving the claim of this stage
+          // never landed under any hash (stage 1 → still unredeemed, stage 2 →
+          // still only partially redeemed); anything less keeps the lock.
+          let droppedAndProvenUnclaimed = false
+          if (droppedHashes.has(normalizedClaimHash) && bridge) {
+            const redeemState = await EvmService.getInstance()
+              .getCorroboratedRedeemState(bridge as Address, ('0x' + id) as Hex)
+              .catch(() => null)
+            droppedAndProvenUnclaimed = pendingClaimStage === 1
+              ? redeemState === 'unredeemed'
+              : redeemState === 'partial'
+          }
+          if (outcome === 'reverted' || protocolAdvanced || droppedAndProvenUnclaimed) {
             await requestStore.clearPendingEvmClaim(id)
             await requestStore.clearEvmTxFacts(normalizedClaimHash)
             pendingClaimHash = undefined

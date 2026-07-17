@@ -285,6 +285,30 @@ export const requestStore = {
     return navigator.locks.request(`nom-bridge:${key}`, {mode: 'exclusive'}, () => action())
   },
 
+  hasCrossContextLocks(): boolean {
+    return typeof navigator !== 'undefined' && Boolean(navigator.locks)
+  },
+
+  // Exclusion for SOURCE transfers: never queues (a queued click would run
+  // later against state the user never saw and could submit a second
+  // transfer) and never runs without real cross-context exclusion (a browser
+  // lacking the Web Locks API fails closed rather than double-submitting).
+  async withExclusiveSourceLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+    if (typeof navigator === 'undefined' || !navigator.locks) {
+      throw new Error('This browser does not support the locking features required for safe bridge submissions. Please use a current browser.')
+    }
+    return navigator.locks.request(
+      `nom-bridge:${key}`,
+      {mode: 'exclusive', ifAvailable: true},
+      lock => {
+        if (!lock) {
+          throw new Error('A submission for this account is already in progress in another tab or window')
+        }
+        return action()
+      },
+    )
+  },
+
   onLocksChanged(listener: () => void): () => void {
     lockChangeListeners.add(listener)
     return () => lockChangeListeners.delete(listener)

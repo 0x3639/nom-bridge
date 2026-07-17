@@ -18,6 +18,8 @@ const h = vi.hoisted(() => ({
   getUnwrapRequest: vi.fn(),
   getSnapshot: vi.fn(),
   withCrossContextLock: vi.fn(),
+  withExclusiveSourceLock: vi.fn(),
+  hasCrossContextLocks: vi.fn(),
 }))
 
 vi.mock('../bridge-service', () => ({
@@ -57,6 +59,8 @@ vi.mock('../request-store', () => ({
     clearPendingZenonRedeem: h.clearPendingZenonRedeem,
     getSnapshot: h.getSnapshot,
     withCrossContextLock: h.withCrossContextLock,
+    withExclusiveSourceLock: h.withExclusiveSourceLock,
+    hasCrossContextLocks: h.hasCrossContextLocks,
   },
 }))
 
@@ -67,6 +71,8 @@ beforeEach(() => {
   h.clearPendingZenonRedeem.mockResolvedValue(undefined)
   h.getSnapshot.mockResolvedValue({zenonRedeems: {}, requests: []})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withExclusiveSourceLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.hasCrossContextLocks.mockReturnValue(true)
 })
 
 describe('useUnwrap.unwrap', () => {
@@ -250,7 +256,7 @@ describe('useUnwrap.unwrap cross-context exclusion', () => {
   const bridgeAddress = '0xBridge00000000000000000000000000000000' as `0x${string}`
   const evmFrom = '0xFrom000000000000000000000000000000000009'
 
-  it('serializes the submission under an account-scoped cross-context lock', async () => {
+  it('submits under a NON-QUEUING account-scoped exclusive lock', async () => {
     h.getAllowance.mockResolvedValue(500n)
     h.trackUnwrap.mockResolvedValue(undefined)
     h.unwrap.mockImplementation(async (...args: unknown[]) => {
@@ -262,10 +268,23 @@ describe('useUnwrap.unwrap cross-context exclusion', () => {
 
     await useUnwrap().unwrap(token, 1n, 'z1q', bridgeAddress, 'zts1znn', 8, 'ZNN', evmFrom)
 
-    expect(h.withCrossContextLock).toHaveBeenCalledWith(
+    expect(h.withExclusiveSourceLock).toHaveBeenCalledWith(
       `unwrap-submit:${evmFrom.toLowerCase()}`,
       expect.any(Function),
     )
+  })
+
+  it('surfaces an occupied source lock as a failure without opening the wallet', async () => {
+    h.withExclusiveSourceLock.mockRejectedValue(
+      new Error('A submission for this account is already in progress in another tab or window'),
+    )
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(
+      useUnwrap().unwrap(token, 1n, 'z1q', bridgeAddress, 'zts1znn', 8, 'ZNN', evmFrom),
+    ).rejects.toThrow('another tab')
+    expect(h.unwrap).not.toHaveBeenCalled()
+    expect(useUnwrap().isUnwrapping.value).toBe(false)
   })
 
   it('refuses a queued submission when an unwrap was recorded after this click', async () => {
@@ -374,6 +393,25 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     })
     await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
     expect(h.clearPendingZenonRedeem).toHaveBeenCalledTimes(1)
+  })
+
+  it('never reclaims an orphaned placeholder without real cross-context exclusion', async () => {
+    const {PLACEHOLDER_LOCK_STALE_MS} = await import('../approval-ux')
+    h.hasCrossContextLocks.mockReturnValue(false)
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {
+        [transactionHash]: {
+          hash: 'awaiting-wallet-result',
+          updatedAt: Date.now() - PLACEHOLDER_LOCK_STALE_MS - 1,
+        },
+      },
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
   })
 })
 
