@@ -49,7 +49,6 @@ export const requestStore = {
     return [...(await ensureLoaded())]
   },
 
-  // Phase 5 — declared now, implemented minimally.
   async prune(predicate: (r: TrackedRequest) => boolean): Promise<void> {
     const list = await ensureLoaded()
     mirror = list.filter(r => !predicate(r))

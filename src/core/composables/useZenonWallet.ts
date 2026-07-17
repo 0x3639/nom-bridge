@@ -15,6 +15,15 @@ service.onInfoChange = info => {
   address.value = info.address
 }
 
+// Adopt a still-live WalletConnect session on app load so a page refresh
+// doesn't present as "disconnected". No-op when nothing is restorable.
+void service
+  .restore()
+  .then(info => {
+    if (info && !address.value) address.value = info.address
+  })
+  .catch(() => {})
+
 export function useZenonWallet() {
   async function connect(): Promise<void> {
     isConnecting.value = true
@@ -30,7 +39,6 @@ export function useZenonWallet() {
     }
   }
 
-  // WIRED now, first USED in Phase 3.
   async function send(block: AccountBlockTemplate): Promise<AccountBlockTemplate> {
     if (!address.value) throw new Error('Zenon wallet not connected')
     return service.send(address.value, block)
