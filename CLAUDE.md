@@ -7,8 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 npm run dev        # Vite dev server
 npm run build      # production build (outputs dist/)
+npm run lint       # ESLint for TypeScript and Vue files
 npm run typecheck  # vue-tsc --noEmit
 npm run test       # vitest run (all tests)
+npm run test:coverage  # unit tests + enforced core coverage thresholds
+npm run test:security  # fail on high/critical npm advisories
+npm run check      # lint + typecheck + coverage + production build
 npx vitest run src/core/amount.test.ts   # single test file
 npx vitest run -t "test name"            # single test by name
 npm run fake-wallet -- "<wc-uri>" [--reject|--locked|--hang|--bad-state]  # headless Syrius stand-in
@@ -17,7 +21,9 @@ npm run test:integration  # live-relay WC test; skips without VITE_WC_PROJECT_ID
 
 Setup: copy `.env.example` to `.env` and set `VITE_WC_PROJECT_ID` (WalletConnect Cloud project id). The app builds without it, but WC pairing fails.
 
-Tests run in a plain `node` environment (see `vitest.config.ts`) and cover pure logic only — no Vue component rendering, no live node. Test files are co-located as `src/**/*.test.ts`. Keep new tests in that style: extract pure functions from services/composables and test those.
+Tests run in a plain `node` environment (see `vitest.config.ts`) with browser and wallet APIs mocked — no Vue component rendering and no live node. Test files are co-located as `src/**/*.test.ts`. Keep new tests in that style: extract pure functions from services/composables where practical and mock external wallet, storage, and network boundaries. Coverage is gated two ways (see `vitest.config.ts`): aggregate thresholds with headroom, plus per-file floors that pin the funds-critical modules (`request-store`, `evm-service`, `zenon-wallet-service`, the wrap/unwrap composables, and the pure safety helpers) at their current levels so they cannot silently regress.
+
+CI (`.github/workflows/ci.yml`) runs lint, typecheck, `test:coverage`, and build as separate steps on Node 22 and 24, and uploads coverage and production-bundle artifacts (`npm run check` is the equivalent local one-shot). The Security workflow gates on `npm audit --omit=dev --audit-level=high` (shipped dependencies only; a full audit runs report-only). CodeQL and dependency review are opt-in via the `ENABLE_GHAS_CHECKS` repository variable — they need GitHub Advanced Security while the repo is private — and CodeQL is advisory: requiring its status check only proves analysis completed, so gating on alerts additionally needs a branch ruleset with "Require code scanning results" and severity thresholds. Note the low-severity `elliptic` advisories arrive through `znn-typescript-sdk`, so they are in the shipped bundle (below the high-severity gate); an SDK bump is the fix vehicle. The live WalletConnect relay test is intentionally manual because it requires the `VITE_WC_PROJECT_ID` repository secret and external relay availability.
 
 ## What this is
 

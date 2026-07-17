@@ -137,6 +137,30 @@ describe('wrapRequestProgress', () => {
       actionable: false,
     })
   })
+
+  it.each([
+    ['signing', 'Waiting for bridge signatures', 1],
+    ['waiting-delay', 'Security delay', 2],
+    ['redeemed', 'Bridge complete', 3],
+  ] as const)('describes the %s state', (status, title, completedApprovals) => {
+    expect(wrapRequestProgress(status)).toMatchObject({
+      title,
+      completedApprovals,
+      totalApprovals: 3,
+      actionable: false,
+    })
+  })
+
+  it('labels a pending final claim as step 3', () => {
+    expect(wrapRequestProgress('redeemable-2', 'wallet')).toMatchObject({
+      badge: 'Step 3 of 3',
+      completedApprovals: 2,
+    })
+    expect(wrapRequestProgress('redeemable-2', 'confirming')).toMatchObject({
+      title: 'Confirming final claim',
+      completedApprovals: 2,
+    })
+  })
 })
 
 describe('unwrapRequestProgress', () => {
@@ -156,6 +180,44 @@ describe('unwrapRequestProgress', () => {
       title: 'Redeem on Zenon',
       action: 'Redeem on Zenon · Final step',
       actionable: true,
+    })
+  })
+
+  it.each([
+    ['submitted', 'Verifying Ethereum transaction', 0],
+    ['pending', 'Waiting for Ethereum event indexing', 1],
+    ['signing', 'Waiting for bridge signatures', 1],
+    ['waiting', 'Security delay', 1],
+    ['redeemed', 'Bridge complete', 2],
+    ['revoked', 'Request revoked', 1],
+    ['broken', 'Bridge request needs support', 1],
+  ] as const)('describes the %s state', (status, title, completedApprovals) => {
+    expect(unwrapRequestProgress(status, undefined, 2)).toMatchObject({
+      title,
+      completedApprovals,
+      totalApprovals: 2,
+      actionable: false,
+    })
+  })
+
+  it('uses safe generic copy when the approval count is unknown', () => {
+    expect(unwrapRequestProgress('redeemable')).toMatchObject({
+      description: 'Syrius will request the final wallet approval.',
+      completedApprovals: 1,
+      totalApprovals: 2,
+    })
+  })
+
+  it('locks the final action during wallet and confirmation phases', () => {
+    expect(unwrapRequestProgress('redeemable', 'wallet', 3)).toMatchObject({
+      action: 'Waiting for Syrius…',
+      completedApprovals: 2,
+      actionable: false,
+    })
+    expect(unwrapRequestProgress('redeemable', 'confirming', 3)).toMatchObject({
+      action: 'Confirming on Zenon…',
+      completedApprovals: 2,
+      actionable: false,
     })
   })
 })
