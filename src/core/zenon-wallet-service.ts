@@ -203,7 +203,7 @@ export class ZenonWalletService {
       )
     }
     try {
-      return AccountBlockTemplate.fromJson(result as any)
+      return AccountBlockTemplate.fromJson(result as Parameters<typeof AccountBlockTemplate.fromJson>[0])
     } catch (e) {
       // znn_send already returned: the wallet signed and broadcast the block.
       // A result we cannot decode (version skew) must never surface as a

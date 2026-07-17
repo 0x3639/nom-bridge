@@ -12,7 +12,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:security": "npm audit --audit-level=high",
+    "test:security": "npm audit --omit=dev --audit-level=high",
     "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run build",
     "fake-wallet": "tsx scripts/fake-syrius.ts"
   },

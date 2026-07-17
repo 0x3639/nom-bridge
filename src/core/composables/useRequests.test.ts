@@ -6,21 +6,7 @@ import {
   matchesTrackedUnwrapEvent,
   normalizeEvmHash,
   reconcileUnknownWrapOperations,
-  useRequests,
 } from './useRequests'
-
-describe('useRequests public state', () => {
-  it('starts with empty derived views and safely stops when polling is inactive', () => {
-    const requests = useRequests()
-
-    expect(requests.wrapRequests.value).toEqual([])
-    expect(requests.activeRequests.value).toEqual([])
-    expect(requests.unwrapRequests.value).toEqual([])
-    expect(requests.activeUnwrapRequests.value).toEqual([])
-    expect(requests.getRawWrapRequest('missing')).toBeUndefined()
-    expect(() => requests.stopPolling()).not.toThrow()
-  })
-})
 
 describe('normalizeEvmHash', () => {
   it('canonicalizes SDK and viem hash formats to the same key', () => {

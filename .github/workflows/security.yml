@@ -9,9 +9,13 @@ on:
     - cron: '17 8 * * 1'
   workflow_dispatch:
 
+# Cancel superseded PR runs only. Push- and schedule-triggered runs on main
+# must always complete: including the event name in the group keeps them from
+# sharing a group (and canceling each other), and cancel-in-progress stays off
+# for them so every main commit ends with a real verdict and uploaded results.
 concurrency:
-  group: security-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: security-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,33 +27,49 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
 
-      - name: Fail on high or critical advisories
+      # The BLOCKING gate audits only what ships to users. Dev-chain advisories
+      # (eslint/vite/vitest) must not block bridge releases.
+      - name: Fail on high or critical advisories in shipped dependencies
         run: npm run test:security
 
+      # Full audit including devDependencies — report-only.
+      - name: Report advisories across all dependencies
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  # dependency-review and CodeQL require the dependency graph / code scanning,
+  # which on a PRIVATE repository need GitHub Advanced Security. Running them
+  # without it fails every push and PR for reasons unrelated to the code under
+  # review, so both jobs are opt-in: set the repository variable
+  # ENABLE_GHAS_CHECKS=true once the repo is public or GHAS is enabled.
   dependency-review:
     name: Dependency review
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && vars.ENABLE_GHAS_CHECKS == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Reject newly introduced vulnerable dependencies
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
         with:
           fail-on-severity: high
 
+  # NOTE: CodeQL results are ADVISORY unless branch protection additionally
+  # requires the code-scanning check — the analyze step exits 0 even when it
+  # finds alerts. Configure branch protection to require it to make it a gate.
   codeql:
     name: CodeQL
+    if: vars.ENABLE_GHAS_CHECKS == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -58,13 +78,13 @@ jobs:
       packages: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           languages: javascript-typescript
           queries: security-extended
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4

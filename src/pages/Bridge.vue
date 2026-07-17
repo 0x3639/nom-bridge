@@ -219,12 +219,17 @@ const actionableRequestCount = computed(() =>
   ).length,
 )
 
+// The unwrap branch ends in a switch that TypeScript verifies as exhaustive
+// over the UnwrapPhase union — adding a `default` would silence that compile-
+// time check, so the lint rule (which cannot see exhaustiveness) is disabled
+// here instead. A new phase kind without a case fails `vue-tsc`.
 const operationPhase = computed<{
   badge: string
   title: string
   description: string
   explorerUrl?: string
   explorerLabel?: string
+  // eslint-disable-next-line vue/return-in-computed-property
 } | null>(() => {
   if (operationDirection.value === 'wrap') {
     if (wrapPhase.value.kind === 'submitting-wrap') {
@@ -328,8 +333,6 @@ const operationPhase = computed<{
         description: unwrapPhase.value.message,
       }
     case 'idle':
-      return null
-    default:
       return null
   }
 })

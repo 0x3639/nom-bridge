@@ -29,7 +29,6 @@ export default tseslint.config(
     files: ['**/*.{ts,vue}'],
     rules: {
       'no-undef': 'off',
-      '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-unused-vars': [
         'error',
         {
@@ -39,6 +38,15 @@ export default tseslint.config(
           ignoreRestSiblings: true,
         },
       ],
+    },
+  },
+  {
+    // Mocks legitimately need `any`; production code must not — an any-typed
+    // token amount slipping into number arithmetic is exactly the bug the
+    // "amounts are bigint, never floating point" invariant guards against.
+    files: ['**/*.test.ts', '**/*.integration.test.ts', 'scripts/**'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
 )
