@@ -3,6 +3,7 @@ import {
   deriveUnwrapStatus,
   deriveWrapStatus,
   findTrackedUnwrapByHash,
+  matchesTrackedUnwrapEvent,
   normalizeEvmHash,
   reconcileUnknownWrapOperations,
 } from './useRequests'
@@ -19,6 +20,32 @@ describe('normalizeEvmHash', () => {
   })
 })
 
+describe('matchesTrackedUnwrapEvent', () => {
+  const tracked = {zts: 'zts1znn', amount: '100', zenonToAddress: 'z1qrecipient'}
+  const event = {
+    transactionHash: `0x${'ab'.repeat(32)}`,
+    logIndex: 3,
+    token: '0xToKen',
+    to: 'z1qrecipient',
+    amount: 100n,
+  }
+
+  it('matches a replacement transaction that executed the identical unwrap', () => {
+    expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', event)).toBe(true)
+  })
+
+  it('rejects events for a different destination, amount, or token', () => {
+    expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', {...event, to: 'z1qother'})).toBe(false)
+    expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', {...event, amount: 99n})).toBe(false)
+    expect(matchesTrackedUnwrapEvent(tracked, '0xother', event)).toBe(false)
+  })
+
+  it('fails closed when the token pair mapping is unknown', () => {
+    // Without a pinned pair, the ERC-20 address cannot be verified.
+    expect(matchesTrackedUnwrapEvent(tracked, undefined, event)).toBe(false)
+  })
+})
+
 describe('reconcileUnknownWrapOperations', () => {
   const operation = (overrides: Partial<Parameters<typeof reconcileUnknownWrapOperations>[0][0]> = {}) => ({
     id: 'op-1',
@@ -32,33 +59,54 @@ describe('reconcileUnknownWrapOperations', () => {
     createdAt: 1,
     ...overrides,
   })
-  const block = (overrides: Partial<{hash: string; height: number; zts: string; amount: string}> = {}) => ({
+  const block = (overrides: Partial<{
+    hash: string
+    height: number
+    zts: string
+    amount: string
+    evmToAddress: string | null
+    networkClass: number | null
+    chainId: number | null
+  }> = {}) => ({
     hash: 'blockhash-1',
     height: 42,
     zts: 'zts1znn',
     amount: '150000000',
+    evmToAddress: '0xrecipient',
+    networkClass: 2,
+    chainId: 1,
     ...overrides,
   })
+  const expected = {networkClass: 2, evmChainId: 1}
 
   it('reconciles an operation against an account-chain wrap send above its frontier', () => {
-    expect(reconcileUnknownWrapOperations([operation()], [block()])).toEqual(['op-1'])
+    expect(reconcileUnknownWrapOperations([operation()], [block()], expected)).toEqual(['op-1'])
   })
 
   it('ignores blocks at or below the recorded frontier or with a different tuple', () => {
-    expect(reconcileUnknownWrapOperations([operation()], [block({height: 41})])).toEqual([])
-    expect(reconcileUnknownWrapOperations([operation()], [block({zts: 'zts1other'})])).toEqual([])
-    expect(reconcileUnknownWrapOperations([operation()], [block({amount: '1'})])).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({height: 41})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({zts: 'zts1other'})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({amount: '1'})], expected)).toEqual([])
+  })
+
+  it('requires the decoded EVM destination and chain to match the operation', () => {
+    // An identical-amount wrap to ANOTHER destination must not clear this
+    // operation's duplicate-submit protection.
+    expect(reconcileUnknownWrapOperations([operation()], [block({evmToAddress: '0xOther'})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({evmToAddress: null})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({networkClass: 3})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({chainId: 5})], expected)).toEqual([])
   })
 
   it('never auto-reconciles when the pre-send frontier read failed', () => {
-    expect(reconcileUnknownWrapOperations([operation({frontierHeight: null})], [block()])).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation({frontierHeight: null})], [block()], expected)).toEqual([])
   })
 
   it('consumes candidate blocks one-to-one, oldest operation first', () => {
     // One published block must not clear two ambiguous operations.
     const ops = [operation({id: 'op-newer', createdAt: 2}), operation({id: 'op-older', createdAt: 1})]
-    expect(reconcileUnknownWrapOperations(ops, [block()])).toEqual(['op-older'])
-    expect(reconcileUnknownWrapOperations(ops, [block(), block({hash: 'blockhash-2', height: 43})]))
+    expect(reconcileUnknownWrapOperations(ops, [block()], expected)).toEqual(['op-older'])
+    expect(reconcileUnknownWrapOperations(ops, [block(), block({hash: 'blockhash-2', height: 43})], expected))
       .toEqual(['op-older', 'op-newer'])
   })
 })

@@ -66,15 +66,59 @@ async function unwrap(
   zts: string,
   decimals: number,
   symbol: string,
+  evmFromAddress: string,
 ): Promise<UnwrapSubmissionResult> {
+  // Synchronous reentrancy guard: rapid double-submission races the UI's
+  // awaited pre-checks, so the composable itself must refuse before any await.
+  if (isUnwrapping.value) throw new Error('An unwrap is already in progress')
+  const clickedAt = Date.now()
   isUnwrapping.value = true
   error.value = null
   phase.value = {kind: 'checking-allowance'}
+  let lockedFlowRan = false
+  try {
+    // Account-scoped NON-QUEUING exclusive lock: two tabs can otherwise both
+    // pass their UI gates and open two MetaMask prompts for the same transfer,
+    // and a QUEUED click would run after the other tab's completed submission
+    // against state the user never saw. Fails closed without Web Locks.
+    return await requestStore.withExclusiveSourceLock(
+      `unwrap-submit:${evmFromAddress.toLowerCase()}`,
+      () => {
+        lockedFlowRan = true
+        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt)
+      },
+    )
+  } catch (e) {
+    if (!lockedFlowRan) {
+      isUnwrapping.value = false
+      error.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
+      phase.value = {kind: 'failed', stage: 'allowance', message: error.value}
+    }
+    throw e
+  }
+}
+
+async function unwrapLocked(
+  token: Address,
+  amount: bigint,
+  zenonAddress: string,
+  bridge: Address,
+  zts: string,
+  decimals: number,
+  symbol: string,
+  clickedAt: number,
+): Promise<UnwrapSubmissionResult> {
   let failureStage: 'allowance' | 'token-approval' | 'bridge-transfer' = 'allowance'
   let broadcastHash: Hex | null = null
   let totalApprovals: 2 | 3 = 2
   let trackingResult: Promise<boolean> | null = null
   try {
+    // Atomic in-lock check: a submission that queued behind another context's
+    // in-flight transfer must not re-submit once that transfer is recorded.
+    const snapshot = await requestStore.getSnapshot()
+    if (snapshot.requests.some(request => request.kind === 'unwrap' && request.createdAt >= clickedAt)) {
+      throw new Error('A bridge transfer was just submitted in another context; review History before submitting again')
+    }
     const evm = EvmService.getInstance()
     const allowance = await evm.getAllowance(token, bridge)
     const approvalRequired = allowance < amount
@@ -174,16 +218,28 @@ async function redeemZenonLocked(request: UnwrapRequestView): Promise<string> {
     // the placeholder must be older than any plausible prompt lifetime before
     // a new flow may overwrite it. Real-hash and ambiguous locks always refuse.
     const existingLock = snapshot.zenonRedeems[transactionHash]
-    if (
-      existingLock &&
-      !canReclaimPlaceholderLock(
+    const reclaimable =
+      requestStore.hasCrossContextLocks() &&
+      existingLock !== undefined &&
+      canReclaimPlaceholderLock(
         existingLock.hash,
         existingLock.updatedAt,
         Date.now(),
         PLACEHOLDER_LOCK_STALE_MS,
       )
-    ) {
+    if (existingLock && !reclaimable) {
       throw new Error('A Zenon redemption for this request is already in progress')
+    }
+    // Fresh in-lock revalidation (the Zenon analog of the EVM path's
+    // redeemsInfo re-read): a queued flow can acquire the lock after polling
+    // observed the redemption and cleared the previous holder's persisted
+    // lock, while this flow's view still says redeemable. Refuse — fail
+    // closed on a failed read — before opening Syrius.
+    const fresh = await BridgeService.getInstance()
+      .getUnwrapRequest(stripEvmHashPrefix(request.transactionHash), request.logIndex)
+      .catch(() => null)
+    if (!fresh || fresh.redeemed !== 0 || fresh.revoked !== 0) {
+      throw new Error('This redemption is no longer available; refresh and check History')
     }
     ownsLock = true
     await requestStore.setPendingZenonRedeem(request.id, AWAITING_WALLET_RESULT)
@@ -226,7 +282,10 @@ async function redeemZenon(request: UnwrapRequestView): Promise<string> {
   setPendingRedeem(request.id, 'wallet')
   let lockedFlowRan = false
   try {
-    return await requestStore.withCrossContextLock(
+    // Wallet-action lock: queues behind other contexts (in-lock guards
+    // re-validate persisted state) but fails closed without Web Locks —
+    // running unlocked would allow duplicate Syrius prompts across tabs.
+    return await requestStore.withWalletActionLock(
       `zenon-redeem:${normalizeEvmHash(request.transactionHash)}`,
       () => {
         lockedFlowRan = true
@@ -242,6 +301,48 @@ async function redeemZenon(request: UnwrapRequestView): Promise<string> {
 async function dismissPendingZenonRedeem(id: string): Promise<void> {
   await requestStore.clearPendingZenonRedeem(id).catch(() => undefined)
   setPendingRedeem(id)
+}
+
+export type ZenonRedeemRecheckResult = 'released-failed' | 'released-orphan' | 'kept' | 'no-lock'
+
+// Evidence-based resolution of a persisted Zenon redeem lock, runnable from
+// the UI's Recheck action. A real block hash is probed on the account chain:
+// receive-block processed + the request STILL redeemable (re-read fresh from
+// the node) proves the embedded call failed — safe to retry. An orphaned
+// pre-prompt placeholder is releasable only after the staleness window
+// (Syrius's prompt can outlive the dApp). Ambiguous markers are never released
+// here — only protocol advance clears them.
+async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRedeemRecheckResult> {
+  const transactionHash = normalizeEvmHash(request.transactionHash)
+  return requestStore.withCrossContextLock(`zenon-redeem:${transactionHash}`, async () => {
+    const snapshot = await requestStore.getSnapshot()
+    const lock = snapshot.zenonRedeems[transactionHash]
+    if (!lock) return 'no-lock'
+    if (lock.hash === AWAITING_WALLET_RESULT) {
+      // The orphan proof requires real Web Lock exclusion to exist at all.
+      if (
+        requestStore.hasCrossContextLocks() &&
+        canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)
+      ) {
+        await requestStore.clearPendingZenonRedeem(transactionHash)
+        setPendingRedeem(request.id)
+        return 'released-orphan'
+      }
+      return 'kept'
+    }
+    if (lock.hash === AMBIGUOUS_WALLET_RESULT) return 'kept'
+    const outcome = await BridgeService.getInstance()
+      .getAccountBlockOutcome(lock.hash)
+      .catch(() => null)
+    if (outcome !== 'processed') return 'kept'
+    const fresh = await BridgeService.getInstance()
+      .getUnwrapRequest(stripEvmHashPrefix(request.transactionHash), request.logIndex)
+      .catch(() => null)
+    if (!fresh || fresh.redeemed !== 0 || fresh.revoked !== 0) return 'kept'
+    await requestStore.clearPendingZenonRedeem(transactionHash)
+    setPendingRedeem(request.id)
+    return 'released-failed'
+  })
 }
 
 
@@ -273,6 +374,7 @@ export function useUnwrap() {
     clearLocalPendingRedeem: (id: string) => {
       setPendingRedeem(id)
     },
+    recheckZenonRedeem,
     recheckSubmittedUnwrap,
     resetPhase,
     clearPhase,

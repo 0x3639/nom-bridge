@@ -19,6 +19,9 @@ const h = vi.hoisted(() => ({
   getAuthoritativeOutcome: vi.fn(),
   getSnapshot: vi.fn(),
   withCrossContextLock: vi.fn(),
+  withWalletActionLock: vi.fn(),
+  withExclusiveSourceLock: vi.fn(),
+  hasCrossContextLocks: vi.fn(),
   extractNumberDecimals: vi.fn(),
 }))
 
@@ -57,6 +60,9 @@ vi.mock('../request-store', () => ({
     clearUnknownWrap: h.clearUnknownWrap,
     getSnapshot: h.getSnapshot,
     withCrossContextLock: h.withCrossContextLock,
+    withWalletActionLock: h.withWalletActionLock,
+    withExclusiveSourceLock: h.withExclusiveSourceLock,
+    hasCrossContextLocks: h.hasCrossContextLocks,
   },
 }))
 
@@ -73,8 +79,11 @@ beforeEach(() => {
   h.setUnknownWrap.mockResolvedValue(undefined)
   h.clearUnknownWrap.mockResolvedValue(undefined)
   h.getAccountFrontierHeight.mockResolvedValue(0)
-  h.getSnapshot.mockResolvedValue({evmClaims: {}})
+  h.getSnapshot.mockResolvedValue({evmClaims: {}, unknownWraps: {}, requests: []})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withExclusiveSourceLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.hasCrossContextLocks.mockReturnValue(true)
 })
 
 describe('useWrap.wrap', () => {
@@ -134,6 +143,105 @@ describe('useWrap.wrap', () => {
       kind: 'rejected',
     })
     expect(useWrap().phase.value).toMatchObject({kind: 'failed'})
+  })
+
+  it('submits under a NON-QUEUING account-scoped exclusive lock', async () => {
+    // Queuing is unsafe for source transfers: a queued click would execute
+    // after another tab's completed submission, against state the user never
+    // saw, and could transfer twice.
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.send.mockResolvedValue({hash: {toString: () => 'wraphash'}})
+    const {useWrap} = await import('./useWrap')
+
+    await useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender')
+
+    expect(h.withExclusiveSourceLock).toHaveBeenCalledWith(
+      'wrap-submit:z1qsender',
+      expect.any(Function),
+    )
+  })
+
+  it('surfaces an occupied source lock as a failure without opening the wallet', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.withExclusiveSourceLock.mockRejectedValue(
+      new Error('A submission for this account is already in progress in another tab or window'),
+    )
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('another tab')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(useWrap().phase.value).toMatchObject({kind: 'failed'})
+    expect(useWrap().isWrapping.value).toBe(false)
+  })
+
+  it('refuses inside the lock when another context holds an unknown-wrap intent for the account', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.getSnapshot.mockResolvedValue({
+      evmClaims: {},
+      requests: [],
+      unknownWraps: {
+        'other-tab-op': {
+          evmToAddress: '0xRecipient',
+          zenonFromAddress: 'z1qsender',
+          frontierHeight: 1,
+          zts: 'zts1znn',
+          amount: '100000000',
+          decimals: 8,
+          symbol: 'ZNN',
+          createdAt: 1,
+        },
+      },
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('in progress')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.setUnknownWrap).not.toHaveBeenCalled()
+  })
+
+  it('refuses a queued submission when a wrap was recorded after this click', async () => {
+    // Tab B clicked while tab A was submitting; B queued on the Web Lock and
+    // must not re-submit once A's transfer is durably recorded.
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    h.getSnapshot.mockResolvedValue({
+      evmClaims: {},
+      unknownWraps: {},
+      requests: [{kind: 'wrap', id: 'a-just-submitted', createdAt: Date.now() + 60_000}],
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('another context')
+    expect(h.send).not.toHaveBeenCalled()
+  })
+
+  it('synchronously refuses a second wrap while one is in flight', async () => {
+    // The duplicate check must not depend on any awaited work: two rapid
+    // submissions racing a network request must never both reach the wallet.
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})
+    let finishSend: (value: unknown) => void = () => undefined
+    h.send.mockReturnValue(new Promise(resolve => {
+      finishSend = resolve
+    }))
+    const {useWrap} = await import('./useWrap')
+
+    const first = useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender')
+    await expect(
+      useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toThrow('already in progress')
+    finishSend({hash: {toString: () => 'wraphash'}})
+    await expect(first).resolves.toEqual({id: 'wraphash', trackingFailed: false})
+    expect(h.send).toHaveBeenCalledTimes(1)
   })
 
   it('persists the safety intent BEFORE the wallet call and keeps it on ambiguity', async () => {
@@ -220,6 +328,66 @@ describe('useWrap.wrap', () => {
       useWrap().wrap('0xRecipient', '1', 8, 'zts1znn', 'ZNN', 'z1qsender'),
     ).resolves.toEqual({id: 'wraphash', trackingFailed: true})
     expect(h.clearUnknownWrap).not.toHaveBeenCalled()
+  })
+})
+
+describe('useWrap.recoverClaimPlaceholder', () => {
+  it('releases an orphaned pre-prompt placeholder through the recovery action', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'awaiting-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('released')
+    expect(h.clearPendingEvmClaim).toHaveBeenCalledWith('1a2b')
+  })
+
+  it('keeps ambiguous and real-hash locks', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'ambiguous-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: '0xrealhash', stage: 1, updatedAt: 1}},
+    })
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+    expect(h.clearPendingEvmClaim).not.toHaveBeenCalled()
+  })
+
+  it('never reclaims a placeholder without real cross-context exclusion', async () => {
+    // Reclaim's proof is "we hold the Web Lock, so the writer is dead" — with
+    // no Web Locks API that proof does not exist and the writer may be live.
+    h.hasCrossContextLocks.mockReturnValue(false)
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      unknownWraps: {},
+      evmClaims: {'1a2b': {hash: 'awaiting-wallet-result', stage: 1, updatedAt: 1}},
+    })
+    const {useWrap} = await import('./useWrap')
+
+    await expect(useWrap().recoverClaimPlaceholder('1a2b')).resolves.toBe('kept')
+    const request = {
+      id: {toString: () => '1a2b'},
+      toAddress: '0xTo00000000000000000000000000000000000001',
+      tokenAddress: '0xToken00000000000000000000000000000000002',
+      amount: {toString: () => '100000000'},
+      fee: {toString: () => '250000'},
+      signature: 'c2lnbmF0dXJl',
+      tokenStandard: {toString: () => 'zts1znn'},
+    }
+    await expect(useWrap().redeemEvm(
+      request as never,
+      '0xBridge00000000000000000000000000000000',
+    )).rejects.toThrow('already in progress')
+    expect(h.clearPendingEvmClaim).not.toHaveBeenCalled()
   })
 })
 
@@ -400,12 +568,12 @@ describe('useWrap.redeemEvm', () => {
     expect(h.setPendingEvmClaim).toHaveBeenLastCalledWith('1a2b', 'ambiguous-wallet-result', 1)
   })
 
-  it('locks the claim locally before waiting on another context\'s cross-context lock', async () => {
+  it('locks the claim locally before waiting on another context\'s wallet-action lock', async () => {
     h.getWrapRedeemProgress.mockResolvedValue({kind: 'unredeemed'})
     h.tssSignatureToHex.mockReturnValue('0xsig')
     h.redeem.mockResolvedValue('0xtxhash')
     let releaseLock: () => void = () => undefined
-    h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
+    h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
       await new Promise<void>(resolve => {
         releaseLock = resolve
       })

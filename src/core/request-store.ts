@@ -136,6 +136,42 @@ async function persist(): Promise<void> {
   await storageService.set(STORAGE_KEY, mirror ?? [])
 }
 
+// Tracked-request mutations are read-apply-write like the lock document:
+// re-read the latest stored list under a cross-context write lock, apply, and
+// persist — a whole-document write from a stale mirror would silently drop
+// another tab's submitted transfer. Rolls back on persist failure.
+let requestsDirty = false
+let requestsWriteQueue: Promise<unknown> = Promise.resolve()
+
+function mutateRequests(
+  mutate: (list: TrackedRequest[]) => TrackedRequest[] | null,
+): Promise<void> {
+  const run = () => requestStore.withCrossContextLock('tracked-requests-write', async () => {
+    const stored = (await storageService.get<TrackedRequest[]>(STORAGE_KEY)) ?? []
+    const next = mutate(stored)
+    if (next === null) {
+      mirror = stored
+      return
+    }
+    requestsDirty = true
+    mirror = next
+    bumpRevision()
+    try {
+      await storageService.set(STORAGE_KEY, next)
+    } catch (e) {
+      // A rejected mutation must leave no trace (mutation applied iff resolved).
+      mirror = stored
+      bumpRevision()
+      throw e
+    } finally {
+      requestsDirty = false
+    }
+  })
+  const nextPromise = requestsWriteQueue.then(run, run)
+  requestsWriteQueue = nextPromise.catch(() => undefined)
+  return nextPromise
+}
+
 async function ensureLocksLoaded(): Promise<PendingActionLocks> {
   if (locksMirror === null) {
     locksMirror = normalizeLocks(await storageService.get<PendingActionLocks>(LOCKS_STORAGE_KEY))
@@ -219,6 +255,17 @@ function notifyLocksChanged(): void {
   }
 }
 
+;(storageService as SubscribableStorage).subscribe?.<TrackedRequest[]>(
+  STORAGE_KEY,
+  incoming => {
+    // Our own in-flight write is authoritative over any event racing it; the
+    // event's content predates the fresh read taken under the write lock.
+    if (requestsDirty) return
+    mirror = incoming ?? []
+    bumpRevision()
+  },
+)
+
 ;(storageService as SubscribableStorage).subscribe?.<PendingActionLocks>(
   LOCKS_STORAGE_KEY,
   incoming => {
@@ -238,41 +285,73 @@ export const requestStore = {
     return navigator.locks.request(`nom-bridge:${key}`, {mode: 'exclusive'}, () => action())
   },
 
+  hasCrossContextLocks(): boolean {
+    return typeof navigator !== 'undefined' && Boolean(navigator.locks)
+  },
+
+  // Exclusion for wallet-invoking DESTINATION actions (claims/redeems): fails
+  // closed without the Web Locks API — running unlocked would allow duplicate
+  // wallet prompts across tabs — but MAY queue, because these flows re-read
+  // persisted lock state inside the lock and re-validate against whatever the
+  // previous holder did.
+  async withWalletActionLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+    if (typeof navigator === 'undefined' || !navigator.locks) {
+      throw new Error('This browser does not support the locking features required for safe bridge actions. Please use a current browser.')
+    }
+    return navigator.locks.request(`nom-bridge:${key}`, {mode: 'exclusive'}, () => action())
+  },
+
+  // Exclusion for SOURCE transfers: never queues (a queued click would run
+  // later against state the user never saw and could submit a second
+  // transfer) and never runs without real cross-context exclusion (a browser
+  // lacking the Web Locks API fails closed rather than double-submitting).
+  async withExclusiveSourceLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+    if (typeof navigator === 'undefined' || !navigator.locks) {
+      throw new Error('This browser does not support the locking features required for safe bridge submissions. Please use a current browser.')
+    }
+    return navigator.locks.request(
+      `nom-bridge:${key}`,
+      {mode: 'exclusive', ifAvailable: true},
+      lock => {
+        if (!lock) {
+          throw new Error('A submission for this account is already in progress in another tab or window')
+        }
+        return action()
+      },
+    )
+  },
+
   onLocksChanged(listener: () => void): () => void {
     lockChangeListeners.add(listener)
     return () => lockChangeListeners.delete(listener)
   },
 
   async trackWrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
-    const list = await ensureLoaded()
-    if (list.some(e => e.id === r.id)) return
-    list.push({
-      kind: 'wrap',
-      evmChainId: config.evmChainId,
-      zenonChainId: config.zenonChainId,
-      ...r,
-    })
-    bumpRevision()
-    await persist()
+    await mutateRequests(list => list.some(e => e.id === r.id)
+      ? null
+      : [...list, {
+          kind: 'wrap' as const,
+          evmChainId: config.evmChainId,
+          zenonChainId: config.zenonChainId,
+          ...r,
+        }])
   },
 
   async trackUnwrap(r: Omit<TrackedRequest, 'kind' | 'evmChainId' | 'zenonChainId'>): Promise<void> {
-    const list = await ensureLoaded()
     const transactionHash = normalizeEvmHash(r.id.split(':')[0])
-    if (list.some(e =>
+    await mutateRequests(list => list.some(e =>
       e.kind === 'unwrap' &&
       e.evmChainId === config.evmChainId &&
       e.zenonChainId === config.zenonChainId &&
       normalizeEvmHash(e.id.split(':')[0]) === transactionHash,
-    )) return
-    list.push({
-      kind: 'unwrap',
-      evmChainId: config.evmChainId,
-      zenonChainId: config.zenonChainId,
-      ...r,
-    })
-    bumpRevision()
-    await persist()
+    )
+      ? null
+      : [...list, {
+          kind: 'unwrap' as const,
+          evmChainId: config.evmChainId,
+          zenonChainId: config.zenonChainId,
+          ...r,
+        }])
   },
 
   async getAll(): Promise<TrackedRequest[]> {
@@ -357,11 +436,9 @@ export const requestStore = {
   },
 
   async prune(predicate: (r: TrackedRequest) => boolean): Promise<void> {
-    const list = await ensureLoaded()
-    const next = list.filter(r => !predicate(r))
-    if (next.length === list.length) return
-    mirror = next
-    bumpRevision()
-    await persist()
+    await mutateRequests(list => {
+      const next = list.filter(r => !predicate(r))
+      return next.length === list.length ? null : next
+    })
   },
 }

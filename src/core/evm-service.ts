@@ -6,6 +6,7 @@ import {
   getAddress,
   http,
   parseAbi,
+  parseAbiItem,
   parseEventLogs,
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
@@ -100,6 +101,43 @@ export interface AuthoritativeOutcomeWithFacts {
   outcome: AuthoritativeEvmOutcome
   from?: string
   nonce?: number
+}
+
+// On-chain redeem state for a wrap request id: 'unredeemed' — no claim ever
+// landed; 'partial' — the first claim landed, the final one has not;
+// 'fully-redeemed' — both claims done.
+export type RedeemState = 'unredeemed' | 'partial' | 'fully-redeemed'
+
+// Release evidence requires a unanimous responsive quorum (≥2 unless only one
+// RPC is configured): one stale RPC reporting "unadvanced" progress must not
+// authorize releasing a claim lock whose replacement claim actually landed.
+export function collapseRedeemStates(
+  states: Array<RedeemState | null>,
+  totalClients: number,
+): RedeemState | null {
+  const responsive = states.filter((state): state is RedeemState => state !== null)
+  const required = totalClients === 1 ? 1 : 2
+  if (responsive.length < required) return null
+  return responsive.every(state => state === responsive[0]) ? responsive[0] : null
+}
+
+// Per-claim-stage interpretation of a corroborated redeem state.
+export function isRedeemStateAdvancedForStage(stage: 1 | 2, state: RedeemState | null): boolean {
+  if (state === null) return false
+  return stage === 1 ? state !== 'unredeemed' : state === 'fully-redeemed'
+}
+
+export function isRedeemStateUnclaimedForStage(stage: 1 | 2, state: RedeemState | null): boolean {
+  if (state === null) return false
+  return stage === 1 ? state === 'unredeemed' : state === 'partial'
+}
+
+export interface UnwrappedEventRecord {
+  transactionHash: string
+  logIndex: number
+  token: string
+  to: string
+  amount: bigint
 }
 
 // Release-critical facts must never rest on a single RPC's word. Sender/nonce
@@ -288,6 +326,73 @@ export class EvmService {
     return collapseConfirmedCounts(counts, this.outcomeClients.length)
   }
 
+  // Quorum-corroborated redeem state for a wrap request, read directly from
+  // redeemsInfo on every configured RPC. Null when the quorum cannot be met —
+  // callers must then keep their locks (fail closed).
+  async getCorroboratedRedeemState(bridge: Address, wrapRequestId: Hex): Promise<RedeemState | null> {
+    const states = await Promise.all(
+      this.outcomeClients.map(client =>
+        client.readContract({
+          address: bridge,
+          abi: bridgeAbi,
+          functionName: 'redeemsInfo',
+          args: [BigInt(wrapRequestId)],
+        }).then(([blockNumber]): RedeemState => {
+          if (blockNumber === 0n) return 'unredeemed'
+          if (blockNumber === UINT256_MAX) return 'fully-redeemed'
+          return 'partial'
+        }).catch(() => null),
+      ),
+    )
+    return collapseRedeemStates(states, this.outcomeClients.length)
+  }
+
+  // Unwrapped events emitted by the bridge for `from` since `fromBlock`,
+  // queried across every configured RPC. Used to decide whether a dropped
+  // (speed-up replaced) transaction's replacement executed the SAME unwrap.
+  // `responsiveClients` lets callers apply the quorum policy to the ABSENCE of
+  // a match — a single silent/lying RPC must not authorize a release.
+  async findUnwrappedEvents(
+    bridge: Address,
+    from: Address,
+    fromBlock: bigint,
+  ): Promise<{events: UnwrappedEventRecord[]; responsiveClients: number}> {
+    const unwrappedEvent = parseAbiItem(
+      'event Unwrapped(address indexed from, address indexed token, string to, uint256 amount)',
+    )
+    const perClient = await Promise.all(
+      this.outcomeClients.map(client =>
+        client.getLogs({
+          address: bridge,
+          event: unwrappedEvent,
+          args: {from},
+          fromBlock,
+        }).catch(() => null),
+      ),
+    )
+    const events = new Map<string, UnwrappedEventRecord>()
+    let responsiveClients = 0
+    for (const logs of perClient) {
+      if (logs === null) continue
+      responsiveClients += 1
+      for (const log of logs as unknown as Array<{
+        transactionHash: string
+        logIndex: number
+        args: {token?: string; to?: string; amount?: bigint}
+      }>) {
+        if (!log.args.token || log.args.to === undefined || log.args.amount === undefined) continue
+        events.set(`${log.transactionHash}:${log.logIndex}`, {
+          transactionHash: log.transactionHash,
+          logIndex: log.logIndex,
+          token: log.args.token,
+          to: log.args.to,
+          amount: log.args.amount,
+        })
+      }
+    }
+    return {events: [...events.values()], responsiveClients}
+  }
+
   private async getTransactionOutcomeFrom(
     client: PublicClient,
     hash: Hex,
@@ -443,7 +548,7 @@ export class EvmService {
         )
       }
       if (receipt.status !== 'success') {
-        throw new EvmSubmissionError('reverted', hash, 'Unwrap transaction reverted')
+        throw await this.classifyReceiptRevert(hash, 'Unwrap')
       }
       const decoded = parseEventLogs({abi: bridgeAbi, logs: receipt.logs, eventName: 'Unwrapped'})
       const provisionalLogIndex = selectProvisionalLogIndex(
@@ -501,12 +606,29 @@ export class EvmService {
         )
       }
       if (receipt.status !== 'success') {
-        throw new EvmSubmissionError('reverted', hash, 'Redeem transaction reverted')
+        throw await this.classifyReceiptRevert(hash, 'Redeem')
       }
       return hash
     } catch (e) {
       throw mapEvmError(e)
     }
+  }
+
+  // waitForTransactionReceipt runs on the fallback transport, which accepts
+  // the FIRST successful RPC response — a stale or forked node's reverted
+  // receipt must not release safety locks and authorize a retry. A revert is
+  // definitive only when the multi-RPC quorum policy corroborates it;
+  // otherwise the failure is classified confirmation-unknown (locks kept).
+  private async classifyReceiptRevert(hash: Hex, action: string): Promise<EvmSubmissionError> {
+    const outcome = await this.getAuthoritativeOutcome(hash).catch(() => 'unknown' as const)
+    if (outcome === 'reverted') {
+      return new EvmSubmissionError('reverted', hash, `${action} transaction reverted`)
+    }
+    return new EvmSubmissionError(
+      'confirmation-unknown',
+      hash,
+      `${action} transaction may have reverted, but the configured RPCs do not agree; do not resubmit until its status is verified`,
+    )
   }
 
   private async assertWalletChain(wallet: WalletClient): Promise<void> {

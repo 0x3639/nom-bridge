@@ -89,12 +89,58 @@ async function wrap(
   symbol: string,
   zenonFromAddress: string,
 ): Promise<WrapSubmissionResult> {
+  // Synchronous reentrancy guard: rapid double-submission races the UI's
+  // awaited pre-checks, so the composable itself must refuse before any await.
+  if (isWrapping.value) throw new Error('A wrap is already in progress')
+  const clickedAt = Date.now()
   isWrapping.value = true
   error.value = null
   phase.value = {kind: 'submitting-wrap'}
+  let lockedFlowRan = false
+  try {
+    // Account-scoped NON-QUEUING exclusive lock: two tabs can otherwise both
+    // pass their UI gates and open two Syrius prompts for the same transfer,
+    // and a QUEUED click would run after the other tab's completed submission
+    // against state the user never saw. Fails closed without Web Locks.
+    return await requestStore.withExclusiveSourceLock(
+      `wrap-submit:${zenonFromAddress}`,
+      () => {
+        lockedFlowRan = true
+        return wrapLocked(evmToAddress, humanAmount, decimals, zts, symbol, zenonFromAddress, clickedAt)
+      },
+    )
+  } catch (e) {
+    if (!lockedFlowRan) {
+      isWrapping.value = false
+      error.value = e instanceof Error ? e.message : 'Failed to submit wrap'
+      phase.value = {kind: 'failed', message: error.value}
+    }
+    throw e
+  }
+}
+
+async function wrapLocked(
+  evmToAddress: string,
+  humanAmount: string | number,
+  decimals: number,
+  zts: string,
+  symbol: string,
+  zenonFromAddress: string,
+  clickedAt: number,
+): Promise<WrapSubmissionResult> {
   let id: string
   let operationId: string | null = null
   try {
+    // Atomic in-lock checks against durable state: another context's live
+    // unknown-wrap intent, or a wrap recorded after this click (a submission
+    // that queued behind another tab's in-flight transfer), must refuse.
+    const snapshot = await requestStore.getSnapshot()
+    if (Object.values(snapshot.unknownWraps).some(op => op.zenonFromAddress === zenonFromAddress)) {
+      throw new Error('A wrap from this Zenon account is already in progress; resolve it in History first')
+    }
+    if (snapshot.requests.some(request => request.kind === 'wrap' && request.createdAt >= clickedAt)) {
+      throw new Error('A wrap was just submitted in another context; review History before submitting again')
+    }
     const block = BridgeService.getInstance().buildWrapBlock(evmToAddress, humanAmount, decimals, zts)
     // Persist the safety intent BEFORE the wallet call: a crash while Syrius
     // holds the prompt — or right after broadcast — must still leave a durable
@@ -190,13 +236,15 @@ async function redeemEvmLocked(
     // A leftover pre-prompt placeholder is reclaimable here: this flow holds
     // the exclusive Web Lock, so the flow that wrote it has terminated, and a
     // terminating flow always clears or upgrades its placeholder — a survivor
-    // means it died mid-prompt, taking its MetaMask popup with it. Real-hash
-    // and ambiguous locks always refuse.
+    // means it died mid-prompt, taking its MetaMask popup with it. That proof
+    // requires the Web Locks API to actually exist (without it the writer may
+    // be live in another tab). Real-hash and ambiguous locks always refuse.
     const existingLock = evmClaims[requestId]
-    if (
-      existingLock &&
-      !canReclaimPlaceholderLock(existingLock.hash, existingLock.updatedAt, Date.now(), 0)
-    ) throw new Error('A claim for this request is already in progress')
+    const reclaimable =
+      requestStore.hasCrossContextLocks() &&
+      existingLock !== undefined &&
+      canReclaimPlaceholderLock(existingLock.hash, existingLock.updatedAt, Date.now(), 0)
+    if (existingLock && !reclaimable) throw new Error('A claim for this request is already in progress')
     const progress = await EvmService.getInstance().getWrapRedeemProgress(bridge, token, wrapId)
     if (progress.kind === 'fully-redeemed') return {kind: 'already-redeemed'}
     if (progress.kind === 'waiting-delay' && progress.remainingSeconds > 0) {
@@ -272,7 +320,10 @@ async function redeemEvm(
   setPendingRedeem(requestId, 'wallet')
   let lockedFlowRan = false
   try {
-    return await requestStore.withCrossContextLock(
+    // Wallet-action lock: queues behind other contexts (in-lock guards
+    // re-validate persisted state) but fails closed without Web Locks —
+    // running unlocked would allow duplicate MetaMask prompts across tabs.
+    return await requestStore.withWalletActionLock(
       `evm-claim:${requestId}`,
       () => {
         lockedFlowRan = true
@@ -298,6 +349,26 @@ async function dismissPendingRedeem(id: string): Promise<void> {
   setPendingRedeemStage(id)
 }
 
+// UI-reachable recovery for a crash-orphaned pre-prompt claim placeholder.
+// Runs under the claim's exclusive Web Lock, which proves the flow that wrote
+// the placeholder is dead (its MetaMask popup died with its browser context).
+// Ambiguous markers and real hashes are never released here.
+async function recoverClaimPlaceholder(requestId: string): Promise<'released' | 'kept' | 'no-lock'> {
+  return requestStore.withCrossContextLock(`evm-claim:${requestId}`, async () => {
+    const {evmClaims} = await requestStore.getSnapshot()
+    const lock = evmClaims[requestId]
+    if (!lock) return 'no-lock'
+    // Without the Web Locks API the "writer is dead" proof does not exist.
+    if (!requestStore.hasCrossContextLocks()) return 'kept'
+    if (!canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), 0)) return 'kept'
+    await requestStore.clearPendingEvmClaim(requestId)
+    setPendingRedeem(requestId)
+    setPendingRedeemHash(requestId)
+    setPendingRedeemStage(requestId)
+    return 'released'
+  })
+}
+
 export function useWrap() {
   return {
     isWrapping,
@@ -315,6 +386,7 @@ export function useWrap() {
       setPendingRedeemStage(id)
     },
     recheckPendingRedeem,
+    recoverClaimPlaceholder,
     dismissPendingRedeem,
     resetPhase,
     clearPhase,
