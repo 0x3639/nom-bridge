@@ -7,6 +7,8 @@ import {
   http,
   parseAbi,
   parseEventLogs,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   UserRejectedRequestError,
   type Address,
   type Hex,
@@ -41,6 +43,99 @@ export type WrapRedeemProgress =
   | {kind: 'unredeemed'}
   | {kind: 'waiting-delay'; remainingSeconds: number}
   | {kind: 'fully-redeemed'}
+
+export type EvmTransactionOutcome = 'success' | 'reverted' | 'pending' | 'not-found' | 'unavailable'
+export type AuthoritativeEvmOutcome = 'confirmed' | 'reverted' | 'absent' | 'unknown'
+export type EvmSubmissionFailureKind = 'reverted' | 'confirmation-unknown'
+
+export class EvmSubmissionError extends Error {
+  constructor(
+    readonly kind: EvmSubmissionFailureKind,
+    readonly hash: Hex,
+    message: string,
+    options?: {cause?: unknown},
+  ) {
+    super(message)
+    this.name = 'EvmSubmissionError'
+    if (options?.cause !== undefined) Object.assign(this, {cause: options.cause})
+  }
+}
+
+// A success receipt from any RPC is authoritative (fabricating success only
+// clears warning copy, never enables a resubmit). A revert must be the
+// consensus of every responsive RPC — corroborated by a second node unless only
+// one is configured — so a single stale or forked node cannot release a
+// duplicate-submit lock. `absent` requires every RPC to answer not-found; it
+// feeds the sustained-absence dropped-transaction policy below and is never a
+// release signal by itself.
+export function collapseAuthoritativeOutcomes(
+  outcomes: EvmTransactionOutcome[],
+): AuthoritativeEvmOutcome {
+  const confirmed = outcomes.includes('success')
+  const revertedCount = outcomes.filter(outcome => outcome === 'reverted').length
+  if (confirmed && revertedCount) return 'unknown'
+  if (confirmed) return 'confirmed'
+  const responsive = outcomes.filter(outcome => outcome !== 'unavailable')
+  if (
+    revertedCount > 0 &&
+    revertedCount === responsive.length &&
+    (outcomes.length === 1 || revertedCount >= 2)
+  ) return 'reverted'
+  if (outcomes.length > 0 && outcomes.every(outcome => outcome === 'not-found')) return 'absent'
+  return 'unknown'
+}
+
+// Positive dropped-transaction evidence. Universal not-found is never proof a
+// wallet-broadcast transaction is dead (private mempools, poor propagation, a
+// low-fee tx that mines late). The only positive fact is nonce consumption:
+// getTransactionCount('latest') is the next unused nonce, so once the sender's
+// confirmed count passes the transaction's nonce, that nonce was consumed —
+// by this tx (then it would not be absent) or by a replacement — and this hash
+// can never mine.
+export function isNonceConsumed(txNonce: number, confirmedTransactionCount: number): boolean {
+  return confirmedTransactionCount > txNonce
+}
+
+export interface AuthoritativeOutcomeWithFacts {
+  outcome: AuthoritativeEvmOutcome
+  from?: string
+  nonce?: number
+}
+
+// Release-critical facts must never rest on a single RPC's word. Sender/nonce
+// count as evidence only when at least two independent RPCs report the
+// identical pair (single-RPC deployments have no peer and stand alone).
+export function corroborateTxFacts(
+  perClientFacts: Array<{from?: string; nonce?: number}>,
+  totalClients: number,
+): {from: string; nonce: number} | undefined {
+  const counts = new Map<string, {from: string; nonce: number; seen: number}>()
+  for (const facts of perClientFacts) {
+    if (facts.from === undefined || facts.nonce === undefined) continue
+    const key = `${facts.from.toLowerCase()}:${facts.nonce}`
+    const entry = counts.get(key) ?? {from: facts.from, nonce: facts.nonce, seen: 0}
+    entry.seen += 1
+    counts.set(key, entry)
+  }
+  const required = totalClients === 1 ? 1 : 2
+  for (const entry of counts.values()) {
+    if (entry.seen >= required) return {from: entry.from, nonce: entry.nonce}
+  }
+  return undefined
+}
+
+// The MINIMUM confirmed count across responsive RPCs: one RPC inflating its
+// answer cannot force a nonce-consumption release, while a lagging honest RPC
+// only fails closed. Multi-RPC configs require at least two responses.
+export function collapseConfirmedCounts(
+  counts: Array<number | null>,
+  totalClients: number,
+): number | null {
+  const responsive = counts.filter((count): count is number => count !== null)
+  const required = totalClients === 1 ? 1 : 2
+  if (responsive.length < required) return null
+  return Math.min(...responsive)
+}
 
 // Pure arithmetic for the wrap countdown, factored out for unit-testing without
 // viem. remainingSeconds = max(0, redeemDelay - elapsedBlocks + 1) * blockTime,
@@ -94,6 +189,7 @@ function assertSuccessfulReceipt(receipt: {status: string}, action: string): voi
 export class EvmService {
   private static instance: EvmService | null = null
   private publicClient: PublicClient
+  private outcomeClients: PublicClient[]
   private walletClient: WalletClient | null = null
 
   private constructor() {
@@ -101,6 +197,10 @@ export class EvmService {
       chain: CHAIN,
       transport: fallback(config.evmRpcUrls.map(url => http(url))),
     })
+    this.outcomeClients = config.evmRpcUrls.map(url => createPublicClient({
+      chain: CHAIN,
+      transport: http(url),
+    }))
   }
 
   static getInstance(): EvmService {
@@ -160,6 +260,56 @@ export class EvmService {
     return this.publicClient.getBlockNumber()
   }
 
+  async getTransactionOutcome(hash: Hex): Promise<EvmTransactionOutcome> {
+    return (await this.getTransactionOutcomeFrom(this.publicClient, hash)).outcome
+  }
+
+  async getAuthoritativeOutcome(hash: Hex): Promise<AuthoritativeEvmOutcome> {
+    return (await this.getAuthoritativeOutcomeWithFacts(hash)).outcome
+  }
+
+  async getAuthoritativeOutcomeWithFacts(hash: Hex): Promise<AuthoritativeOutcomeWithFacts> {
+    const results = await Promise.all(
+      this.outcomeClients.map(client => this.getTransactionOutcomeFrom(client, hash)),
+    )
+    const outcome = collapseAuthoritativeOutcomes(results.map(result => result.outcome))
+    const facts = corroborateTxFacts(results, this.outcomeClients.length)
+    return facts ? {outcome, from: facts.from, nonce: facts.nonce} : {outcome}
+  }
+
+  // Corroborated confirmed transaction count for dropped-tx evidence; null
+  // when the quorum cannot be met.
+  async getConfirmedTransactionCount(address: Address): Promise<number | null> {
+    const counts = await Promise.all(
+      this.outcomeClients.map(client =>
+        client.getTransactionCount({address, blockTag: 'latest'}).catch(() => null),
+      ),
+    )
+    return collapseConfirmedCounts(counts, this.outcomeClients.length)
+  }
+
+  private async getTransactionOutcomeFrom(
+    client: PublicClient,
+    hash: Hex,
+  ): Promise<{outcome: EvmTransactionOutcome; from?: string; nonce?: number}> {
+    try {
+      const receipt = await client.getTransactionReceipt({hash})
+      return {outcome: receipt.status === 'success' ? 'success' : 'reverted'}
+    } catch (e) {
+      if (!(e instanceof TransactionReceiptNotFoundError)) return {outcome: 'unavailable'}
+      try {
+        const transaction = await client.getTransaction({hash})
+        // Capture sender + nonce while the transaction is still visible: these
+        // are the only facts that can later PROVE a vanished hash is dead.
+        return {outcome: 'pending', from: transaction.from, nonce: transaction.nonce}
+      } catch (transactionError) {
+        return {
+          outcome: transactionError instanceof TransactionNotFoundError ? 'not-found' : 'unavailable',
+        }
+      }
+    }
+  }
+
   async getEstimatedBlockTime(bridge: Address): Promise<bigint> {
     return this.publicClient.readContract({
       address: bridge,
@@ -216,18 +366,32 @@ export class EvmService {
     return {kind: 'waiting-delay', remainingSeconds}
   }
 
-  async ensureAllowance(token: Address, bridge: Address, amount: bigint): Promise<void> {
+  async getAllowance(token: Address, bridge: Address): Promise<bigint> {
     const wallet = this.getWalletClient()
     try {
       const [account] = await wallet.requestAddresses()
       await this.assertWalletChain(wallet)
-      const allowance = await this.publicClient.readContract({
+      return await this.publicClient.readContract({
         address: token,
         abi: erc20Abi,
         functionName: 'allowance',
         args: [account, bridge],
       })
-      if (allowance >= amount) return
+    } catch (e) {
+      throw mapEvmError(e)
+    }
+  }
+
+  async approveAllowance(
+    token: Address,
+    bridge: Address,
+    amount: bigint,
+    onSubmitted?: (hash: Hex) => void | Promise<void>,
+  ): Promise<Hex> {
+    const wallet = this.getWalletClient()
+    try {
+      const [account] = await wallet.requestAddresses()
+      await this.assertWalletChain(wallet)
       const {request} = await this.publicClient.simulateContract({
         address: token,
         abi: erc20Abi,
@@ -237,8 +401,10 @@ export class EvmService {
         account,
       })
       const hash = await wallet.writeContract(request)
+      onSubmitted?.(hash)
       const receipt = await this.publicClient.waitForTransactionReceipt({hash})
       assertSuccessfulReceipt(receipt, 'Approval')
+      return hash
     } catch (e) {
       throw mapEvmError(e)
     }
@@ -249,6 +415,7 @@ export class EvmService {
     token: Address,
     amount: bigint,
     zenonAddress: string,
+    onSubmitted?: (hash: Hex) => void,
   ): Promise<{hash: Hex; provisionalLogIndex: number; eventMatched: boolean}> {
     const wallet = this.getWalletClient()
     try {
@@ -263,8 +430,21 @@ export class EvmService {
         account,
       })
       const hash = await wallet.writeContract(request)
-      const receipt = await this.publicClient.waitForTransactionReceipt({hash})
-      assertSuccessfulReceipt(receipt, 'Unwrap')
+      await onSubmitted?.(hash)
+      let receipt
+      try {
+        receipt = await this.publicClient.waitForTransactionReceipt({hash})
+      } catch (e) {
+        throw new EvmSubmissionError(
+          'confirmation-unknown',
+          hash,
+          'Unwrap transaction was submitted, but confirmation could not be verified',
+          {cause: e},
+        )
+      }
+      if (receipt.status !== 'success') {
+        throw new EvmSubmissionError('reverted', hash, 'Unwrap transaction reverted')
+      }
       const decoded = parseEventLogs({abi: bridgeAbi, logs: receipt.logs, eventName: 'Unwrapped'})
       const provisionalLogIndex = selectProvisionalLogIndex(
         decoded as unknown as Array<{
@@ -293,6 +473,7 @@ export class EvmService {
     netAmount: bigint,
     nonce: bigint,
     signature: Hex,
+    onSubmitted?: (hash: Hex) => void | Promise<void>,
   ): Promise<Hex> {
     const wallet = this.getWalletClient()
     try {
@@ -307,8 +488,21 @@ export class EvmService {
         account,
       })
       const hash = await wallet.writeContract(request)
-      const receipt = await this.publicClient.waitForTransactionReceipt({hash})
-      assertSuccessfulReceipt(receipt, 'Redeem')
+      await onSubmitted?.(hash)
+      let receipt
+      try {
+        receipt = await this.publicClient.waitForTransactionReceipt({hash})
+      } catch (e) {
+        throw new EvmSubmissionError(
+          'confirmation-unknown',
+          hash,
+          'Redeem transaction was submitted, but confirmation could not be verified',
+          {cause: e},
+        )
+      }
+      if (receipt.status !== 'success') {
+        throw new EvmSubmissionError('reverted', hash, 'Redeem transaction reverted')
+      }
       return hash
     } catch (e) {
       throw mapEvmError(e)

@@ -1,18 +1,28 @@
 <script setup lang="ts">
-import {computed, onMounted, onUnmounted, ref, watch} from 'vue'
+import {computed, nextTick, onMounted, onUnmounted, ref, watch} from 'vue'
 import {
   Alert,
   AlertDescription,
   AlertTitle,
   Card,
   CardContent,
-  ItemGroup,
   useToast,
 } from 'nom-ui'
 import {ArrowUpDown, Clock3, Wallet} from 'lucide-vue-next'
-import RequestList from '@/components/RequestList.vue'
-import UnwrapRequestItem from '@/components/UnwrapRequestItem.vue'
+import TransferProgress from '@/components/TransferProgress.vue'
 import {useBridge, useEvmWallet, useRequests, useUnwrap, useWrap, useZenonWallet} from '@/core'
+import {
+  approvalPlan,
+  isAuthoritativeLockHash,
+  isUnwrapSourceConfirmed,
+  shouldHandoffLocalUnwrapLock,
+  shouldHandoffLocalWrapLock,
+  unwrapRequestProgress,
+  wrapRequestProgress,
+} from '@/core/approval-ux'
+import {normalizeEvmHash} from '@/core/evm-hash'
+import {EvmSubmissionError} from '@/core/evm-service'
+import {ZenonSubmissionError} from '@/core/zenon-wallet-service'
 import type {UnwrapRequestView, WrapRequestView} from '@/types'
 import type {Address} from 'viem'
 import {config, FEE_DENOMINATOR} from '@/config'
@@ -47,11 +57,41 @@ const {
   disconnect: disconnectEvm,
   getTokenBalance,
 } = useEvmWallet()
-const {wrap, redeemEvm, isWrapping, error: wrapError} = useWrap()
-const {unwrap: doUnwrap, redeemZenon, isUnwrapping, error: unwrapError} = useUnwrap()
 const {
+  wrap,
+  redeemEvm,
+  isWrapping,
+  phase: wrapPhase,
+  pendingRedeems: pendingWrapRedeems,
+  pendingRedeemHashes: pendingWrapRedeemHashes,
+  pendingRedeemStages: pendingWrapRedeemStages,
+  clearPendingRedeem: clearPendingWrapRedeem,
+  clearLocalPendingRedeem: clearLocalPendingWrapRedeem,
+  recheckPendingRedeem: recheckPendingWrapRedeem,
+  resetPhase: resetWrapPhase,
+  clearPhase: clearWrapPhase,
+  error: wrapError,
+} = useWrap()
+const {
+  unwrap: doUnwrap,
+  redeemZenon,
+  isUnwrapping,
+  phase: unwrapPhase,
+  pendingRedeems: pendingUnwrapRedeems,
+  clearPendingRedeem: clearPendingUnwrapRedeem,
+  clearLocalPendingRedeem: clearLocalPendingUnwrapRedeem,
+  recheckSubmittedUnwrap,
+  resetPhase: resetUnwrapPhase,
+  clearPhase: clearUnwrapPhase,
+  error: unwrapError,
+} = useUnwrap()
+const {
+  wrapRequests,
   activeRequests,
+  unwrapRequests,
   activeUnwrapRequests,
+  unknownWrapOperations,
+  unknownWrapsHydrated,
   getRawWrapRequest,
   startPolling,
   stopPolling,
@@ -65,6 +105,23 @@ const selectedZts = ref<string | null>(null)
 const amount = ref('')
 const localError = ref<string | null>(null)
 const lastSubmitted = ref<{label: string; url: string} | null>(null)
+const lastCompleted = ref<{label: string; url: string} | null>(null)
+const awaitingCompletion = ref<{
+  kind: 'wrap' | 'unwrap'
+  requestId: string
+  transactionHash?: string
+  explorer: {label: string; url: string}
+} | null>(null)
+const progressRegion = ref<HTMLElement | null>(null)
+const sourceRechecking = ref(false)
+// Durable hashless safety records for ambiguous Zenon wrap submissions by the
+// connected account; polling reconciles them against the node's request list.
+const relevantUnknownWraps = computed(() =>
+  unknownWrapOperations.value.filter(operation =>
+    evmAccount.value &&
+    operation.evmToAddress.toLowerCase() === evmAccount.value.toLowerCase(),
+  ),
+)
 
 const selectedPair = computed(() => tokenPairs.value.find(p => p.zts === selectedZts.value) ?? null)
 const evmBalance = ref<bigint | undefined>(undefined)
@@ -110,6 +167,168 @@ const destinationConnecting = computed(() =>
   direction.value === 'wrap' ? isEvmConnecting.value : isZenonConnecting.value,
 )
 const isSubmitting = computed(() => isWrapping.value || isUnwrapping.value)
+const hasSubmittedSafetyState = computed(() =>
+  wrapPhase.value.kind === 'submitted-untracked' ||
+  wrapPhase.value.kind === 'submitted-unknown' ||
+  relevantUnknownWraps.value.length > 0 ||
+  unwrapPhase.value.kind === 'submitted-unconfirmed' ||
+  unwrapPhase.value.kind === 'submitted-untracked',
+)
+const directionLocked = computed(() => isSubmitting.value || hasSubmittedSafetyState.value)
+const operationDirection = computed<'wrap' | 'unwrap'>(() => {
+  if (
+    isWrapping.value ||
+    wrapPhase.value.kind === 'submitted-untracked' ||
+    wrapPhase.value.kind === 'submitted-unknown' ||
+    relevantUnknownWraps.value.length > 0
+  ) return 'wrap'
+  if (
+    isUnwrapping.value ||
+    unwrapPhase.value.kind === 'submitted-unconfirmed' ||
+    unwrapPhase.value.kind === 'submitted-untracked'
+  ) return 'unwrap'
+  return direction.value
+})
+const approvalPlanCopy = computed(() => approvalPlan(direction.value))
+const displayedPendingWrapRedeems = computed(() => {
+  const pending = {...pendingWrapRedeems.value}
+  for (const request of wrapRequests.value) {
+    if (request.pendingClaimHash && !pending[request.id]) pending[request.id] = 'confirming'
+  }
+  return pending
+})
+const displayedPendingUnwrapRedeems = computed(() => {
+  const pending = {...pendingUnwrapRedeems.value}
+  for (const request of unwrapRequests.value) {
+    if (request.pendingZenonRedeemHash && !pending[request.id]) pending[request.id] = 'confirming'
+  }
+  return pending
+})
+const actionableRequestCount = computed(() =>
+  activeRequests.value.filter(request =>
+    wrapRequestProgress(request.status, displayedPendingWrapRedeems.value[request.id]).actionable,
+  ).length +
+  activeUnwrapRequests.value.filter(request =>
+    unwrapRequestProgress(
+      request.status,
+      displayedPendingUnwrapRedeems.value[request.id],
+      request.totalApprovals,
+    ).actionable,
+  ).length,
+)
+
+const operationPhase = computed<{
+  badge: string
+  title: string
+  description: string
+  explorerUrl?: string
+  explorerLabel?: string
+} | null>(() => {
+  if (operationDirection.value === 'wrap') {
+    if (wrapPhase.value.kind === 'submitting-wrap') {
+      return {
+        badge: 'Step 1 of 3',
+        title: 'Approve wrap in Syrius',
+        description: 'Confirm the Zenon source transaction. Two Ethereum claims will follow after bridge signatures and the security delay.',
+      }
+    }
+    if (wrapPhase.value.kind === 'failed') {
+      return {badge: 'Retry available', title: 'Syrius request did not complete', description: wrapPhase.value.message}
+    }
+    if (wrapPhase.value.kind === 'submitted-untracked') {
+      return {
+        badge: 'Submitted',
+        title: 'Wrap submitted; tracking unavailable',
+        description: wrapPhase.value.message,
+        explorerUrl: config.zenonExplorerTxUrl + wrapPhase.value.id,
+        explorerLabel: 'View submitted Zenon transaction',
+      }
+    }
+    if (wrapPhase.value.kind === 'submitted-unknown') {
+      return {
+        badge: 'Submitted · verify status',
+        title: 'Wrap may have been submitted',
+        description: wrapPhase.value.message,
+      }
+    }
+    if (relevantUnknownWraps.value.length > 0) {
+      // Restored after a reload from the durable operation record.
+      return {
+        badge: 'Submitted · verify status',
+        title: 'Wrap may have been submitted',
+        description: 'A previous wrap may have been submitted, but Syrius did not return a result. Do not submit it again; the node is being checked for the transfer.',
+      }
+    }
+    return null
+  }
+
+  switch (unwrapPhase.value.kind) {
+    case 'checking-allowance':
+      return {
+        badge: 'Read only',
+        title: 'Checking token allowance',
+        description: 'The bridge is checking whether token approval is needed. No wallet confirmation is required for this read.',
+      }
+    case 'approving-token':
+      return {
+        badge: 'Step 1 of 3',
+        title: `Approve ${selectedPair.value?.evmSymbol ?? 'token'} in MetaMask`,
+        description: 'Approve only the exact bridge amount. The bridge transfer prompt comes next.',
+      }
+    case 'confirming-approval':
+      return {
+        badge: 'Step 1 of 3',
+        title: 'Confirming token approval',
+        description: 'The approval was submitted to Ethereum. The bridge transfer will not be requested until it confirms.',
+        explorerUrl: config.evmExplorerTxUrl + unwrapPhase.value.hash,
+        explorerLabel: 'View submitted Ethereum transaction',
+      }
+    case 'submitting-unwrap':
+      return {
+        badge: `Step ${unwrapPhase.value.step} of ${unwrapPhase.value.total}`,
+        title: 'Confirm bridge transfer in MetaMask',
+        description: unwrapPhase.value.total === 2
+          ? 'The existing token allowance is sufficient, so the separate approval was skipped.'
+          : 'The exact-amount token approval is confirmed. Submit the bridge transfer next.',
+      }
+    case 'confirming-unwrap':
+      return {
+        badge: `Step ${unwrapPhase.value.step} of ${unwrapPhase.value.total}`,
+        title: 'Confirming bridge transfer',
+        description: 'The Ethereum transaction was submitted. Keep this page open while it confirms.',
+        explorerUrl: config.evmExplorerTxUrl + unwrapPhase.value.hash,
+        explorerLabel: 'View submitted Ethereum transaction',
+      }
+    case 'submitted-unconfirmed':
+      return {
+        badge: 'Submitted · verify status',
+        title: 'Bridge transfer submitted',
+        description: unwrapPhase.value.message,
+        explorerUrl: config.evmExplorerTxUrl + unwrapPhase.value.hash,
+        explorerLabel: 'View submitted Ethereum transaction',
+      }
+    case 'submitted-untracked':
+      return {
+        badge: 'Confirmed · tracking unavailable',
+        title: 'Bridge transfer confirmed',
+        description: unwrapPhase.value.message,
+        explorerUrl: config.evmExplorerTxUrl + unwrapPhase.value.hash,
+        explorerLabel: 'View confirmed Ethereum transaction',
+      }
+    case 'failed':
+      return {
+        badge: 'Retry available',
+        title: unwrapPhase.value.stage === 'token-approval'
+          ? 'Token approval did not complete'
+          : unwrapPhase.value.stage === 'bridge-transfer'
+            ? 'Bridge transfer did not complete'
+            : 'Allowance check failed',
+        description: unwrapPhase.value.message,
+      }
+    case 'idle':
+      return null
+  }
+})
 const minimumAmount = computed(() => {
   const pair = selectedPair.value
   if (!pair) return undefined
@@ -145,10 +364,20 @@ const ctaLabel = computed(() => {
       ? 'Connecting destination wallet…'
       : 'Connect destination wallet'
   }
-  if (isSubmitting.value) return 'Submitting…'
+  if (direction.value === 'wrap' && wrapPhase.value.kind === 'failed') return 'Retry wrap submission'
+  if (direction.value === 'unwrap' && unwrapPhase.value.kind === 'failed') {
+    if (unwrapPhase.value.stage === 'allowance') return 'Retry allowance check'
+    if (unwrapPhase.value.stage === 'token-approval') return 'Retry token approval'
+    return 'Retry bridge transfer'
+  }
+  // An active submission wins: its own pre-send safety record would otherwise
+  // relabel a normal in-flight wrap as "already submitted".
+  if (isSubmitting.value) return operationPhase.value ? `${operationPhase.value.title}…` : 'Submitting…'
+  if (hasSubmittedSafetyState.value) return 'Transfer already submitted'
   return `Bridge to ${toSide.value.network}`
 })
 const ctaDisabled = computed(() => {
+  if (hasSubmittedSafetyState.value) return true
   if (!sourceConnected.value) return sourceConnecting.value
   if (!destinationConnected.value) return destinationConnecting.value
   return !canSubmit.value
@@ -202,10 +431,14 @@ async function onCtaClick(): Promise<void> {
 }
 
 function swapDirection(): void {
+  if (directionLocked.value) return
   direction.value = direction.value === 'wrap' ? 'unwrap' : 'wrap'
 }
 
 const canSubmit = computed<boolean>(() => {
+  // Durable safety records must be enforced before any submission is possible;
+  // until hydration completes the form cannot know whether a lock exists.
+  if (!unknownWrapsHydrated.value) return false
   if (!selectedPair.value || !amount.value) return false
   if (halted.value || allowKeyGen.value) return false
   if (evmChainId.value !== config.evmChainId) return false
@@ -273,9 +506,101 @@ watch([evmAccount, zenonAddress], () => {
   void refreshForAccountChange().catch(() => undefined)
 })
 
+// An ambiguous wrap submission resolves when polling reconciles its durable
+// operation record against the originating account chain and clears it. Only
+// records observed OUTSIDE an active submission count — a normal wrap creates
+// and clears its own pre-send record.
+let hadUnknownWrapOperations = false
+watch([relevantUnknownWraps, isWrapping], ([operations, wrapping]) => {
+  if (operations.length > 0) {
+    if (!wrapping) hadUnknownWrapOperations = true
+    return
+  }
+  if (!hadUnknownWrapOperations) return
+  hadUnknownWrapOperations = false
+  if (wrapPhase.value.kind === 'submitted-unknown') clearWrapPhase()
+  toast.show('The wrap was published after all. Continue from the transfer progress list.', 'success')
+})
+
+// Failed prompts are contextual. Editing the route, token, amount, or wallet
+// clears stale retry copy, while submitted/unknown states remain locked until
+// authoritative request polling finds them.
+watch([direction, selectedZts, amount, evmAccount, zenonAddress], () => {
+  const hadFailure = wrapPhase.value.kind === 'failed' || unwrapPhase.value.kind === 'failed'
+  resetWrapPhase()
+  resetUnwrapPhase()
+  if (hadFailure) localError.value = null
+}, {immediate: true})
+
+watch([wrapRequests, unwrapRequests], () => {
+  for (const id of Object.keys(pendingWrapRedeems.value)) {
+    const request = wrapRequests.value.find(candidate => candidate.id === id)
+    const stage = pendingWrapRedeemStages.value[id]
+    if (
+      pendingWrapRedeems.value[id] === 'confirming' &&
+      request &&
+      // A persisted placeholder is not a handoff-worthy hash: it means the
+      // real broadcast hash exists only in this context's memory.
+      shouldHandoffLocalWrapLock(stage, request.status, isAuthoritativeLockHash(request.pendingClaimHash))
+    ) {
+      clearLocalPendingWrapRedeem(id)
+    }
+  }
+  for (const id of Object.keys(pendingUnwrapRedeems.value)) {
+    const request = unwrapRequests.value.find(candidate => candidate.id === id)
+    if (
+      pendingUnwrapRedeems.value[id] === 'confirming' &&
+      request &&
+      shouldHandoffLocalUnwrapLock(request.status, isAuthoritativeLockHash(request.pendingZenonRedeemHash))
+    ) {
+      clearLocalPendingUnwrapRedeem(id)
+    }
+  }
+
+  const currentWrapPhase = wrapPhase.value
+  if (
+    currentWrapPhase.kind === 'submitted-untracked' &&
+    wrapRequests.value.some(request => request.id === currentWrapPhase.id)
+  ) clearWrapPhase()
+
+
+  const currentUnwrapPhase = unwrapPhase.value
+  if (
+    (currentUnwrapPhase.kind === 'submitted-unconfirmed' || currentUnwrapPhase.kind === 'submitted-untracked') &&
+    unwrapRequests.value.some(request =>
+      isUnwrapSourceConfirmed(request.status) &&
+      normalizeEvmHash(request.transactionHash) === normalizeEvmHash(currentUnwrapPhase.hash),
+    )
+  ) clearUnwrapPhase()
+
+  const awaiting = awaitingCompletion.value
+  if (!awaiting) return
+  if (awaiting.kind === 'wrap') {
+    if (wrapRequests.value.some(request => request.id === awaiting.requestId && request.status === 'redeemed')) {
+      lastCompleted.value = awaiting.explorer
+      awaitingCompletion.value = null
+      void clearPendingWrapRedeem(awaiting.requestId)
+    }
+    return
+  }
+
+  const final = unwrapRequests.value.find(request =>
+    normalizeEvmHash(request.transactionHash) === awaiting.transactionHash,
+  )
+  if (final?.status === 'redeemed') {
+    lastCompleted.value = awaiting.explorer
+    awaitingCompletion.value = null
+    void clearPendingUnwrapRedeem(awaiting.requestId)
+  } else if (final?.status === 'revoked') {
+    awaitingCompletion.value = null
+    void clearPendingUnwrapRedeem(awaiting.requestId)
+  }
+}, {immediate: true})
+
 async function onSubmit(): Promise<void> {
   localError.value = null
   lastSubmitted.value = null
+  lastCompleted.value = null
   if (!selectedPair.value || !evmAccount.value) return
   if (direction.value === 'unwrap') return onUnwrapSubmit()
   const zts = selectedPair.value.zts
@@ -291,19 +616,34 @@ async function onSubmit(): Promise<void> {
     if (!pair || !pair.wrapEnabled) throw new Error('Wrapping is disabled for this token pair')
     const base = parseAmount(amount.value, pair.decimals)
     if (base < pair.wrapMinAmount) throw new Error('Amount is below the current wrap minimum')
-    const hash = await wrap(
+    if (!zenonAddress.value) return
+    const {id: hash, trackingFailed} = await wrap(
       evmAccount.value,
       amount.value,
       pair.decimals,
       pair.zts,
       pair.symbol,
+      zenonAddress.value,
     )
     toast.show('Wrap submitted', 'success')
+    if (trackingFailed) {
+      toast.show('The wrap was submitted, but local tracking failed. Do not submit it again.', 'info')
+    }
     lastSubmitted.value = {label: 'View Zenon transaction', url: config.zenonExplorerTxUrl + hash}
     amount.value = ''
     if (zenonBalance.value !== undefined) zenonBalance.value -= base
     await refreshRequestsSafely()
+    await focusProgressRegion()
   } catch (e) {
+    if (e instanceof ZenonSubmissionError && e.kind === 'ambiguous') {
+      // The wrap block may still be signed and broadcast by Syrius; the form
+      // is locked (submitted-unknown) until the node shows a new wrap request
+      // or the user verifies in Syrius that nothing was sent.
+      localError.value = null
+      toast.show('The wrap may have been submitted. Do not submit it again — checking the Zenon node for the transfer.', 'info')
+      await refreshRequestsSafely()
+      return
+    }
     localError.value = e instanceof Error ? e.message : 'Failed to submit wrap'
     toast.show(localError.value, 'error')
   }
@@ -326,7 +666,7 @@ async function onUnwrapSubmit(): Promise<void> {
     if (!pair || !pair.unwrapEnabled) throw new Error('Unwrapping is disabled for this token pair')
     const base = parseAmount(amount.value, pair.decimals)
     if (base < pair.unwrapMinAmount) throw new Error('Amount is below the current unwrap minimum')
-    const {hash, eventMatched} = await doUnwrap(
+    const result = await doUnwrap(
       pair.tokenAddress as Address,
       base,
       zenonAddress.value,
@@ -335,14 +675,24 @@ async function onUnwrapSubmit(): Promise<void> {
       pair.decimals,
       pair.symbol,
     )
-    toast.show('Unwrap submitted', 'success')
-    if (!eventMatched) {
+    const {hash} = result
+    toast.show(
+      result.kind === 'confirmed'
+        ? 'Bridge transfer confirmed'
+        : 'Bridge transfer submitted; confirmation status is unavailable',
+      result.kind === 'confirmed' ? 'success' : 'info',
+    )
+    if (result.trackingFailed) {
+      toast.show('Local request tracking failed. Do not submit the transfer again.', 'info')
+    }
+    if (result.kind === 'confirmed' && !result.eventMatched) {
       toast.show('Transaction confirmed; waiting for the Zenon node to recover its event index.', 'info')
     }
     lastSubmitted.value = {label: 'View Ethereum transaction', url: config.evmExplorerTxUrl + hash}
     amount.value = ''
     await refreshBalances()
     await refreshRequestsSafely()
+    await focusProgressRegion()
   } catch (e) {
     localError.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
     toast.show(localError.value, 'error')
@@ -350,32 +700,154 @@ async function onUnwrapSubmit(): Promise<void> {
 }
 
 async function onUnwrapRedeem(view: UnwrapRequestView): Promise<void> {
+  if (displayedPendingUnwrapRedeems.value[view.id]) return
   localError.value = null
   try {
     const hash = await redeemZenon(view)
-    toast.show('Redeem submitted', 'success')
+    toast.show('Zenon redemption published; waiting for node confirmation', 'success')
     lastSubmitted.value = {label: 'View Zenon transaction', url: config.zenonExplorerTxUrl + hash}
+    awaitingCompletion.value = {
+      kind: 'unwrap',
+      requestId: view.id,
+      transactionHash: normalizeEvmHash(view.transactionHash),
+      explorer: lastSubmitted.value,
+    }
     await refreshRequestsSafely()
   } catch (e) {
+    if (e instanceof ZenonSubmissionError && e.kind === 'ambiguous') {
+      localError.value = null
+      toast.show('Zenon redemption may have been submitted. The safety lock remains active while node status is checked.', 'info')
+      await refreshRequestsSafely()
+      return
+    }
     localError.value = e instanceof Error ? e.message : 'Failed to redeem'
     toast.show(localError.value, 'error')
+    await refreshRequestsSafely()
   }
 }
 
 async function onRedeem(view: WrapRequestView): Promise<void> {
+  if (displayedPendingWrapRedeems.value[view.id]) return
   localError.value = null
   const raw = getRawWrapRequest(view.id)
   const bridge = bridgeAddress.value
   if (!raw || !bridge) return
   try {
-    const hash = await redeemEvm(raw, bridge as `0x${string}`)
-    toast.show('Redeem submitted', 'success')
+    const result = await redeemEvm(raw, bridge as `0x${string}`, (submittedHash, claimStage) => {
+      lastSubmitted.value = {
+        label: 'View Ethereum transaction',
+        url: config.evmExplorerTxUrl + submittedHash,
+      }
+      if (claimStage === 2) {
+        awaitingCompletion.value = {
+          kind: 'wrap',
+          requestId: view.id,
+          explorer: lastSubmitted.value,
+        }
+      }
+    })
+    if (result.kind === 'already-redeemed') {
+      lastSubmitted.value = null
+      toast.show('This claim was already completed. Refreshing its authoritative status.', 'info')
+      await refreshRequestsSafely()
+      return
+    }
+    const hash = result.hash
+    const completed = result.claimStage === 2
+    toast.show(completed ? 'Bridge complete' : 'First claim confirmed', 'success')
     lastSubmitted.value = {label: 'View Ethereum transaction', url: config.evmExplorerTxUrl + hash}
+    if (completed) lastCompleted.value = lastSubmitted.value
+    if (completed) awaitingCompletion.value = null
     await refreshRequestsSafely()
   } catch (e) {
+    if (e instanceof EvmSubmissionError && e.kind === 'reverted') {
+      localError.value = e.message
+      toast.show('Ethereum confirms the claim reverted. It is safe to retry.', 'error')
+      await refreshRequestsSafely()
+      return
+    }
+    if (
+      (e instanceof EvmSubmissionError && e.kind === 'confirmation-unknown') ||
+      (!(e instanceof EvmSubmissionError) &&
+        displayedPendingWrapRedeems.value[view.id] === 'confirming')
+    ) {
+      localError.value = null
+      toast.show('Claim submitted; confirmation is unavailable. Do not submit it again. Recheck its status below.', 'info')
+      await refreshRequestsSafely()
+      return
+    }
     localError.value = e instanceof Error ? e.message : 'Failed to redeem'
     toast.show(localError.value, 'error')
   }
+}
+
+async function onRecheckSubmittedUnwrap(): Promise<void> {
+  sourceRechecking.value = true
+  try {
+    const outcome = await recheckSubmittedUnwrap()
+    if (outcome === 'confirmed') {
+      toast.show('Ethereum confirms the bridge transfer succeeded.', 'success')
+      await refreshRequestsSafely()
+    } else if (outcome === 'reverted') {
+      toast.show('Ethereum confirms the transaction reverted. It is safe to retry.', 'info')
+      await refreshRequestsSafely()
+    } else if (outcome === 'absent') {
+      toast.show('No configured RPC knows this transaction yet. The safety lock remains active; if it stays unknown, the tracked transfer is released automatically.', 'info')
+    } else {
+      toast.show('Ethereum could not confirm success or failure across the configured RPCs. The safety lock remains active.', 'info')
+    }
+  } finally {
+    sourceRechecking.value = false
+  }
+}
+
+async function onRecheckWrap(request: WrapRequestView): Promise<void> {
+  // Prefer a real persisted hash; if the persisted lock still holds the
+  // pre-prompt placeholder (its persist failed post-broadcast), the in-memory
+  // hash is the only authoritative record of the submitted transaction.
+  const persisted = request.pendingClaimHash
+  const hash = isAuthoritativeLockHash(persisted)
+    ? persisted
+    : pendingWrapRedeemHashes.value[request.id]
+  if (!hash) {
+    // Placeholder-only or no lock: polling releases an orphaned placeholder
+    // automatically once no context holds its Web Lock.
+    if (!persisted) clearLocalPendingWrapRedeem(request.id)
+    await refreshRequestsSafely()
+    if (persisted) {
+      toast.show('No transaction was recorded for this claim. If the wallet prompt was abandoned, the lock releases automatically.', 'info')
+    }
+    return
+  }
+  const outcome = await recheckPendingWrapRedeem(request.id, hash as `0x${string}`)
+  await refreshRequestsSafely()
+  if (outcome === 'reverted') {
+    toast.show('Ethereum confirms the claim reverted. It is safe to retry.', 'info')
+  } else if (outcome === 'confirmed') {
+    toast.show('The claim transaction is confirmed; refreshing bridge state.', 'success')
+  } else if (outcome === 'absent') {
+    toast.show('No configured RPC knows this transaction. The safety lock remains active; if the transaction stays unknown, the lock releases automatically.', 'info')
+  } else {
+    toast.show('The claim could not be confirmed or reverted across the configured RPCs. Its safety lock remains active.', 'info')
+  }
+}
+
+async function onRecheckUnwrap(request: UnwrapRequestView): Promise<void> {
+  await refreshRequestsSafely()
+  const current = unwrapRequests.value.find(candidate => candidate.id === request.id)
+  if (current?.status === 'redeemed') toast.show('Zenon confirms the redemption completed.', 'success')
+  else toast.show('Zenon has not confirmed completion. The safety lock remains active.', 'info')
+}
+
+function dismissSubmittedNotice(): void {
+  if (wrapPhase.value.kind === 'submitted-untracked') clearWrapPhase()
+  if (unwrapPhase.value.kind === 'submitted-untracked') clearUnwrapPhase()
+  toast.show('Tracking notice dismissed. The confirmed transfer must not be submitted again.', 'info')
+}
+
+async function focusProgressRegion(): Promise<void> {
+  await nextTick()
+  progressRegion.value?.focus({preventScroll: false})
 }
 
 async function refreshRequestsSafely(): Promise<void> {
@@ -424,11 +896,18 @@ onUnmounted(() => {
           </div>
           <router-link
             to="/requests"
-            class="grid h-9 w-9 place-items-center rounded-full border border-border/80 text-muted-foreground transition-colors hover:border-foreground/25 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+            class="relative grid h-9 w-9 place-items-center rounded-full border border-border/80 text-muted-foreground transition-colors hover:border-foreground/25 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
             title="History"
             aria-label="History"
           >
             <Clock3 class="h-4 w-4" />
+            <span
+              v-if="actionableRequestCount"
+              class="absolute -right-1.5 -top-1.5 grid min-h-5 min-w-5 place-items-center rounded-full bg-zenon-green px-1 text-[10px] font-semibold text-[#04150b]"
+              :aria-label="`${actionableRequestCount} bridge actions required`"
+            >
+              {{ actionableRequestCount }}
+            </span>
           </router-link>
         </div>
 
@@ -571,9 +1050,10 @@ onUnmounted(() => {
           <div class="relative z-10 flex justify-center">
             <button
               type="button"
-              class="-my-6 grid h-10 w-10 place-items-center rounded-full border border-border/80 bg-card text-muted-foreground shadow-sm transition-colors hover:border-zenon-green/50 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              class="-my-6 grid h-10 w-10 place-items-center rounded-full border border-border/80 bg-card text-muted-foreground shadow-sm transition-colors hover:border-zenon-green/50 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
               title="Swap direction"
               aria-label="Swap direction"
+              :disabled="directionLocked"
               @click="swapDirection"
             >
               <ArrowUpDown class="h-4 w-4" />
@@ -650,6 +1130,57 @@ onUnmounted(() => {
           </section>
         </div>
 
+        <p
+          v-if="sourceConnected && destinationConnected && !operationPhase"
+          class="px-2 text-center text-xs leading-relaxed text-muted-foreground"
+        >
+          {{ approvalPlanCopy }}
+        </p>
+
+        <div
+          v-if="operationPhase"
+          class="rounded-[14px] border border-border/80 bg-background/50 p-4"
+          aria-live="polite"
+        >
+          <div class="mb-2 flex items-center justify-between gap-3">
+            <p class="text-sm font-semibold">{{ operationPhase.title }}</p>
+            <span class="shrink-0 rounded-full bg-primary/10 px-2.5 py-1 text-[10px] font-medium text-primary">
+              {{ operationPhase.badge }}
+            </span>
+          </div>
+          <p class="text-xs leading-relaxed text-muted-foreground">{{ operationPhase.description }}</p>
+          <a
+            v-if="operationPhase.explorerUrl"
+            :href="operationPhase.explorerUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="mt-2 inline-block text-xs text-primary underline"
+          >
+            {{ operationPhase.explorerLabel ?? 'View pending Ethereum transaction' }}
+          </a>
+          <div
+            v-if="unwrapPhase.kind === 'submitted-unconfirmed'"
+            class="mt-3 flex flex-wrap gap-2"
+          >
+            <button
+              type="button"
+              class="rounded-full border border-border px-3 py-1.5 text-xs font-medium text-foreground disabled:opacity-40"
+              :disabled="sourceRechecking"
+              @click="onRecheckSubmittedUnwrap"
+            >
+              {{ sourceRechecking ? 'Rechecking…' : 'Recheck on Ethereum' }}
+            </button>
+          </div>
+          <button
+            v-if="wrapPhase.kind === 'submitted-untracked' || unwrapPhase.kind === 'submitted-untracked'"
+            type="button"
+            class="mt-3 rounded-full border border-border px-3 py-1.5 text-xs font-medium text-foreground"
+            @click="dismissSubmittedNotice"
+          >
+            Continue without local tracking
+          </button>
+        </div>
+
         <button
           type="button"
           class="w-full rounded-full bg-zenon-green px-4 py-3.5 text-sm font-semibold text-[#04150b] transition-colors hover:bg-zenon-green/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
@@ -681,21 +1212,51 @@ onUnmounted(() => {
       </CardContent>
     </Card>
 
-    <RequestList
-      v-if="direction === 'wrap'"
-      :requests="activeRequests"
-      @redeem="onRedeem"
-    />
-    <template v-else>
-      <ItemGroup v-if="activeUnwrapRequests.length" class="gap-2">
-        <UnwrapRequestItem
-          v-for="request in activeUnwrapRequests"
-          :key="request.id"
-          :request="request"
-          @redeem="onUnwrapRedeem"
-        />
-      </ItemGroup>
-      <p v-else class="text-sm text-muted-foreground">No active requests.</p>
-    </template>
+    <div ref="progressRegion" tabindex="-1" class="rounded-[18px] outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <TransferProgress
+        :wrap-requests="activeRequests"
+        :unwrap-requests="activeUnwrapRequests"
+        :pending-wrap-redeems="displayedPendingWrapRedeems"
+        :pending-unwrap-redeems="displayedPendingUnwrapRedeems"
+        @redeem-wrap="onRedeem"
+        @redeem-unwrap="onUnwrapRedeem"
+        @recheck-wrap="onRecheckWrap"
+        @recheck-unwrap="onRecheckUnwrap"
+      />
+    </div>
+
+    <Card v-if="lastCompleted" class="rounded-[18px] border-border/80 bg-card">
+      <CardContent class="space-y-3 !p-5" aria-live="polite">
+        <div>
+          <p class="text-sm font-semibold">Bridge complete</p>
+          <p class="mt-1 text-xs text-muted-foreground">
+            The final destination transaction is confirmed. No further wallet action is required.
+          </p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button
+            type="button"
+            class="rounded-full bg-zenon-green px-4 py-2 text-xs font-semibold text-[#04150b]"
+            @click="lastCompleted = null"
+          >
+            Bridge another token
+          </button>
+          <a
+            :href="lastCompleted.url"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="rounded-full border border-border px-4 py-2 text-xs font-medium text-foreground"
+          >
+            {{ lastCompleted.label }}
+          </a>
+          <router-link
+            to="/requests"
+            class="rounded-full border border-border px-4 py-2 text-xs font-medium text-foreground"
+          >
+            View history
+          </router-link>
+        </div>
+      </CardContent>
+    </Card>
   </div>
 </template>

@@ -20,6 +20,17 @@ export interface ZenonWalletInfo {
   nodeUrl?: string
 }
 
+export class ZenonSubmissionError extends Error {
+  constructor(
+    readonly kind: 'rejected' | 'ambiguous',
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'ZenonSubmissionError'
+  }
+}
+
 type SignClientInstance = Awaited<ReturnType<typeof SignClient.init>>
 
 export class ZenonWalletService {
@@ -173,11 +184,36 @@ export class ZenonWalletService {
     if (info.address !== fromAddress) {
       throw new Error('Zenon wallet address changed. Review the recipient and try again.')
     }
-    const result = await this.requestWithRetry<unknown>('znn_send', {
-      fromAddress,
-      accountBlock: block.toJson(),
-    })
-    return AccountBlockTemplate.fromJson(result as any)
+    let result: unknown
+    try {
+      result = await this.requestWithRetry<unknown>('znn_send', {
+        fromAddress,
+        accountBlock: block.toJson(),
+      })
+    } catch (e) {
+      // Rejections are recognized structurally (typed by requestWithRetry from
+      // the wallet's error code), never by matching a message string. Anything
+      // not provably a rejection is ambiguous: the wallet may still have
+      // signed and broadcast the block, so callers must keep safety locks.
+      if (e instanceof ZenonSubmissionError) throw e
+      throw new ZenonSubmissionError(
+        'ambiguous',
+        'Zenon redemption may have been submitted, but WalletConnect did not return a result',
+        e,
+      )
+    }
+    try {
+      return AccountBlockTemplate.fromJson(result as any)
+    } catch (e) {
+      // znn_send already returned: the wallet signed and broadcast the block.
+      // A result we cannot decode (version skew) must never surface as a
+      // retryable failure — callers would release safety locks and resubmit.
+      throw new ZenonSubmissionError(
+        'ambiguous',
+        'Zenon transaction was submitted, but its result could not be decoded',
+        e,
+      )
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -228,9 +264,12 @@ export class ZenonWalletService {
         lastError = e
         switch (classifyWalletError(e)) {
           case 'locked':
-            throw new Error('Your wallet is locked — please unlock Syrius')
+            // A locked wallet provably did not sign — typed like a rejection so
+            // send() never classifies it as ambiguous (which would latch
+            // pre-send safety records forever).
+            throw new ZenonSubmissionError('rejected', 'Your wallet is locked — please unlock Syrius', e)
           case 'rejected':
-            throw new Error('Request rejected in the wallet')
+            throw new ZenonSubmissionError('rejected', 'Request rejected in the wallet', e)
           case 'reconnect':
             // Known Syrius desync ("Bad state: No element"): drop the session
             // and re-acquire before the next attempt — but not after the

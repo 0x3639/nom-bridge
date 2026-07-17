@@ -1,6 +1,6 @@
 import {ZenonService} from './zenon-service'
 import {config} from '@/config'
-import {Address, Hash, TokenStandard} from 'znn-typescript-sdk'
+import {Address, BRIDGE_ADDRESS, Hash, TokenStandard} from 'znn-typescript-sdk'
 import {parseAmount} from './amount'
 import type {
   AccountBlockTemplate,
@@ -94,6 +94,51 @@ export class BridgeService {
 
   // Synchronous: wrapToken only constructs an unsigned AccountBlockTemplate
   // (no node read), so it does not gate on ensureInitialized.
+  // Frontier height of a user account chain — recorded before a wrap send so
+  // an ambiguous submission can later be reconciled against blocks above it.
+  async getAccountFrontierHeight(address: string): Promise<number> {
+    await this.ensureInitialized()
+    const frontier = await this.zenonService
+      .getZenon()
+      .ledger.getFrontierAccountBlock(Address.parse(address))
+    return frontier?.height ?? 0
+  }
+
+  // Sends from `address` to the embedded bridge contract with height above
+  // `afterHeight` — the authoritative account-chain evidence that a wrap was
+  // published. Pages are newest-first; scanning stops once heights fall to or
+  // below the recorded frontier.
+  async findWrapSendsAfter(
+    address: string,
+    afterHeight: number,
+  ): Promise<Array<{hash: string; height: number; zts: string; amount: string}>> {
+    await this.ensureInitialized()
+    const ledger = this.zenonService.getZenon().ledger
+    const parsed = Address.parse(address)
+    const results: Array<{hash: string; height: number; zts: string; amount: string}> = []
+    for (let page = 0; page < 20; page += 1) {
+      const response = await ledger.getAccountBlocksByPage(parsed, page, 50)
+      const blocks = response.list ?? []
+      if (!blocks.length) break
+      let reachedBaseline = false
+      for (const block of blocks) {
+        if (block.height <= afterHeight) {
+          reachedBaseline = true
+          continue
+        }
+        if (block.toAddress.toString() !== BRIDGE_ADDRESS.toString()) continue
+        results.push({
+          hash: block.hash.toString(),
+          height: block.height,
+          zts: block.tokenStandard.toString(),
+          amount: block.amount.toString(),
+        })
+      }
+      if (reachedBaseline) break
+    }
+    return results
+  }
+
   buildWrapBlock(
     evmToAddress: string,
     humanAmount: string | number,

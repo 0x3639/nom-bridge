@@ -292,9 +292,76 @@ describe('ZenonWalletService.send', () => {
     await service.connect()
 
     const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
-    await expect(service.send('z1addr', block as never)).rejects.toThrow(
-      'Syrius request (znn_send) timed out',
-    )
+    await expect(service.send('z1addr', block as never)).rejects.toMatchObject({
+      name: 'ZenonSubmissionError',
+      kind: 'ambiguous',
+    })
+  })
+
+  it('classifies a post-send result-decoding failure as ambiguous, never as a plain failure', async () => {
+    // znn_send already returned: the block was signed and broadcast. A
+    // version-skewed result that fromJson cannot parse must not become a
+    // retryable failure — callers would clear safety locks and resubmit.
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
+      .mockResolvedValueOnce({unexpected: 'shape'}) // znn_send result
+    h.fromJson.mockImplementationOnce(() => {
+      throw new Error('unexpected block shape')
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    await expect(service.send('z1addr', block as never)).rejects.toMatchObject({
+      name: 'ZenonSubmissionError',
+      kind: 'ambiguous',
+    })
+  })
+
+  // A rejection must be recognized structurally (by wallet error code), never by
+  // matching a message string: misclassifying a plain rejection as ambiguous
+  // permanently latches the redemption safety lock.
+  it('classifies a wallet-locked znn_send failure as a definite non-submission, not ambiguous', async () => {
+    // Syrius answering "wallet is locked" proves it did not sign or broadcast;
+    // treating it as ambiguous would permanently latch pre-send safety records.
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
+      .mockRejectedValueOnce(Object.assign(new Error('Wallet is locked'), {code: 9000}))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    await expect(service.send('z1addr', block as never)).rejects.toMatchObject({
+      name: 'ZenonSubmissionError',
+      kind: 'rejected',
+      message: 'Your wallet is locked — please unlock Syrius',
+    })
+  })
+
+  it.each([4001, 5000, 5999])('classifies a wallet rejection with code %i as rejected, not ambiguous', async code => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
+      .mockRejectedValueOnce(Object.assign(new Error('User rejected the request'), {code}))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    await expect(service.send('z1addr', block as never)).rejects.toMatchObject({
+      name: 'ZenonSubmissionError',
+      kind: 'rejected',
+    })
   })
 })
 

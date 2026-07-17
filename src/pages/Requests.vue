@@ -83,22 +83,26 @@ onUnmounted(stopPolling)
 
       <section v-if="zenonAddress" class="space-y-2">
         <h2 class="text-sm font-semibold">Ethereum → Zenon</h2>
-        <a
+        <div
           v-for="request in unwrapRequests"
           :key="request.id"
-          :href="config.evmExplorerTxUrl + request.transactionHash"
-          target="_blank"
-          rel="noopener noreferrer"
           class="flex items-center justify-between gap-3 rounded-md border p-3 text-sm hover:border-primary/50"
         >
-          <span>
+          <a
+            :href="config.evmExplorerTxUrl + request.transactionHash"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="min-w-0 flex-1"
+          >
             <span class="block font-mono">
               {{ formatAmount(request.amount, request.decimals) }} {{ request.symbol }}
             </span>
             <span class="text-xs text-muted-foreground">To {{ truncateAddress(request.toAddress) }}</span>
-          </span>
-          <Badge variant="secondary">{{ request.status }}</Badge>
-        </a>
+          </a>
+          <div class="flex items-center gap-2">
+            <Badge variant="secondary">{{ request.status }}</Badge>
+          </div>
+        </div>
         <p v-if="!unwrapRequests.length" class="text-sm text-muted-foreground">No unwrap requests found.</p>
       </section>
     </CardContent>

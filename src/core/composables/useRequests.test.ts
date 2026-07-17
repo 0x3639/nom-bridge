@@ -1,5 +1,67 @@
 import {describe, expect, it} from 'vitest'
-import {deriveUnwrapStatus, deriveWrapStatus} from './useRequests'
+import {
+  deriveUnwrapStatus,
+  deriveWrapStatus,
+  findTrackedUnwrapByHash,
+  normalizeEvmHash,
+  reconcileUnknownWrapOperations,
+} from './useRequests'
+
+describe('normalizeEvmHash', () => {
+  it('canonicalizes SDK and viem hash formats to the same key', () => {
+    expect(normalizeEvmHash('ABCDEF')).toBe('0xabcdef')
+    expect(normalizeEvmHash('0xAbCdEf')).toBe('0xabcdef')
+  })
+
+  it('finds prefixed tracked metadata for an unprefixed node hash', () => {
+    const tracked = [{kind: 'unwrap', id: '0xABCDEF:-1', approvalCount: 3}] as never
+    expect(findTrackedUnwrapByHash(tracked, 'abcdef')).toMatchObject({approvalCount: 3})
+  })
+})
+
+describe('reconcileUnknownWrapOperations', () => {
+  const operation = (overrides: Partial<Parameters<typeof reconcileUnknownWrapOperations>[0][0]> = {}) => ({
+    id: 'op-1',
+    evmToAddress: '0xRecipient',
+    zenonFromAddress: 'z1qsender',
+    frontierHeight: 41,
+    zts: 'zts1znn',
+    amount: '150000000',
+    decimals: 8,
+    symbol: 'ZNN',
+    createdAt: 1,
+    ...overrides,
+  })
+  const block = (overrides: Partial<{hash: string; height: number; zts: string; amount: string}> = {}) => ({
+    hash: 'blockhash-1',
+    height: 42,
+    zts: 'zts1znn',
+    amount: '150000000',
+    ...overrides,
+  })
+
+  it('reconciles an operation against an account-chain wrap send above its frontier', () => {
+    expect(reconcileUnknownWrapOperations([operation()], [block()])).toEqual(['op-1'])
+  })
+
+  it('ignores blocks at or below the recorded frontier or with a different tuple', () => {
+    expect(reconcileUnknownWrapOperations([operation()], [block({height: 41})])).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({zts: 'zts1other'})])).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({amount: '1'})])).toEqual([])
+  })
+
+  it('never auto-reconciles when the pre-send frontier read failed', () => {
+    expect(reconcileUnknownWrapOperations([operation({frontierHeight: null})], [block()])).toEqual([])
+  })
+
+  it('consumes candidate blocks one-to-one, oldest operation first', () => {
+    // One published block must not clear two ambiguous operations.
+    const ops = [operation({id: 'op-newer', createdAt: 2}), operation({id: 'op-older', createdAt: 1})]
+    expect(reconcileUnknownWrapOperations(ops, [block()])).toEqual(['op-older'])
+    expect(reconcileUnknownWrapOperations(ops, [block(), block({hash: 'blockhash-2', height: 43})]))
+      .toEqual(['op-older', 'op-newer'])
+  })
+})
 
 describe('deriveWrapStatus', () => {
   it('empty signature → signing (progress null)', () => {

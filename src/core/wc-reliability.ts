@@ -41,6 +41,8 @@ export function classifyWalletError(e: unknown): WalletErrorAction {
   const code = (e as {code?: number})?.code
   const message = String((e as {message?: string})?.message ?? '')
   if (typeof code === 'number' && code >= 5000 && code < 6000) return 'rejected'
+  if (code === 4001) return 'rejected' // EIP-1193 userRejectedRequest
+
   if (code === 9000 && message.includes('Wallet is locked')) return 'locked'
   if (code === -32602 && message.includes('Bad state: No element')) return 'reconnect'
   if (code === -32602 && message.includes('No matching key')) return 'retry'
