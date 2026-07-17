@@ -14,5 +14,21 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/*.integration.test.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json-summary', 'lcov'],
+      include: ['src/core/**/*.ts', 'src/config.ts'],
+      exclude: [
+        'src/**/*.test.ts',
+        'src/core/index.ts',
+        'src/core/composables/index.ts',
+      ],
+      thresholds: {
+        statements: 80,
+        branches: 80,
+        functions: 80,
+        lines: 80,
+      },
+    },
   },
 })

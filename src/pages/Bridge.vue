@@ -329,6 +329,8 @@ const operationPhase = computed<{
       }
     case 'idle':
       return null
+    default:
+      return null
   }
 })
 const minimumAmount = computed(() => {

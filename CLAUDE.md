@@ -7,8 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 npm run dev        # Vite dev server
 npm run build      # production build (outputs dist/)
+npm run lint       # ESLint for TypeScript and Vue files
 npm run typecheck  # vue-tsc --noEmit
 npm run test       # vitest run (all tests)
+npm run test:coverage  # unit tests + enforced core coverage thresholds
+npm run test:security  # fail on high/critical npm advisories
+npm run check      # lint + typecheck + coverage + production build
 npx vitest run src/core/amount.test.ts   # single test file
 npx vitest run -t "test name"            # single test by name
 npm run fake-wallet -- "<wc-uri>" [--reject|--locked|--hang|--bad-state]  # headless Syrius stand-in
@@ -17,7 +21,9 @@ npm run test:integration  # live-relay WC test; skips without VITE_WC_PROJECT_ID
 
 Setup: copy `.env.example` to `.env` and set `VITE_WC_PROJECT_ID` (WalletConnect Cloud project id). The app builds without it, but WC pairing fails.
 
-Tests run in a plain `node` environment (see `vitest.config.ts`) and cover pure logic only — no Vue component rendering, no live node. Test files are co-located as `src/**/*.test.ts`. Keep new tests in that style: extract pure functions from services/composables and test those.
+Tests run in a plain `node` environment (see `vitest.config.ts`) with browser and wallet APIs mocked — no Vue component rendering and no live node. Test files are co-located as `src/**/*.test.ts`. Keep new tests in that style: extract pure functions from services/composables where practical and mock external wallet, storage, and network boundaries. Core coverage is enforced at 80% statements, branches, functions, and lines.
+
+GitHub Actions runs `npm run check` on supported Node 22 and 24 releases, uploads coverage and production bundle artifacts, runs npm audit and CodeQL, and reviews dependency changes. The live WalletConnect relay test is intentionally manual because it requires the `VITE_WC_PROJECT_ID` repository secret and external relay availability.
 
 ## What this is
 

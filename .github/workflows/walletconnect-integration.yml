@@ -1,0 +1,33 @@
+name: WalletConnect Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-relay:
+    name: Live relay round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VITE_WC_PROJECT_ID: ${{ secrets.VITE_WC_PROJECT_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Require WalletConnect project ID
+        run: test -n "$VITE_WC_PROJECT_ID"
+
+      - name: Run live WalletConnect integration test
+        run: npm run test:integration
