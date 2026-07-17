@@ -14,7 +14,12 @@ import {
   hasWrapProtocolAdvanced,
   isAuthoritativeLockHash,
 } from '../approval-ux'
-import {isNonceConsumed, type UnwrappedEventRecord} from '../evm-service'
+import {
+  isNonceConsumed,
+  isRedeemStateAdvancedForStage,
+  isRedeemStateUnclaimedForStage,
+  type UnwrappedEventRecord,
+} from '../evm-service'
 export {normalizeEvmHash} from '../evm-hash'
 
 const wrapRequests = ref<WrapRequestView[]>([])
@@ -338,23 +343,25 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
         if (pendingClaimHash && pendingClaimStage) {
           const normalizedClaimHash = normalizeEvmHash(pendingClaimHash)
           const outcome = outcomes.get(normalizedClaimHash)
-          const protocolAdvanced = hasWrapProtocolAdvanced(pendingClaimStage, status)
-          // `dropped` alone is not release evidence for claim locks: a
-          // speed-up replacement may have executed the same claim, and the
-          // poll's progress read came from the single fallback client. Require
-          // a QUORUM-corroborated redeem state proving the claim of this stage
-          // never landed under any hash (stage 1 → still unredeemed, stage 2 →
-          // still only partially redeemed); anything less keeps the lock.
-          let droppedAndProvenUnclaimed = false
-          if (droppedHashes.has(normalizedClaimHash) && bridge) {
-            const redeemState = await EvmService.getInstance()
+          // Neither the single-fallback-client progress read nor dropped-hash
+          // evidence alone may clear the durable claim lock. Both candidate
+          // release paths are decided from the QUORUM-corroborated redeemsInfo
+          // state: forward advancement (the stage's claim provably landed) or
+          // dropped + provably unclaimed (the stage's claim never landed under
+          // any hash). No quorum → lock kept.
+          const suggestsAdvance = hasWrapProtocolAdvanced(pendingClaimStage, status)
+          const dropped = droppedHashes.has(normalizedClaimHash)
+          let redeemState = null as Awaited<ReturnType<EvmService['getCorroboratedRedeemState']>>
+          if ((suggestsAdvance || dropped) && bridge) {
+            redeemState = await EvmService.getInstance()
               .getCorroboratedRedeemState(bridge as Address, ('0x' + id) as Hex)
               .catch(() => null)
-            droppedAndProvenUnclaimed = pendingClaimStage === 1
-              ? redeemState === 'unredeemed'
-              : redeemState === 'partial'
           }
-          if (outcome === 'reverted' || protocolAdvanced || droppedAndProvenUnclaimed) {
+          const advanceConfirmed =
+            suggestsAdvance && isRedeemStateAdvancedForStage(pendingClaimStage, redeemState)
+          const droppedAndProvenUnclaimed =
+            dropped && isRedeemStateUnclaimedForStage(pendingClaimStage, redeemState)
+          if (outcome === 'reverted' || advanceConfirmed || droppedAndProvenUnclaimed) {
             await requestStore.clearPendingEvmClaim(id)
             await requestStore.clearEvmTxFacts(normalizedClaimHash)
             pendingClaimHash = undefined

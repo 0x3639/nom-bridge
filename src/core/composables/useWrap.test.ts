@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
   getAuthoritativeOutcome: vi.fn(),
   getSnapshot: vi.fn(),
   withCrossContextLock: vi.fn(),
+  withWalletActionLock: vi.fn(),
   withExclusiveSourceLock: vi.fn(),
   hasCrossContextLocks: vi.fn(),
   extractNumberDecimals: vi.fn(),
@@ -59,6 +60,7 @@ vi.mock('../request-store', () => ({
     clearUnknownWrap: h.clearUnknownWrap,
     getSnapshot: h.getSnapshot,
     withCrossContextLock: h.withCrossContextLock,
+    withWalletActionLock: h.withWalletActionLock,
     withExclusiveSourceLock: h.withExclusiveSourceLock,
     hasCrossContextLocks: h.hasCrossContextLocks,
   },
@@ -79,6 +81,7 @@ beforeEach(() => {
   h.getAccountFrontierHeight.mockResolvedValue(0)
   h.getSnapshot.mockResolvedValue({evmClaims: {}, unknownWraps: {}, requests: []})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
   h.withExclusiveSourceLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
   h.hasCrossContextLocks.mockReturnValue(true)
 })
@@ -565,12 +568,12 @@ describe('useWrap.redeemEvm', () => {
     expect(h.setPendingEvmClaim).toHaveBeenLastCalledWith('1a2b', 'ambiguous-wallet-result', 1)
   })
 
-  it('locks the claim locally before waiting on another context\'s cross-context lock', async () => {
+  it('locks the claim locally before waiting on another context\'s wallet-action lock', async () => {
     h.getWrapRedeemProgress.mockResolvedValue({kind: 'unredeemed'})
     h.tssSignatureToHex.mockReturnValue('0xsig')
     h.redeem.mockResolvedValue('0xtxhash')
     let releaseLock: () => void = () => undefined
-    h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
+    h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
       await new Promise<void>(resolve => {
         releaseLock = resolve
       })

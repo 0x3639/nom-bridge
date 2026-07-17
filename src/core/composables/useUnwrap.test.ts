@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   getUnwrapRequest: vi.fn(),
   getSnapshot: vi.fn(),
   withCrossContextLock: vi.fn(),
+  withWalletActionLock: vi.fn(),
   withExclusiveSourceLock: vi.fn(),
   hasCrossContextLocks: vi.fn(),
 }))
@@ -59,6 +60,7 @@ vi.mock('../request-store', () => ({
     clearPendingZenonRedeem: h.clearPendingZenonRedeem,
     getSnapshot: h.getSnapshot,
     withCrossContextLock: h.withCrossContextLock,
+    withWalletActionLock: h.withWalletActionLock,
     withExclusiveSourceLock: h.withExclusiveSourceLock,
     hasCrossContextLocks: h.hasCrossContextLocks,
   },
@@ -70,7 +72,9 @@ beforeEach(() => {
   h.setPendingZenonRedeem.mockResolvedValue(true)
   h.clearPendingZenonRedeem.mockResolvedValue(undefined)
   h.getSnapshot.mockResolvedValue({zenonRedeems: {}, requests: []})
+  h.getUnwrapRequest.mockResolvedValue({redeemed: 0, revoked: 0})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
+  h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
   h.withExclusiveSourceLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
   h.hasCrossContextLocks.mockReturnValue(true)
 })
@@ -543,11 +547,11 @@ describe('useUnwrap.redeemZenon', () => {
     expect(h.setPendingZenonRedeem).toHaveBeenLastCalledWith(view.id, 'ambiguous-wallet-result')
   })
 
-  it('locks the redemption locally before waiting on another context\'s cross-context lock', async () => {
+  it('locks the redemption locally before waiting on another context\'s wallet-action lock', async () => {
     h.buildRedeemBlock.mockReturnValue({__block: true})
     h.send.mockResolvedValue({hash: {toString: () => 'zenonhash'}})
     let releaseLock: () => void = () => undefined
-    h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
+    h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => {
       await new Promise<void>(resolve => {
         releaseLock = resolve
       })
@@ -597,6 +601,35 @@ describe('useUnwrap.redeemZenon', () => {
 
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     expect(useUnwrap().pendingRedeems.value[view.id]).toBeUndefined()
+  })
+
+  it('revalidates the request fresh inside the lock and refuses an already-effective redemption', async () => {
+    // A queued flow can acquire the lock AFTER polling observed 'redeemed' and
+    // cleared the previous holder's persisted lock; its own view is stale.
+    // The fresh node read inside the lock is what must refuse.
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    h.getUnwrapRequest.mockResolvedValue({redeemed: 1, revoked: 0})
+    const {useUnwrap} = await import('./useUnwrap')
+    const transactionHash = `0x${'ff'.repeat(32)}`
+    const view = {
+      id: `${transactionHash}:6`,
+      transactionHash,
+      logIndex: 6,
+      zts: 'zts1znn',
+      amount: 100n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qrecipient',
+      status: 'redeemable' as const,
+    }
+
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('no longer available')
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.setPendingZenonRedeem).not.toHaveBeenCalled()
+    // A failed fresh read also refuses (fail closed).
+    h.getUnwrapRequest.mockRejectedValue(new Error('node unreachable'))
+    await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('no longer available')
+    expect(h.send).not.toHaveBeenCalled()
   })
 
   it('refuses a Zenon redemption when another context already persisted its lock', async () => {

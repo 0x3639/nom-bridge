@@ -121,6 +121,17 @@ export function collapseRedeemStates(
   return responsive.every(state => state === responsive[0]) ? responsive[0] : null
 }
 
+// Per-claim-stage interpretation of a corroborated redeem state.
+export function isRedeemStateAdvancedForStage(stage: 1 | 2, state: RedeemState | null): boolean {
+  if (state === null) return false
+  return stage === 1 ? state !== 'unredeemed' : state === 'fully-redeemed'
+}
+
+export function isRedeemStateUnclaimedForStage(stage: 1 | 2, state: RedeemState | null): boolean {
+  if (state === null) return false
+  return stage === 1 ? state === 'unredeemed' : state === 'partial'
+}
+
 export interface UnwrappedEventRecord {
   transactionHash: string
   logIndex: number

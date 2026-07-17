@@ -215,6 +215,23 @@ describe('dropped-transaction evidence', () => {
     expect(collapseRedeemStates(['fully-redeemed'], 1)).toBe('fully-redeemed')
   })
 
+  it('maps corroborated redeem states to per-stage advancement and unclaimed evidence', async () => {
+    const {isRedeemStateAdvancedForStage, isRedeemStateUnclaimedForStage} = await import('./evm-service')
+    // Stage 1 advanced once ANY claim landed; stage 2 only when fully redeemed.
+    expect(isRedeemStateAdvancedForStage(1, 'partial')).toBe(true)
+    expect(isRedeemStateAdvancedForStage(1, 'fully-redeemed')).toBe(true)
+    expect(isRedeemStateAdvancedForStage(1, 'unredeemed')).toBe(false)
+    expect(isRedeemStateAdvancedForStage(2, 'fully-redeemed')).toBe(true)
+    expect(isRedeemStateAdvancedForStage(2, 'partial')).toBe(false)
+    expect(isRedeemStateAdvancedForStage(1, null)).toBe(false)
+    // Unclaimed: the stage's own claim provably never landed.
+    expect(isRedeemStateUnclaimedForStage(1, 'unredeemed')).toBe(true)
+    expect(isRedeemStateUnclaimedForStage(1, 'partial')).toBe(false)
+    expect(isRedeemStateUnclaimedForStage(2, 'partial')).toBe(true)
+    expect(isRedeemStateUnclaimedForStage(2, 'fully-redeemed')).toBe(false)
+    expect(isRedeemStateUnclaimedForStage(2, null)).toBe(false)
+  })
+
   it('takes the MINIMUM confirmed count across at least two responsive RPCs', async () => {
     const {collapseConfirmedCounts} = await import('./evm-service')
     // Minimum defeats a single RPC inflating the count to force a release; a

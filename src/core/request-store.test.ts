@@ -484,6 +484,28 @@ describe('requestStore', () => {
     expect(requestStore.hasCrossContextLocks()).toBe(true)
   })
 
+  it('fails closed for wallet actions without Web Locks but allows them to queue', async () => {
+    // Claims/redeems must never run without real exclusion, but MAY queue:
+    // their in-lock guards re-read persisted state after the holder finishes.
+    vi.stubGlobal('navigator', {})
+    const {requestStore} = await import('./request-store')
+    await expect(
+      requestStore.withWalletActionLock('evm-claim:1a2b', async () => 'ran'),
+    ).rejects.toThrow(/does not support/)
+
+    const request = vi.fn(
+      async (name: string, options: {mode: string; ifAvailable?: boolean}, action: () => unknown) => {
+        expect(options.ifAvailable).toBeUndefined()
+        expect(name).toBe('nom-bridge:evm-claim:1a2b')
+        return action()
+      },
+    )
+    vi.stubGlobal('navigator', {locks: {request}})
+    await expect(
+      requestStore.withWalletActionLock('evm-claim:1a2b', async () => 'ran'),
+    ).resolves.toBe('ran')
+  })
+
   it('serializes lock mutations through the cross-context write lock when available', async () => {
     const lockNames: string[] = []
     const request = vi.fn(

@@ -230,6 +230,17 @@ async function redeemZenonLocked(request: UnwrapRequestView): Promise<string> {
     if (existingLock && !reclaimable) {
       throw new Error('A Zenon redemption for this request is already in progress')
     }
+    // Fresh in-lock revalidation (the Zenon analog of the EVM path's
+    // redeemsInfo re-read): a queued flow can acquire the lock after polling
+    // observed the redemption and cleared the previous holder's persisted
+    // lock, while this flow's view still says redeemable. Refuse — fail
+    // closed on a failed read — before opening Syrius.
+    const fresh = await BridgeService.getInstance()
+      .getUnwrapRequest(stripEvmHashPrefix(request.transactionHash), request.logIndex)
+      .catch(() => null)
+    if (!fresh || fresh.redeemed !== 0 || fresh.revoked !== 0) {
+      throw new Error('This redemption is no longer available; refresh and check History')
+    }
     ownsLock = true
     await requestStore.setPendingZenonRedeem(request.id, AWAITING_WALLET_RESULT)
     const published = await useZenonWallet().send(block)
@@ -271,7 +282,10 @@ async function redeemZenon(request: UnwrapRequestView): Promise<string> {
   setPendingRedeem(request.id, 'wallet')
   let lockedFlowRan = false
   try {
-    return await requestStore.withCrossContextLock(
+    // Wallet-action lock: queues behind other contexts (in-lock guards
+    // re-validate persisted state) but fails closed without Web Locks —
+    // running unlocked would allow duplicate Syrius prompts across tabs.
+    return await requestStore.withWalletActionLock(
       `zenon-redeem:${normalizeEvmHash(request.transactionHash)}`,
       () => {
         lockedFlowRan = true

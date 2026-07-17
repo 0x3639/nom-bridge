@@ -320,7 +320,10 @@ async function redeemEvm(
   setPendingRedeem(requestId, 'wallet')
   let lockedFlowRan = false
   try {
-    return await requestStore.withCrossContextLock(
+    // Wallet-action lock: queues behind other contexts (in-lock guards
+    // re-validate persisted state) but fails closed without Web Locks —
+    // running unlocked would allow duplicate MetaMask prompts across tabs.
+    return await requestStore.withWalletActionLock(
       `evm-claim:${requestId}`,
       () => {
         lockedFlowRan = true
