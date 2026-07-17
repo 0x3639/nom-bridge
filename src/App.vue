@@ -20,7 +20,7 @@ onMounted(() => {
       aria-hidden="true"
     />
     <header class="sticky top-0 z-20 border-b p-4 bg-card/60 backdrop-blur">
-      <div class="container mx-auto max-w-3xl flex justify-between items-center">
+      <div class="container mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
         <Heading as="h1" class="flex items-center gap-2 text-xl font-semibold tracking-tight">
           <span class="inline-block h-3 w-3 rotate-45 rounded-[2px] bg-zenon-green" aria-hidden="true" />
           NoM <span class="text-primary">Bridge</span>
@@ -35,6 +35,12 @@ onMounted(() => {
             <SunIcon v-if="theme === 'dark'" class="w-5 h-5" />
             <MoonIcon v-else class="w-5 h-5" />
           </button>
+          <div class="hidden items-center gap-2 sm:flex">
+            <ConnectZenonButton />
+            <ConnectEvmButton />
+          </div>
+        </div>
+        <div class="flex w-full items-center justify-end gap-2 sm:hidden">
           <ConnectZenonButton />
           <ConnectEvmButton />
         </div>
