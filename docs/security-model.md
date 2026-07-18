@@ -31,6 +31,29 @@ Bridge availability and signing still depend on the Zenon orchestrator set.
 Users should expect finality delays and verify operator health at
 <https://status.bridge.zenon.community/>.
 
+## Unwrap self-referral bonus
+
+On unwrap the app passes `<zenonAddress>&<zenonAddress>` as the bridge
+receiver. The orchestrator (HyperCore-Team/orchestrator,
+`network/evm.go:182-249`) splits on `&`: part 0 is the beneficiary, part 1
+the affiliate. When the bridge metadata's affiliate program is active for the
+token, the beneficiary's unwrap request is created at 101% of the amount and
+a separate 2% request is created for the affiliate at
+`logIndex + 4_000_000_000` — so the destination address collects the full 3%
+itself. Safety properties, verified against orchestrator source:
+
+- An invalid or ignored affiliate part never blocks the unwrap; worst case is
+  a normal 100% unwrap. Funds are never at risk from the suffix.
+- The suffix is only sent when `getBridgeInfo().metadata` advertises the
+  program as active for the pair (`wZNN`/`wQSR` flags, `startingHeight > 0`);
+  missing or malformed metadata fails safe to a bare receiver
+  (`src/core/affiliate.ts#parseUnwrapBonusBps`).
+- Tracked requests store the clean beneficiary address; the node's
+  authoritative unwrap requests carry parsed clean addresses, so Zenon-side
+  redeem and reconciliation are unchanged. Zenon redeem locks are keyed by
+  `txHash:logIndex` because the bonus request shares the main request's tx
+  hash.
+
 ## Audit provenance and remaining assurance work
 
 ChainSafe's May 2023 review covered three Ethereum contracts at commit
