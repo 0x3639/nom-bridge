@@ -102,9 +102,36 @@ describe('useBridge token metadata and safety mapping', () => {
       wrapEnabled: true,
       unwrapEnabled: true,
       owned: false,
+      unwrapBonusBps: 0,
     })
     expect(tokenPairs.value[1].wrapEnabled).toBe(false)
     expect(tokenPairs.value[1].unwrapEnabled).toBe(true)
+  })
+
+  it('derives a live unwrap bonus from bridge metadata for every resolved pair', async () => {
+    getBridgeInfo.mockResolvedValue({
+      halted: false,
+      allowKeyGen: false,
+      metadata: JSON.stringify({
+        affiliateProgram: {
+          networks: {'1': {startingHeight: 17678862, wZNN: true, wQSR: true, ZNN: true, QSR: true}},
+        },
+      }),
+    })
+    const {useBridge} = await import('./useBridge')
+    const {tokenPairs, load} = useBridge()
+    await load()
+
+    expect(tokenPairs.value.every(pair => pair.unwrapBonusBps === 300)).toBe(true)
+  })
+
+  it('yields no unwrap bonus when bridge metadata is empty', async () => {
+    getBridgeInfo.mockResolvedValue({halted: false, allowKeyGen: false, metadata: ''})
+    const {useBridge} = await import('./useBridge')
+    const {tokenPairs, load} = useBridge()
+    await load()
+
+    expect(tokenPairs.value.every(pair => pair.unwrapBonusBps === 0)).toBe(true)
   })
 
   it('fails closed when native and EVM decimals differ', async () => {

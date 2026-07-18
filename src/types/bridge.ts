@@ -28,6 +28,7 @@ export interface TokenPairView {
   wrapEnabled: boolean
   unwrapEnabled: boolean
   owned: boolean
+  unwrapBonusBps: number // 300 when the unwrap affiliate self-bonus is live, else 0
 }
 
 export interface WrapRequestView {

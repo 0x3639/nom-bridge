@@ -1,6 +1,7 @@
 import {ref} from 'vue'
 import {BridgeService} from '../bridge-service'
 import {EvmService} from '../evm-service'
+import {parseUnwrapBonusBps} from '../affiliate'
 import {config, DEFAULT_MOMENTUM_TIME} from '@/config'
 import type {TokenPairView} from '@/types'
 import type {BridgeNetworkInfo, TokenPair} from 'znn-typescript-sdk'
@@ -41,7 +42,11 @@ export function validatePinnedNetwork(info: BridgeNetworkInfo): TokenPair[] {
   return supported
 }
 
-async function resolvePair(pair: TokenPair, bridgeAddress: Address): Promise<TokenPairView> {
+async function resolvePair(
+  pair: TokenPair,
+  bridgeAddress: Address,
+  bridgeMetadata: string,
+): Promise<TokenPairView> {
   const zts = pair.tokenStandard.toString()
   const tokenAddress = pair.tokenAddress as Address
   const expected = config.expectedTokenPairs[zts]
@@ -85,6 +90,7 @@ async function resolvePair(pair: TokenPair, bridgeAddress: Address): Promise<Tok
     wrapEnabled: pair.bridgeable && evmBridge.redeemable,
     unwrapEnabled: pair.redeemable && evmBridge.bridgeable,
     owned: pair.owned,
+    unwrapBonusBps: parseUnwrapBonusBps(bridgeMetadata, config.evmChainId, native.symbol),
   }
 }
 
@@ -101,7 +107,7 @@ async function load(force = false): Promise<void> {
     ])
     const supportedPairs = validatePinnedNetwork(network)
     const resolvedPairs = await Promise.all(
-      supportedPairs.map(pair => resolvePair(pair, network.contractAddress as Address)),
+      supportedPairs.map(pair => resolvePair(pair, network.contractAddress as Address, info.metadata)),
     )
 
     networkInfo.value = network
