@@ -44,6 +44,28 @@ describe('matchesTrackedUnwrapEvent', () => {
     // Without a pinned pair, the ERC-20 address cannot be verified.
     expect(matchesTrackedUnwrapEvent(tracked, undefined, event)).toBe(false)
   })
+
+  it('matches a self-referral event by its beneficiary part', () => {
+    const selfReferralEvent = {
+      transactionHash: `0x${'ab'.repeat(32)}`,
+      logIndex: 3,
+      token: '0xToKen',
+      to: 'z1qrecipient&z1qrecipient',
+      amount: 100n,
+    }
+    expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', selfReferralEvent)).toBe(true)
+  })
+
+  it('does not match when only the affiliate part equals the tracked address', () => {
+    const affiliateOnlyEvent = {
+      transactionHash: `0x${'ab'.repeat(32)}`,
+      logIndex: 3,
+      token: '0xToKen',
+      to: 'z1qother&z1qrecipient',
+      amount: 100n,
+    }
+    expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', affiliateOnlyEvent)).toBe(false)
+  })
 })
 
 describe('reconcileUnknownWrapOperations', () => {

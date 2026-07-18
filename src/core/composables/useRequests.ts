@@ -9,6 +9,7 @@ import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, Wra
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
+import {beneficiaryOf} from '../affiliate'
 import {
   hasUnwrapProtocolAdvanced,
   hasWrapProtocolAdvanced,
@@ -79,8 +80,8 @@ export function findTrackedUnwrapByHash(
 
 // Whether a bridge Unwrapped event corresponds to a tracked unwrap whose
 // original hash was replaced (wallet speed-up). Requires the exact Zenon
-// destination, amount, and the pinned pair's ERC-20 token address; an unknown
-// pair mapping fails closed.
+// beneficiary (the part of `to` before any `&` affiliate suffix), amount, and
+// the pinned pair's ERC-20 token address; an unknown pair mapping fails closed.
 export function matchesTrackedUnwrapEvent(
   tracked: {zts: string; amount: string; zenonToAddress?: string},
   pairTokenAddress: string | undefined,
@@ -88,7 +89,7 @@ export function matchesTrackedUnwrapEvent(
 ): boolean {
   if (!pairTokenAddress) return false
   return (
-    event.to === tracked.zenonToAddress &&
+    beneficiaryOf(event.to) === tracked.zenonToAddress &&
     event.amount.toString() === tracked.amount &&
     event.token.toLowerCase() === pairTokenAddress.toLowerCase()
   )
