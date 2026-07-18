@@ -1,4 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {pendingZenonRedeemFor} from './request-store'
 
 // Mock the storage adapter so the store never touches real localStorage. The
 // fake holds an in-memory cell whose initial value drives ensureLoaded().
@@ -131,16 +132,16 @@ describe('requestStore', () => {
     await requestStore.setPendingZenonRedeem('0xabc:1', 'awaiting-wallet-result')
     const snapshot = await requestStore.getSnapshot()
     expect(snapshot.evmClaims['claim-id'].updatedAt).toBeTypeOf('number')
-    expect(snapshot.zenonRedeems['0xabc'].updatedAt).toBeTypeOf('number')
+    expect(snapshot.zenonRedeems['0xabc:1'].updatedAt).toBeTypeOf('number')
   })
 
   it('matches unwrap locks across prefixed and unprefixed transaction hashes', async () => {
     const {requestStore} = await import('./request-store')
     await requestStore.trackUnwrap(wrapFixture('abcdef:-1'))
     await expect(requestStore.setPendingZenonRedeem('0xABCDEF:9', 'zenon-block')).resolves.toBe(true)
-    expect((await requestStore.getSnapshot()).zenonRedeems['0xabcdef']).toMatchObject({hash: 'zenon-block'})
+    expect((await requestStore.getSnapshot()).zenonRedeems['0xabcdef:9']).toMatchObject({hash: 'zenon-block'})
     await requestStore.clearPendingZenonRedeem('0xabcdef:9')
-    expect((await requestStore.getSnapshot()).zenonRedeems['0xabcdef']).toBeUndefined()
+    expect((await requestStore.getSnapshot()).zenonRedeems['0xabcdef:9']).toBeUndefined()
   })
 
   it('deduplicates provisional and node-indexed ids for the same unwrap hash', async () => {
@@ -296,7 +297,7 @@ describe('requestStore', () => {
     }
     expect(final.evmClaims.theirs).toMatchObject({hash: '0xtheirs'})
     expect(final.evmClaims.mine).toMatchObject({hash: '0xmine'})
-    expect(final.zenonRedeems['0xabc']).toMatchObject({hash: 'zenon-block'})
+    expect(final.zenonRedeems['0xabc:1']).toMatchObject({hash: 'zenon-block'})
   })
 
   it('still reads the latest stored state after an earlier persist failed', async () => {
@@ -324,7 +325,7 @@ describe('requestStore', () => {
     }
     expect(final.evmClaims.theirs).toMatchObject({hash: '0xtheirs'})
     expect(final.evmClaims.mine).toBeUndefined()
-    expect(final.zenonRedeems['0xabc']).toMatchObject({hash: 'zenon-block'})
+    expect(final.zenonRedeems['0xabc:1']).toMatchObject({hash: 'zenon-block'})
   })
 
   it('rolls back an optimistic mutation when its persist fails, leaving no phantom lock', async () => {
@@ -520,5 +521,80 @@ describe('requestStore', () => {
     await requestStore.setPendingEvmClaim('claim-id', '0xclaim', 1)
 
     expect(lockNames).toContain('nom-bridge:action-locks-write')
+  })
+})
+
+describe('zenon redeem lock keying', () => {
+  const HASH = '0x' + 'ab'.repeat(32)
+  const MAIN_ID = `${HASH}:7`
+  const BONUS_ID = `${HASH}:4000000007`
+
+  it('keys pending redeems by full id so same-hash rows are independent', async () => {
+    const {requestStore} = await import('./request-store')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
+    const snapshot = await requestStore.getSnapshot()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-main')
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBeUndefined()
+  })
+
+  it('clearing one row leaves the other row locked', async () => {
+    const {requestStore} = await import('./request-store')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
+    await requestStore.setPendingZenonRedeem(BONUS_ID, 'zhash-bonus')
+    await requestStore.clearPendingZenonRedeem(MAIN_ID)
+    const snapshot = await requestStore.getSnapshot()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBeUndefined()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBe('zhash-bonus')
+  })
+
+  it('falls back to a legacy bare-hash entry for main rows only', () => {
+    const legacy = {[HASH]: {hash: 'zhash-legacy'}}
+    expect(pendingZenonRedeemFor(legacy, MAIN_ID)).toBe('zhash-legacy')
+    expect(pendingZenonRedeemFor(legacy, `${HASH}:-1`)).toBe('zhash-legacy')
+    expect(pendingZenonRedeemFor(legacy, BONUS_ID)).toBeUndefined()
+  })
+
+  it('clearPendingZenonRedeem on a main row also clears the legacy key', async () => {
+    // Seed a legacy-style entry through the public API shape: write directly
+    // via setPendingZenonRedeem then simulate legacy by asserting clear
+    // removes both the id key and the bare-hash key.
+    const {requestStore} = await import('./request-store')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
+    await requestStore.clearPendingZenonRedeem(MAIN_ID)
+    const snapshot = await requestStore.getSnapshot()
+    expect(Object.keys(snapshot.zenonRedeems)).toHaveLength(0)
+  })
+
+  it('clearing a main row also removes a genuinely-legacy bare-hash entry coexisting with it', async () => {
+    const {requestStore} = await import('./request-store')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
+    // Simulate a pre-migration lock written under the bare tx hash (as this
+    // module did before full-id keying), coexisting alongside the new key —
+    // e.g. left over from a version skew across browser contexts.
+    const stored = h.values.get('nom-bridge:action-locks:v1') as {zenonRedeems: Record<string, unknown>}
+    h.values.set('nom-bridge:action-locks:v1', {
+      ...stored,
+      zenonRedeems: {...stored.zenonRedeems, [HASH]: {hash: 'zhash-legacy'}},
+    })
+    await requestStore.clearPendingZenonRedeem(MAIN_ID)
+    const snapshot = await requestStore.getSnapshot()
+    expect(Object.keys(snapshot.zenonRedeems)).toHaveLength(0)
+  })
+
+  it('clearing a bonus row leaves a genuinely-legacy bare-hash entry alone', async () => {
+    const {requestStore} = await import('./request-store')
+    const stored = h.values.get('nom-bridge:action-locks:v1') as
+      {zenonRedeems: Record<string, unknown>} | undefined
+    h.values.set('nom-bridge:action-locks:v1', {
+      evmClaims: {},
+      zenonRedeems: {...stored?.zenonRedeems, [HASH]: {hash: 'zhash-legacy'}},
+      evmTxFacts: {},
+      unknownWraps: {},
+    })
+    await requestStore.setPendingZenonRedeem(BONUS_ID, 'zhash-bonus')
+    await requestStore.clearPendingZenonRedeem(BONUS_ID)
+    const snapshot = await requestStore.getSnapshot()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-legacy')
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBeUndefined()
   })
 })

@@ -2,7 +2,7 @@ import {computed, ref} from 'vue'
 import {BridgeService} from '../bridge-service'
 import {EvmService} from '../evm-service'
 import type {WrapRedeemProgress} from '../evm-service'
-import {requestStore, type UnknownWrapOperation} from '../request-store'
+import {pendingZenonRedeemFor, requestStore, type UnknownWrapOperation} from '../request-store'
 import {DEFAULT_MOMENTUM_TIME} from '@/config'
 import {config} from '@/config'
 import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, WrapRequestView, WrapStatus} from '@/types'
@@ -430,7 +430,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
         nodeIds.add(id)
         nodeHashes.add(transactionHash)
         const status = deriveUnwrapStatus(req, false)
-        let pendingZenonRedeemHash: string | undefined = zenonRedeems[transactionHash]?.hash
+        let pendingZenonRedeemHash: string | undefined = pendingZenonRedeemFor(zenonRedeems, id)
         // Forward-only: a transient regression (signing/waiting during TSS
         // re-signing) must never release the redeem lock.
         if (pendingZenonRedeemHash && hasUnwrapProtocolAdvanced(status)) {
@@ -542,7 +542,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           toAddress: t.zenonToAddress ?? '',
           status: outcome === 'confirmed' ? 'pending' : 'submitted',
           totalApprovals: t.approvalCount,
-          pendingZenonRedeemHash: zenonRedeems[hash]?.hash,
+          pendingZenonRedeemHash: pendingZenonRedeemFor(zenonRedeems, id),
         })
       }
 

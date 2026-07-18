@@ -2,6 +2,7 @@ import {storageService} from './storage/storage-service'
 import type {TrackedRequest} from '@/types'
 import {config} from '@/config'
 import {normalizeEvmHash} from './evm-hash'
+import {AFFILIATE_LOG_INDEX_THRESHOLD} from './affiliate'
 
 const STORAGE_KEY = 'nom-bridge:requests:v2'
 const LOCKS_STORAGE_KEY = 'nom-bridge:action-locks:v1'
@@ -65,6 +66,28 @@ function normalizeLocks(value: Partial<PendingActionLocks> | null | undefined): 
     evmTxFacts: value?.evmTxFacts ?? {},
     unknownWraps: value?.unknownWraps ?? {},
   }
+}
+
+// Zenon redeem locks are keyed by the full `txHash:logIndex` id: an affiliate
+// bonus request shares its tx hash with the main unwrap, and redeeming one
+// must not lock or unlock the other. Entries persisted before this keying
+// used the bare tx hash; those can only refer to main rows (bonus rows did
+// not exist), so the legacy fallback is limited to logIndex below the
+// affiliate threshold.
+function normalizeUnwrapLockKey(id: string): string {
+  const [hash, index] = id.split(':')
+  return `${normalizeEvmHash(hash)}:${index}`
+}
+
+export function pendingZenonRedeemFor(
+  zenonRedeems: Record<string, {hash: string; updatedAt?: number}>,
+  id: string,
+): string | undefined {
+  const direct = zenonRedeems[normalizeUnwrapLockKey(id)]?.hash
+  if (direct) return direct
+  const [hash, index] = id.split(':')
+  if (Number(index) >= AFFILIATE_LOG_INDEX_THRESHOLD) return undefined
+  return zenonRedeems[normalizeEvmHash(hash)]?.hash
 }
 
 function applyLockOps(base: PendingActionLocks, ops: LockOp[]): PendingActionLocks {
@@ -194,8 +217,8 @@ async function ensureLocksLoaded(): Promise<PendingActionLocks> {
         migrated = true
       }
       if (request.kind === 'unwrap' && request.pendingZenonRedeemHash) {
-        const transactionHash = normalizeEvmHash(request.id.split(':')[0])
-        locksMirror.zenonRedeems[transactionHash] ??= {hash: request.pendingZenonRedeemHash}
+        locksMirror.zenonRedeems[normalizeUnwrapLockKey(request.id)] ??=
+          {hash: request.pendingZenonRedeemHash}
         delete request.pendingZenonRedeemHash
         migrated = true
       }
@@ -395,18 +418,26 @@ export const requestStore = {
   },
 
   async setPendingZenonRedeem(id: string, hash: string): Promise<boolean> {
-    const transactionHash = normalizeEvmHash(id.split(':')[0])
+    const key = normalizeUnwrapLockKey(id)
     await mutateLocks(() => [
-      {scope: 'zenonRedeems', op: 'set', key: transactionHash, value: {hash, updatedAt: Date.now()}},
+      {scope: 'zenonRedeems', op: 'set', key, value: {hash, updatedAt: Date.now()}},
     ])
     return true
   },
 
   async clearPendingZenonRedeem(id: string): Promise<void> {
-    const transactionHash = normalizeEvmHash(id.split(':')[0])
-    await mutateLocks(locks => locks.zenonRedeems[transactionHash]
-      ? [{scope: 'zenonRedeems', op: 'delete', key: transactionHash}]
-      : [])
+    const key = normalizeUnwrapLockKey(id)
+    const [rawHash, index] = id.split(':')
+    const legacyKey = normalizeEvmHash(rawHash)
+    const clearLegacy = Number(index) < AFFILIATE_LOG_INDEX_THRESHOLD
+    await mutateLocks(locks => {
+      const ops: LockOp[] = []
+      if (locks.zenonRedeems[key]) ops.push({scope: 'zenonRedeems', op: 'delete', key})
+      if (clearLegacy && locks.zenonRedeems[legacyKey]) {
+        ops.push({scope: 'zenonRedeems', op: 'delete', key: legacyKey})
+      }
+      return ops
+    })
   },
 
   async recordEvmTxFacts(hash: string, facts: {from: string; nonce: number}): Promise<void> {
