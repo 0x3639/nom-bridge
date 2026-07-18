@@ -23,7 +23,10 @@ export interface UnknownWrapOperation {
 
 interface PendingActionLocks {
   evmClaims: Record<string, {hash: string; stage: 1 | 2; updatedAt?: number}>
-  zenonRedeems: Record<string, {hash: string; updatedAt?: number}>
+  // `fence: true` marks the bare-hash compatibility entry written alongside
+  // every full-id lock (see setPendingZenonRedeem) — old bundles that still
+  // read/write bare-hash keys see it and refuse to redeem either row.
+  zenonRedeems: Record<string, {hash: string; updatedAt?: number; fence?: boolean}>
   // Sender + nonce captured while a broadcast transaction was still visible on
   // some RPC, keyed by normalized transaction hash. The only positive evidence
   // that a later-vanished hash can never mine (nonce consumption).
@@ -65,6 +68,67 @@ function normalizeLocks(value: Partial<PendingActionLocks> | null | undefined): 
     evmTxFacts: value?.evmTxFacts ?? {},
     unknownWraps: value?.unknownWraps ?? {},
   }
+}
+
+// Zenon redeem locks are keyed by the full `txHash:logIndex` id: an affiliate
+// bonus request shares its tx hash with the main unwrap, and redeeming one
+// must not silently unlock the other. Because old bundles (and locks they
+// persisted) key by the bare tx hash — and an old bundle can lock EITHER row
+// (bonus rows already exist via other dApps' referrals) — every full-id lock
+// is accompanied by a bare-hash compatibility fence, and any bare entry
+// conservatively blocks BOTH rows until it is released. Main and bonus
+// therefore redeem sequentially, never concurrently.
+function normalizeUnwrapLockKey(id: string): string {
+  const [hash, index] = id.split(':')
+  return `${normalizeEvmHash(hash)}:${index}`
+}
+
+type ZenonRedeemLock = {hash: string; updatedAt?: number; fence?: boolean}
+
+// BLOCKING view: the lock that must stop this row from opening a wallet
+// prompt. Full-id entry first; otherwise ANY bare-hash entry blocks — it may
+// be this app's compatibility fence for the sibling row, or an old bundle's
+// lock on either row. Conservative by design: main and bonus redeem
+// sequentially whenever a bare entry exists.
+export function zenonRedeemLockFor(
+  zenonRedeems: Record<string, ZenonRedeemLock>,
+  id: string,
+): ZenonRedeemLock | undefined {
+  return zenonRedeems[normalizeUnwrapLockKey(id)] ??
+    zenonRedeems[normalizeEvmHash(id.split(':')[0])]
+}
+
+// OWN view: the lock this row is allowed to release (recheck, staleness
+// reclaim) — exactly the full-id entry, nothing else. An unmarked bare entry
+// is an old bundle's lock with an UNKNOWN target row (old bundles can redeem
+// either row), so no row may claim it; it is resolved only by the
+// evidence-based legacy path (legacyZenonRedeemLockFor /
+// clearLegacyZenonRedeem), never attributed by log index.
+export function ownZenonRedeemLockFor(
+  zenonRedeems: Record<string, ZenonRedeemLock>,
+  id: string,
+): ZenonRedeemLock | undefined {
+  return zenonRedeems[normalizeUnwrapLockKey(id)]
+}
+
+// A genuine legacy (unmarked) bare-hash lock for this transaction, if any.
+// Marked fences are excluded — they mirror a known full-id lock and share its
+// lifecycle. Callers resolve the returned lock ONLY with hash-wide evidence
+// (its block's on-chain outcome, staleness of a placeholder, or every row
+// sharing the hash being terminal), never by guessing its target row.
+export function legacyZenonRedeemLockFor(
+  zenonRedeems: Record<string, ZenonRedeemLock>,
+  transactionHash: string,
+): ZenonRedeemLock | undefined {
+  const bare = zenonRedeems[normalizeEvmHash(transactionHash)]
+  return bare && bare.fence !== true ? bare : undefined
+}
+
+export function pendingZenonRedeemFor(
+  zenonRedeems: Record<string, ZenonRedeemLock>,
+  id: string,
+): string | undefined {
+  return zenonRedeemLockFor(zenonRedeems, id)?.hash
 }
 
 function applyLockOps(base: PendingActionLocks, ops: LockOp[]): PendingActionLocks {
@@ -194,8 +258,19 @@ async function ensureLocksLoaded(): Promise<PendingActionLocks> {
         migrated = true
       }
       if (request.kind === 'unwrap' && request.pendingZenonRedeemHash) {
-        const transactionHash = normalizeEvmHash(request.id.split(':')[0])
-        locksMirror.zenonRedeems[transactionHash] ??= {hash: request.pendingZenonRedeemHash}
+        // A tracked row still at its provisional id (`hash:-1`, before the
+        // node assigns an authoritative logIndex) must migrate to the bare
+        // legacy key: mirroring to the full provisional id would be
+        // unreachable forever, since the real row later becomes `hash:7` and
+        // only the bare-hash legacy fallback — never `hash:-1` — is ever
+        // checked for it.
+        const [rawHash, indexPart] = request.id.split(':')
+        const indexNum = Number(indexPart)
+        const isProvisionalIndex = !Number.isFinite(indexNum) || indexNum < 0
+        const key = isProvisionalIndex
+          ? normalizeEvmHash(rawHash)
+          : normalizeUnwrapLockKey(request.id)
+        locksMirror.zenonRedeems[key] ??= {hash: request.pendingZenonRedeemHash}
         delete request.pendingZenonRedeemHash
         migrated = true
       }
@@ -394,18 +469,59 @@ export const requestStore = {
       : [])
   },
 
+  // Writes the full-id lock plus a bare-hash compatibility fence so bundles
+  // that still key by bare hash refuse both rows while this redeem is live.
+  // The fence tracks its writer's lock value (including the placeholder →
+  // published-hash upgrade), but never clobbers a genuine legacy bare entry —
+  // that is another context's lock evidence, and it already fences old
+  // bundles on its own.
   async setPendingZenonRedeem(id: string, hash: string): Promise<boolean> {
-    const transactionHash = normalizeEvmHash(id.split(':')[0])
-    await mutateLocks(() => [
-      {scope: 'zenonRedeems', op: 'set', key: transactionHash, value: {hash, updatedAt: Date.now()}},
-    ])
+    const key = normalizeUnwrapLockKey(id)
+    const legacyKey = normalizeEvmHash(id.split(':')[0])
+    await mutateLocks(locks => {
+      const value = {hash, updatedAt: Date.now()}
+      const ops: LockOp[] = [{scope: 'zenonRedeems', op: 'set', key, value}]
+      const bare = locks.zenonRedeems[legacyKey]
+      if (legacyKey !== key && (!bare || bare.fence === true)) {
+        ops.push({scope: 'zenonRedeems', op: 'set', key: legacyKey, value: {...value, fence: true}})
+      }
+      return ops
+    })
     return true
   },
 
+  // Releases this row's lock: exactly the full-id entry, plus a MARKED fence
+  // whose value matches it (the fence mirrors this lock and dies with it).
+  // An unmarked bare entry is never touched here — its target row is unknown
+  // (an old bundle can lock either row), so ordinary row advancement must not
+  // release it; only clearLegacyZenonRedeem, gated on hash-wide evidence, may.
   async clearPendingZenonRedeem(id: string): Promise<void> {
-    const transactionHash = normalizeEvmHash(id.split(':')[0])
-    await mutateLocks(locks => locks.zenonRedeems[transactionHash]
-      ? [{scope: 'zenonRedeems', op: 'delete', key: transactionHash}]
+    const key = normalizeUnwrapLockKey(id)
+    const legacyKey = normalizeEvmHash(id.split(':')[0])
+    await mutateLocks(locks => {
+      const ops: LockOp[] = []
+      const own = locks.zenonRedeems[key]
+      if (own) ops.push({scope: 'zenonRedeems', op: 'delete', key})
+      const bare = locks.zenonRedeems[legacyKey]
+      if (
+        bare && legacyKey !== key &&
+        bare.fence === true && own !== undefined && bare.hash === own.hash
+      ) {
+        ops.push({scope: 'zenonRedeems', op: 'delete', key: legacyKey})
+      }
+      return ops
+    })
+  },
+
+  // Removes the bare-hash entry for a transaction. Callers must hold
+  // hash-wide evidence that no wallet action can still be in flight for ANY
+  // row sharing the hash: the legacy lock's block outcome is processed, its
+  // placeholder passed the staleness window, or every row is terminal
+  // (redeemed/revoked). Never call this from ordinary single-row advancement.
+  async clearLegacyZenonRedeem(transactionHash: string): Promise<void> {
+    const legacyKey = normalizeEvmHash(transactionHash)
+    await mutateLocks(locks => locks.zenonRedeems[legacyKey]
+      ? [{scope: 'zenonRedeems', op: 'delete', key: legacyKey}]
       : [])
   },
 

@@ -20,6 +20,7 @@ import {
   unwrapRequestProgress,
   wrapRequestProgress,
 } from '@/core/approval-ux'
+import {selfReferralPayout} from '@/core/affiliate'
 import {normalizeEvmHash} from '@/core/evm-hash'
 import {EvmSubmissionError} from '@/core/evm-service'
 import {ZenonSubmissionError} from '@/core/zenon-wallet-service'
@@ -79,7 +80,6 @@ const {
   isUnwrapping,
   phase: unwrapPhase,
   pendingRedeems: pendingUnwrapRedeems,
-  clearPendingRedeem: clearPendingUnwrapRedeem,
   clearLocalPendingRedeem: clearLocalPendingUnwrapRedeem,
   recheckZenonRedeem,
   recheckSubmittedUnwrap,
@@ -147,8 +147,16 @@ const destinationAmount = computed(() => {
   if (!pair || !amount.value) return '0'
   try {
     const base = parseAmount(amount.value, pair.decimals)
-    const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
-    return formatAmount(base - fee, pair.decimals)
+    if (direction.value === 'wrap') {
+      const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
+      return formatAmount(base - fee, pair.decimals)
+    }
+    // Exact protocol payout (two independent floors), not floor(base * bps):
+    // the aggregate rounding over-estimates by one base unit for many amounts.
+    return formatAmount(
+      pair.unwrapBonusBps > 0 ? selfReferralPayout(base) : base,
+      pair.decimals,
+    )
   } catch {
     return '0'
   }
@@ -353,14 +361,21 @@ const minimumLabel = computed(() => {
   if (!pair || minimum === undefined) return null
   return `Min ${formatDisplayAmount(minimum, pair.decimals)} ${fromSide.value.symbol}`
 })
-const feePercentageLabel = computed(() => {
-  const basisPoints = selectedPair.value?.feePercentage ?? 0
-  return (basisPoints / 100).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')
-})
 const rateLabel = computed(() => {
-  const basisPoints = selectedPair.value?.feePercentage ?? 0
-  const rate = (1 - basisPoints / Number(FEE_DENOMINATOR)).toFixed(4)
+  const pair = selectedPair.value
+  const basisPoints = direction.value === 'wrap'
+    ? -(pair?.feePercentage ?? 0)
+    : (pair?.unwrapBonusBps ?? 0)
+  const rate = (1 + basisPoints / Number(FEE_DENOMINATOR)).toFixed(4)
   return rate.replace(/0+$/, '').replace(/\.$/, '')
+})
+const feeSummaryLabel = computed(() => {
+  const pair = selectedPair.value
+  const formatBps = (bps: number) =>
+    (bps / 100).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')
+  if (direction.value === 'wrap') return `${formatBps(pair?.feePercentage ?? 0)}% bridge fee`
+  const bonus = pair?.unwrapBonusBps ?? 0
+  return bonus > 0 ? `includes ${formatBps(bonus)}% bonus` : 'no bridge fee'
 })
 const ctaLabel = computed(() => {
   if (!sourceConnected.value) {
@@ -591,16 +606,20 @@ watch([wrapRequests, unwrapRequests], () => {
     return
   }
 
-  const final = unwrapRequests.value.find(request =>
-    normalizeEvmHash(request.transactionHash) === awaiting.transactionHash,
-  )
+  // Exact-id match: a self-referral bonus row shares the main row's tx hash,
+  // so a hash lookup could observe the OTHER row's terminal status and clear
+  // this row's state while its redeem block is still pending. Only transient
+  // UI state is cleared here — the durable redeem lock is owned by the
+  // reconciliation layer, which releases it per-row on authoritative protocol
+  // advancement (useRequests forward-only clearing).
+  const final = unwrapRequests.value.find(request => request.id === awaiting.requestId)
   if (final?.status === 'redeemed') {
     lastCompleted.value = awaiting.explorer
     awaitingCompletion.value = null
-    void clearPendingUnwrapRedeem(awaiting.requestId)
+    clearLocalPendingUnwrapRedeem(awaiting.requestId)
   } else if (final?.status === 'revoked') {
     awaitingCompletion.value = null
-    void clearPendingUnwrapRedeem(awaiting.requestId)
+    clearLocalPendingUnwrapRedeem(awaiting.requestId)
   }
 }, {immediate: true})
 
@@ -698,6 +717,7 @@ async function onUnwrapSubmit(): Promise<void> {
       pair.decimals,
       pair.symbol,
       evmFrom,
+      pair.unwrapBonusBps > 0,
     )
     const {hash} = result
     toast.show(
@@ -877,6 +897,10 @@ async function onRecheckUnwrap(request: UnwrapRequestView): Promise<void> {
     await refreshRequestsSafely()
     if (result === 'released-failed') {
       toast.show('Zenon confirms the redemption failed on-chain. It is safe to retry.', 'info')
+    } else if (result === 'released-processed') {
+      // Target-unknown legacy lock: the block finished, but whether the main
+      // or bonus redemption succeeded is unknowable — neutral copy only.
+      toast.show('The previous redemption attempt finished; request statuses were refreshed.', 'info')
     } else if (result === 'released-orphan') {
       toast.show('The abandoned redemption attempt was cleared. You can redeem again.', 'info')
     } else {
@@ -1173,7 +1197,7 @@ onUnmounted(() => {
 
             <p class="mt-3.5 font-mono text-[10px] text-muted-foreground">
               1 {{ fromSide.symbol }} ≈ {{ rateLabel }} {{ toSide.symbol }} ·
-              {{ feePercentageLabel }}% bridge fee
+              {{ feeSummaryLabel }}
             </p>
           </section>
         </div>

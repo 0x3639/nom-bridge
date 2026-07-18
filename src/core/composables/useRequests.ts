@@ -2,13 +2,14 @@ import {computed, ref} from 'vue'
 import {BridgeService} from '../bridge-service'
 import {EvmService} from '../evm-service'
 import type {WrapRedeemProgress} from '../evm-service'
-import {requestStore, type UnknownWrapOperation} from '../request-store'
+import {pendingZenonRedeemFor, requestStore, type UnknownWrapOperation} from '../request-store'
 import {DEFAULT_MOMENTUM_TIME} from '@/config'
 import {config} from '@/config'
 import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, WrapRequestView, WrapStatus} from '@/types'
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
+import {beneficiaryOf} from '../affiliate'
 import {
   hasUnwrapProtocolAdvanced,
   hasWrapProtocolAdvanced,
@@ -79,8 +80,8 @@ export function findTrackedUnwrapByHash(
 
 // Whether a bridge Unwrapped event corresponds to a tracked unwrap whose
 // original hash was replaced (wallet speed-up). Requires the exact Zenon
-// destination, amount, and the pinned pair's ERC-20 token address; an unknown
-// pair mapping fails closed.
+// beneficiary (the part of `to` before any `&` affiliate suffix), amount, and
+// the pinned pair's ERC-20 token address; an unknown pair mapping fails closed.
 export function matchesTrackedUnwrapEvent(
   tracked: {zts: string; amount: string; zenonToAddress?: string},
   pairTokenAddress: string | undefined,
@@ -88,7 +89,7 @@ export function matchesTrackedUnwrapEvent(
 ): boolean {
   if (!pairTokenAddress) return false
   return (
-    event.to === tracked.zenonToAddress &&
+    beneficiaryOf(event.to) === tracked.zenonToAddress &&
     event.amount.toString() === tracked.amount &&
     event.token.toLowerCase() === pairTokenAddress.toLowerCase()
   )
@@ -192,6 +193,30 @@ export function deriveUnwrapStatus(
   if (req.redeemableIn < 0) return 'broken'
   if (req.redeemableIn > 0) return 'waiting'
   return 'redeemable'
+}
+
+// A tx hash is final for pruning purposes only when EVERY unwrap view
+// sharing it (the main row and any affiliate bonus row at
+// logIndex + AFFILIATE_LOG_INDEX_THRESHOLD) is redeemed/revoked. Pruning on a
+// single final row while a same-hash sibling is still live would silently
+// discard the tracked request's approvalCount/createdAt out from under it.
+export function computeFinalUnwrapHashes(
+  views: Array<{transactionHash: string; status: UnwrapStatus}>,
+): Set<string> {
+  const statusesByHash = new Map<string, UnwrapStatus[]>()
+  for (const view of views) {
+    const hash = normalizeEvmHash(view.transactionHash)
+    const statuses = statusesByHash.get(hash)
+    if (statuses) statuses.push(view.status)
+    else statusesByHash.set(hash, [view.status])
+  }
+  const finalHashes = new Set<string>()
+  for (const [hash, statuses] of statusesByHash) {
+    if (statuses.every(status => status === 'redeemed' || status === 'revoked')) {
+      finalHashes.add(hash)
+    }
+  }
+  return finalHashes
 }
 
 const MAX_POLL_RERUNS = 5
@@ -430,7 +455,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
         nodeIds.add(id)
         nodeHashes.add(transactionHash)
         const status = deriveUnwrapStatus(req, false)
-        let pendingZenonRedeemHash: string | undefined = zenonRedeems[transactionHash]?.hash
+        let pendingZenonRedeemHash: string | undefined = pendingZenonRedeemFor(zenonRedeems, id)
         // Forward-only: a transient regression (signing/waiting during TSS
         // re-signing) must never release the redeem lock.
         if (pendingZenonRedeemHash && hasUnwrapProtocolAdvanced(status)) {
@@ -542,7 +567,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           toAddress: t.zenonToAddress ?? '',
           status: outcome === 'confirmed' ? 'pending' : 'submitted',
           totalApprovals: t.approvalCount,
-          pendingZenonRedeemHash: zenonRedeems[hash]?.hash,
+          pendingZenonRedeemHash: pendingZenonRedeemFor(zenonRedeems, id),
         })
       }
 
@@ -554,17 +579,19 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const finalWrapIds = new Set(
       wrapRequests.value.filter(r => r.status === 'redeemed').map(r => r.id),
     )
-    const finalUnwrapHashes = new Set(
-      unwrapRequests.value
-        .filter(r => r.status === 'redeemed' || r.status === 'revoked')
-        .map(r => normalizeEvmHash(r.transactionHash)),
-    )
+    const finalUnwrapHashes = computeFinalUnwrapHashes(unwrapRequests.value)
     if (finalWrapIds.size || finalUnwrapHashes.size) {
       await requestStore.prune(request =>
         request.kind === 'wrap'
           ? finalWrapIds.has(request.id)
           : finalUnwrapHashes.has(normalizeEvmHash(request.id.split(':')[0])),
       )
+    }
+    // Every row sharing these hashes is terminal, so no wallet action can
+    // still matter for them — the only state under which a target-unknown
+    // bare-hash lock (old bundle) or an orphaned fence may be swept.
+    for (const hash of finalUnwrapHashes) {
+      await requestStore.clearLegacyZenonRedeem(hash)
     }
     return true
   }

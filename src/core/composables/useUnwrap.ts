@@ -1,8 +1,14 @@
 import {ref} from 'vue'
+import {selfReferralReceiver} from '../affiliate'
 import {BridgeService} from '../bridge-service'
 import {EvmService, EvmSubmissionError} from '../evm-service'
 import type {AuthoritativeEvmOutcome} from '../evm-service'
-import {requestStore} from '../request-store'
+import {
+  legacyZenonRedeemLockFor,
+  ownZenonRedeemLockFor,
+  requestStore,
+  zenonRedeemLockFor,
+} from '../request-store'
 import {useZenonWallet} from './useZenonWallet'
 import type {UnwrapRequestView} from '@/types'
 import type {Address, Hex} from 'viem'
@@ -67,6 +73,7 @@ async function unwrap(
   decimals: number,
   symbol: string,
   evmFromAddress: string,
+  bonusActive = false,
 ): Promise<UnwrapSubmissionResult> {
   // Synchronous reentrancy guard: rapid double-submission races the UI's
   // awaited pre-checks, so the composable itself must refuse before any await.
@@ -85,7 +92,7 @@ async function unwrap(
       `unwrap-submit:${evmFromAddress.toLowerCase()}`,
       () => {
         lockedFlowRan = true
-        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt)
+        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt, bonusActive)
       },
     )
   } catch (e) {
@@ -107,6 +114,7 @@ async function unwrapLocked(
   decimals: number,
   symbol: string,
   clickedAt: number,
+  bonusActive: boolean,
 ): Promise<UnwrapSubmissionResult> {
   let failureStage: 'allowance' | 'token-approval' | 'bridge-transfer' = 'allowance'
   let broadcastHash: Hex | null = null
@@ -135,11 +143,12 @@ async function unwrapLocked(
     const unwrapStep = approvalRequired ? 2 : 1
     failureStage = 'bridge-transfer'
     phase.value = {kind: 'submitting-unwrap', step: unwrapStep, total}
+    const receiver = bonusActive ? selfReferralReceiver(zenonAddress) : zenonAddress
     const {hash, provisionalLogIndex, eventMatched} = await evm.unwrap(
       bridge,
       token,
       amount,
-      zenonAddress,
+      receiver,
       submittedHash => {
         broadcastHash = submittedHash
         phase.value = {
@@ -212,15 +221,20 @@ async function redeemZenonLocked(request: UnwrapRequestView): Promise<string> {
       request.logIndex,
     )
     const snapshot = await requestStore.getSnapshot()
-    const transactionHash = normalizeEvmHash(request.transactionHash)
     // Reclaim only a STALE orphaned pre-prompt placeholder: Syrius runs
     // outside the browser, so its prompt can outlive a crashed dApp context —
     // the placeholder must be older than any plausible prompt lifetime before
     // a new flow may overwrite it. Real-hash and ambiguous locks always refuse.
-    const existingLock = snapshot.zenonRedeems[transactionHash]
+    // BLOCKING view for the refusal (a sibling row's lock or fence, or an old
+    // bundle's bare-hash lock, must also block this row — main and bonus
+    // redeem sequentially); OWN view for the reclaim — this row may only
+    // overwrite a placeholder that belongs to it.
+    const existingLock = zenonRedeemLockFor(snapshot.zenonRedeems, request.id)
+    const ownLock = ownZenonRedeemLockFor(snapshot.zenonRedeems, request.id)
     const reclaimable =
       requestStore.hasCrossContextLocks() &&
       existingLock !== undefined &&
+      existingLock === ownLock &&
       canReclaimPlaceholderLock(
         existingLock.hash,
         existingLock.updatedAt,
@@ -303,7 +317,12 @@ async function dismissPendingZenonRedeem(id: string): Promise<void> {
   setPendingRedeem(id)
 }
 
-export type ZenonRedeemRecheckResult = 'released-failed' | 'released-orphan' | 'kept' | 'no-lock'
+export type ZenonRedeemRecheckResult =
+  | 'released-failed'
+  | 'released-orphan'
+  | 'released-processed'
+  | 'kept'
+  | 'no-lock'
 
 // Evidence-based resolution of a persisted Zenon redeem lock, runnable from
 // the UI's Recheck action. A real block hash is probed on the account chain:
@@ -314,17 +333,56 @@ export type ZenonRedeemRecheckResult = 'released-failed' | 'released-orphan' | '
 // here — only protocol advance clears them.
 async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRedeemRecheckResult> {
   const transactionHash = normalizeEvmHash(request.transactionHash)
+  // Cross-context lock name intentionally stays coarse (per tx hash, not per
+  // row): it just serializes concurrent recheck/redeem UI actions across
+  // tabs for the main and bonus rows of one unwrap event.
   return requestStore.withCrossContextLock(`zenon-redeem:${transactionHash}`, async () => {
     const snapshot = await requestStore.getSnapshot()
-    const lock = snapshot.zenonRedeems[transactionHash]
-    if (!lock) return 'no-lock'
+    // OWN view first: this row's evidence (its own logIndex re-read) may only
+    // release the row's exact full-id lock. Without one, an unmarked bare
+    // entry is an old bundle's lock with an UNKNOWN target row — resolvable
+    // only with hash-wide evidence (block outcome / placeholder staleness),
+    // never by attributing it to this row. A marked sibling fence is simply
+    // 'kept': it dies with its writer's lock.
+    const lock = ownZenonRedeemLockFor(snapshot.zenonRedeems, request.id)
+    if (!lock) {
+      const legacy = legacyZenonRedeemLockFor(snapshot.zenonRedeems, transactionHash)
+      if (!legacy) {
+        return zenonRedeemLockFor(snapshot.zenonRedeems, request.id) ? 'kept' : 'no-lock'
+      }
+      if (legacy.hash === AWAITING_WALLET_RESULT) {
+        if (
+          requestStore.hasCrossContextLocks() &&
+          canReclaimPlaceholderLock(legacy.hash, legacy.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)
+        ) {
+          await requestStore.clearLegacyZenonRedeem(transactionHash)
+          setPendingRedeem(request.id)
+          return 'released-orphan'
+        }
+        return 'kept'
+      }
+      if (legacy.hash === AMBIGUOUS_WALLET_RESULT) return 'kept'
+      const legacyOutcome = await BridgeService.getInstance()
+        .getAccountBlockOutcome(legacy.hash)
+        .catch(() => null)
+      if (legacyOutcome !== 'processed') return 'kept'
+      // Processed proves the account block is no longer in flight for ANY
+      // row — but with an unknown target row, whether the embedded call
+      // succeeded or failed is unknowable here, so this is NOT
+      // 'released-failed' (which implies "safe to retry"). Deliberately no
+      // per-row redeemable re-read either: that would be target inference.
+      // A fresh node read now reflects whichever rows remain redeemable.
+      await requestStore.clearLegacyZenonRedeem(transactionHash)
+      setPendingRedeem(request.id)
+      return 'released-processed'
+    }
     if (lock.hash === AWAITING_WALLET_RESULT) {
       // The orphan proof requires real Web Lock exclusion to exist at all.
       if (
         requestStore.hasCrossContextLocks() &&
         canReclaimPlaceholderLock(lock.hash, lock.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)
       ) {
-        await requestStore.clearPendingZenonRedeem(transactionHash)
+        await requestStore.clearPendingZenonRedeem(request.id)
         setPendingRedeem(request.id)
         return 'released-orphan'
       }
@@ -339,7 +397,7 @@ async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRede
       .getUnwrapRequest(stripEvmHashPrefix(request.transactionHash), request.logIndex)
       .catch(() => null)
     if (!fresh || fresh.redeemed !== 0 || fresh.revoked !== 0) return 'kept'
-    await requestStore.clearPendingZenonRedeem(transactionHash)
+    await requestStore.clearPendingZenonRedeem(request.id)
     setPendingRedeem(request.id)
     return 'released-failed'
   })

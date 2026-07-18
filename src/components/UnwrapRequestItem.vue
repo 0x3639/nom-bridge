@@ -11,6 +11,7 @@ import {
 } from 'nom-ui'
 import {formatAmount, formatCountdown, truncateAddress} from '@/core/composables/utils/formatters'
 import {unwrapRequestProgress, type PendingRedeemPhase} from '@/core/approval-ux'
+import {isAffiliateBonusLogIndex} from '@/core/affiliate'
 import type {UnwrapRequestView} from '@/types'
 
 const props = defineProps<{
@@ -31,6 +32,7 @@ const badgeLabel = computed(() =>
     ? `Security delay · ${formatCountdown(props.request.remainingSeconds ?? 0)}`
     : progress.value.badge,
 )
+const isBonus = computed(() => isAffiliateBonusLogIndex(props.request.logIndex))
 
 function redeem(): void {
   if (progress.value.actionable && !props.pending) emit('redeem', props.request)
@@ -42,6 +44,7 @@ function redeem(): void {
     <ItemContent>
       <ItemTitle>
         {{ formatAmount(props.request.amount, props.request.decimals) }} {{ props.request.symbol }}
+        <Badge v-if="isBonus" variant="outline">Bonus</Badge>
         <Badge :variant="progress.actionable ? 'default' : 'secondary'">{{ badgeLabel }}</Badge>
       </ItemTitle>
       <ItemDescription class="space-y-1">

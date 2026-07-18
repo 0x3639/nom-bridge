@@ -47,7 +47,7 @@ Three layers, all under `src/`:
 
 **Bridge flows** (each is two async legs, resumed from the Requests page):
 - **Wrap (Zenon → Ethereum)**: build unsigned wrap block → wallet signs/broadcasts via `znn_send` → after orchestrator signing + redeem delay, submit `redeem` on Ethereum with the TSS signature (`useWrap.redeemEvm`).
-- **Unwrap (Ethereum → Zenon)**: exact-amount ERC-20 approve + `bridge.unwrap` via viem (simulated first, receipt required) → later redeem on Zenon via `znn_send`, using the node's authoritative `logIndex` (the browser-decoded log index is provisional/display-only).
+- **Unwrap (Ethereum → Zenon)**: exact-amount ERC-20 approve + `bridge.unwrap` via viem (simulated first, receipt required). The unwrap receiver string is `zenonAddr&zenonAddr` (self-referral) whenever the bridge metadata's affiliate program is active for the pair, which yields a 1% + 2% bonus to the destination address (the 2% arrives as a separate unwrap request at logIndex + 4e9); see `src/core/affiliate.ts` and docs/security-model.md. Later, redeem on Zenon via `znn_send`, using the node's authoritative `logIndex` (the browser-decoded log index is provisional/display-only).
 
 **Amounts** are `bigint` everywhere in core (`amount.ts#parseAmount` converts human input; stored as decimal strings in tracked requests). Never use floating point for token amounts.
 

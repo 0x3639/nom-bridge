@@ -3,6 +3,7 @@ import {onMounted, onUnmounted, watch} from 'vue'
 import {Alert, AlertDescription, AlertTitle, Badge, Card, CardContent, CardHeader, CardTitle} from 'nom-ui'
 import {config} from '@/config'
 import {useBridge, useEvmWallet, useRequests, useZenonWallet} from '@/core'
+import {isAffiliateBonusLogIndex} from '@/core/affiliate'
 import {formatAmount, truncateAddress} from '@/core/composables/utils/formatters'
 
 const {tokenPairs, bridgeAddress, momentumTime, error: bridgeError, load} = useBridge()
@@ -96,6 +97,7 @@ onUnmounted(stopPolling)
           >
             <span class="block font-mono">
               {{ formatAmount(request.amount, request.decimals) }} {{ request.symbol }}
+              <Badge v-if="isAffiliateBonusLogIndex(request.logIndex)" variant="outline">Bonus</Badge>
             </span>
             <span class="text-xs text-muted-foreground">To {{ truncateAddress(request.toAddress) }}</span>
           </a>
