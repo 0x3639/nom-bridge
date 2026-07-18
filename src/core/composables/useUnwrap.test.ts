@@ -52,19 +52,27 @@ vi.mock('./useZenonWallet', () => ({
   useZenonWallet: () => ({send: h.send}),
 }))
 
-vi.mock('../request-store', () => ({
-  requestStore: {
-    trackUnwrap: h.trackUnwrap,
-    prune: h.prune,
-    setPendingZenonRedeem: h.setPendingZenonRedeem,
-    clearPendingZenonRedeem: h.clearPendingZenonRedeem,
-    getSnapshot: h.getSnapshot,
-    withCrossContextLock: h.withCrossContextLock,
-    withWalletActionLock: h.withWalletActionLock,
-    withExclusiveSourceLock: h.withExclusiveSourceLock,
-    hasCrossContextLocks: h.hasCrossContextLocks,
-  },
-}))
+vi.mock('../request-store', async importOriginal => {
+  // requestStore itself is a full mock (external storage/wallet boundary),
+  // but zenonRedeemLockFor is a pure id-keying helper with no side effects —
+  // use the real implementation so these tests exercise the actual
+  // full-id/legacy-fallback lookup behavior rather than a re-guessed copy.
+  const actual = await importOriginal<typeof import('../request-store')>()
+  return {
+    zenonRedeemLockFor: actual.zenonRedeemLockFor,
+    requestStore: {
+      trackUnwrap: h.trackUnwrap,
+      prune: h.prune,
+      setPendingZenonRedeem: h.setPendingZenonRedeem,
+      clearPendingZenonRedeem: h.clearPendingZenonRedeem,
+      getSnapshot: h.getSnapshot,
+      withCrossContextLock: h.withCrossContextLock,
+      withWalletActionLock: h.withWalletActionLock,
+      withExclusiveSourceLock: h.withExclusiveSourceLock,
+      hasCrossContextLocks: h.hasCrossContextLocks,
+    },
+  }
+})
 
 beforeEach(() => {
   vi.resetModules()
@@ -350,7 +358,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     // reports the request redeemable — the redeem failed on-chain.
     h.getSnapshot.mockResolvedValue({
       requests: [],
-      zenonRedeems: {[transactionHash]: {hash: 'zenonblockhash', updatedAt: 1}},
+      zenonRedeems: {[view.id]: {hash: 'zenonblockhash', updatedAt: 1}},
     })
     h.getAccountBlockOutcome.mockResolvedValue('processed')
     h.getUnwrapRequest.mockResolvedValue({redeemed: 0, revoked: 0})
@@ -364,7 +372,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
   it('keeps the lock while the block is pending or the redeem already took effect', async () => {
     h.getSnapshot.mockResolvedValue({
       requests: [],
-      zenonRedeems: {[transactionHash]: {hash: 'zenonblockhash', updatedAt: 1}},
+      zenonRedeems: {[view.id]: {hash: 'zenonblockhash', updatedAt: 1}},
     })
     h.getAccountBlockOutcome.mockResolvedValue('pending')
     const {useUnwrap} = await import('./useUnwrap')
@@ -381,7 +389,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     h.getSnapshot.mockResolvedValue({
       requests: [],
       zenonRedeems: {
-        [transactionHash]: {
+        [view.id]: {
           hash: 'awaiting-wallet-result',
           updatedAt: Date.now() - PLACEHOLDER_LOCK_STALE_MS - 1,
         },
@@ -393,7 +401,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
 
     h.getSnapshot.mockResolvedValue({
       requests: [],
-      zenonRedeems: {[transactionHash]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
+      zenonRedeems: {[view.id]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
     })
     await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
     expect(h.clearPendingZenonRedeem).toHaveBeenCalledTimes(1)
@@ -405,7 +413,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     h.getSnapshot.mockResolvedValue({
       requests: [],
       zenonRedeems: {
-        [transactionHash]: {
+        [view.id]: {
           hash: 'awaiting-wallet-result',
           updatedAt: Date.now() - PLACEHOLDER_LOCK_STALE_MS - 1,
         },
@@ -416,6 +424,30 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+  })
+
+  it('does not see or clear a lock held by the bonus row sharing this tx hash', async () => {
+    // Recheck must key by the full request id: a lock belonging to the bonus
+    // row (logIndex + 4e9) must be invisible to — and unclearable by — the
+    // main row's recheck, and vice versa.
+    const bonusView = {
+      ...view,
+      id: `${transactionHash}:4000000004`,
+      logIndex: 4000000004,
+    }
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[view.id]: {hash: 'zenonblockhash', updatedAt: 1}},
+    })
+    h.getAccountBlockOutcome.mockResolvedValue('processed')
+    h.getUnwrapRequest.mockResolvedValue({redeemed: 0, revoked: 0})
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(bonusView)).resolves.toBe('no-lock')
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+    // The main row's own recheck still finds and releases its lock.
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-failed')
+    expect(h.clearPendingZenonRedeem).toHaveBeenCalledWith(view.id)
   })
 })
 
@@ -497,19 +529,19 @@ describe('useUnwrap.redeemZenon', () => {
     const {useUnwrap} = await import('./useUnwrap')
     // Fresh placeholder → refuse.
     h.getSnapshot.mockResolvedValue({
-      zenonRedeems: {[transactionHash]: {hash: 'awaiting-wallet-result', updatedAt: Date.now()}},
+      zenonRedeems: {[view.id]: {hash: 'awaiting-wallet-result', updatedAt: Date.now()}},
     })
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     // Ambiguous marker → refuse regardless of age.
     h.getSnapshot.mockResolvedValue({
-      zenonRedeems: {[transactionHash]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
+      zenonRedeems: {[view.id]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
     })
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     expect(h.send).not.toHaveBeenCalled()
     // Stale orphaned placeholder → reclaim.
     h.getSnapshot.mockResolvedValue({
       zenonRedeems: {
-        [transactionHash]: {
+        [view.id]: {
           hash: 'awaiting-wallet-result',
           updatedAt: Date.now() - PLACEHOLDER_LOCK_STALE_MS - 1,
         },
@@ -583,10 +615,6 @@ describe('useUnwrap.redeemZenon', () => {
 
   it('clears the local marker when the flow fails before any wallet prompt', async () => {
     const transactionHash = `0x${'bb'.repeat(32)}`
-    h.getSnapshot.mockResolvedValue({
-      zenonRedeems: {[transactionHash]: {hash: 'other-tab'}},
-    })
-    const {useUnwrap} = await import('./useUnwrap')
     const view = {
       id: `${transactionHash}:3`,
       transactionHash,
@@ -598,6 +626,10 @@ describe('useUnwrap.redeemZenon', () => {
       toAddress: 'z1qrecipient',
       status: 'redeemable' as const,
     }
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[view.id]: {hash: 'other-tab'}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
 
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     expect(useUnwrap().pendingRedeems.value[view.id]).toBeUndefined()
@@ -634,10 +666,6 @@ describe('useUnwrap.redeemZenon', () => {
 
   it('refuses a Zenon redemption when another context already persisted its lock', async () => {
     const transactionHash = `0x${'ef'.repeat(32)}`
-    h.getSnapshot.mockResolvedValue({
-      zenonRedeems: {[transactionHash]: {hash: 'other-tab'}},
-    })
-    const {useUnwrap} = await import('./useUnwrap')
     const view = {
       id: `${transactionHash}:2`,
       transactionHash,
@@ -649,9 +677,52 @@ describe('useUnwrap.redeemZenon', () => {
       toAddress: 'z1qrecipient',
       status: 'redeemable' as const,
     }
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[view.id]: {hash: 'other-tab'}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
 
     await expect(useUnwrap().redeemZenon(view)).rejects.toThrow('already in progress')
     expect(h.send).not.toHaveBeenCalled()
     expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+  })
+
+  it('a lock on the main row does not block redeeming the bonus row sharing its tx hash', async () => {
+    // The affiliate bonus row shares its tx hash with the main unwrap
+    // (`hash:N` / `hash:N+4e9`); a persisted redeem lock on one must not be
+    // visible to, or block, the other.
+    h.buildRedeemBlock.mockReturnValue({__block: true})
+    h.send.mockResolvedValue({hash: {toString: () => 'bonushash'}})
+    const transactionHash = `0x${'11'.repeat(32)}`
+    const mainView = {
+      id: `${transactionHash}:3`,
+      transactionHash,
+      logIndex: 3,
+      zts: 'zts1znn',
+      amount: 97n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qmain',
+      status: 'redeemable' as const,
+    }
+    const bonusView = {
+      id: `${transactionHash}:4000000003`,
+      transactionHash,
+      logIndex: 4000000003,
+      zts: 'zts1znn',
+      amount: 3n,
+      decimals: 8,
+      symbol: 'ZNN',
+      toAddress: 'z1qbonus',
+      status: 'redeemable' as const,
+    }
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {[mainView.id]: {hash: 'other-tab', updatedAt: Date.now()}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().redeemZenon(mainView)).rejects.toThrow('already in progress')
+    await expect(useUnwrap().redeemZenon(bonusView)).resolves.toBe('bonushash')
+    expect(h.setPendingZenonRedeem).toHaveBeenCalledWith(bonusView.id, expect.any(String))
   })
 })

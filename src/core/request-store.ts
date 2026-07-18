@@ -79,15 +79,26 @@ function normalizeUnwrapLockKey(id: string): string {
   return `${normalizeEvmHash(hash)}:${index}`
 }
 
+// Full lock entry (hash + updatedAt) for a request id, with the same
+// id-first/legacy-fallback lookup as pendingZenonRedeemFor. Callers that need
+// staleness info (e.g. reclaiming an orphaned pre-prompt placeholder) must use
+// this rather than pendingZenonRedeemFor, which only surfaces the hash.
+export function zenonRedeemLockFor(
+  zenonRedeems: Record<string, {hash: string; updatedAt?: number}>,
+  id: string,
+): {hash: string; updatedAt?: number} | undefined {
+  const direct = zenonRedeems[normalizeUnwrapLockKey(id)]
+  if (direct) return direct
+  const [hash, index] = id.split(':')
+  if (Number(index) >= AFFILIATE_LOG_INDEX_THRESHOLD) return undefined
+  return zenonRedeems[normalizeEvmHash(hash)]
+}
+
 export function pendingZenonRedeemFor(
   zenonRedeems: Record<string, {hash: string; updatedAt?: number}>,
   id: string,
 ): string | undefined {
-  const direct = zenonRedeems[normalizeUnwrapLockKey(id)]?.hash
-  if (direct) return direct
-  const [hash, index] = id.split(':')
-  if (Number(index) >= AFFILIATE_LOG_INDEX_THRESHOLD) return undefined
-  return zenonRedeems[normalizeEvmHash(hash)]?.hash
+  return zenonRedeemLockFor(zenonRedeems, id)?.hash
 }
 
 function applyLockOps(base: PendingActionLocks, ops: LockOp[]): PendingActionLocks {
