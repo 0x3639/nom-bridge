@@ -45,7 +45,7 @@ export function validatePinnedNetwork(info: BridgeNetworkInfo): TokenPair[] {
 async function resolvePair(
   pair: TokenPair,
   bridgeAddress: Address,
-  bridgeMetadata: string,
+  bridgeMetadata: string | null | undefined,
 ): Promise<TokenPairView> {
   const zts = pair.tokenStandard.toString()
   const tokenAddress = pair.tokenAddress as Address

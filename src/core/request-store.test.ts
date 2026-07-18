@@ -1,5 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {pendingZenonRedeemFor} from './request-store'
+import {pendingZenonRedeemFor, zenonRedeemLockFor} from './request-store'
 
 // Mock the storage adapter so the store never touches real localStorage. The
 // fake holds an in-memory cell whose initial value drives ensureLoaded().
@@ -579,6 +579,42 @@ describe('zenon redeem lock keying', () => {
     await requestStore.clearPendingZenonRedeem(MAIN_ID)
     const snapshot = await requestStore.getSnapshot()
     expect(Object.keys(snapshot.zenonRedeems)).toHaveLength(0)
+  })
+
+  it('migrates a legacy pendingZenonRedeemHash on a still-provisional tracked row (id hash:-1) to the bare-hash legacy key, not the full provisional id', async () => {
+    // Before the node assigns an authoritative logIndex, a tracked unwrap sits
+    // at the provisional id `hash:-1`. If an old embedded
+    // pendingZenonRedeemHash on that row migrated to the FULL id (`hash:-1`),
+    // it would be unreachable forever: the real row later becomes `hash:7`,
+    // whose direct lookup is `hash:7` (no match) and whose legacy fallback
+    // only ever checks the BARE hash (never `hash:-1`).
+    h.get.mockImplementation(async (key: string) => key === 'nom-bridge:requests:v2'
+      ? [{
+          kind: 'unwrap',
+          evmChainId: 1,
+          zenonChainId: 1,
+          id: `${HASH}:-1`,
+          zts: 'zts1znn',
+          amount: '100000000',
+          decimals: 8,
+          symbol: 'ZNN',
+          zenonToAddress: 'z1qrecipient',
+          createdAt: 1,
+          pendingZenonRedeemHash: 'zhash-legacy',
+        }]
+      : h.values.get(key) ?? null)
+    const {requestStore} = await import('./request-store')
+
+    const snapshot = await requestStore.getSnapshot()
+    // Found via the legacy bare-hash fallback for the node's authoritative row.
+    expect(zenonRedeemLockFor(snapshot.zenonRedeems, MAIN_ID)).toMatchObject({hash: 'zhash-legacy'})
+    // Not mirrored under the full provisional id.
+    expect(snapshot.zenonRedeems[`${HASH}:-1`]).toBeUndefined()
+    // The embedded field was stripped off the tracked request.
+    expect(h.set).toHaveBeenCalledWith(
+      'nom-bridge:requests:v2',
+      [expect.not.objectContaining({pendingZenonRedeemHash: 'zhash-legacy'})],
+    )
   })
 
   it('clearing a bonus row leaves a genuinely-legacy bare-hash entry alone', async () => {

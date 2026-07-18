@@ -195,6 +195,30 @@ export function deriveUnwrapStatus(
   return 'redeemable'
 }
 
+// A tx hash is final for pruning purposes only when EVERY unwrap view
+// sharing it (the main row and any affiliate bonus row at
+// logIndex + AFFILIATE_LOG_INDEX_THRESHOLD) is redeemed/revoked. Pruning on a
+// single final row while a same-hash sibling is still live would silently
+// discard the tracked request's approvalCount/createdAt out from under it.
+export function computeFinalUnwrapHashes(
+  views: Array<{transactionHash: string; status: UnwrapStatus}>,
+): Set<string> {
+  const statusesByHash = new Map<string, UnwrapStatus[]>()
+  for (const view of views) {
+    const hash = normalizeEvmHash(view.transactionHash)
+    const statuses = statusesByHash.get(hash)
+    if (statuses) statuses.push(view.status)
+    else statusesByHash.set(hash, [view.status])
+  }
+  const finalHashes = new Set<string>()
+  for (const [hash, statuses] of statusesByHash) {
+    if (statuses.every(status => status === 'redeemed' || status === 'revoked')) {
+      finalHashes.add(hash)
+    }
+  }
+  return finalHashes
+}
+
 const MAX_POLL_RERUNS = 5
 
 async function poll(evmAddress: string | null, bridge: string | null): Promise<void> {
@@ -555,11 +579,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const finalWrapIds = new Set(
       wrapRequests.value.filter(r => r.status === 'redeemed').map(r => r.id),
     )
-    const finalUnwrapHashes = new Set(
-      unwrapRequests.value
-        .filter(r => r.status === 'redeemed' || r.status === 'revoked')
-        .map(r => normalizeEvmHash(r.transactionHash)),
-    )
+    const finalUnwrapHashes = computeFinalUnwrapHashes(unwrapRequests.value)
     if (finalWrapIds.size || finalUnwrapHashes.size) {
       await requestStore.prune(request =>
         request.kind === 'wrap'

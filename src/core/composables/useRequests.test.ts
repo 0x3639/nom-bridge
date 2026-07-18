@@ -1,5 +1,6 @@
 import {describe, expect, it} from 'vitest'
 import {
+  computeFinalUnwrapHashes,
   deriveUnwrapStatus,
   deriveWrapStatus,
   findTrackedUnwrapByHash,
@@ -7,6 +8,7 @@ import {
   normalizeEvmHash,
   reconcileUnknownWrapOperations,
 } from './useRequests'
+import type {UnwrapStatus} from '@/types'
 
 describe('normalizeEvmHash', () => {
   it('canonicalizes SDK and viem hash formats to the same key', () => {
@@ -226,5 +228,41 @@ describe('deriveUnwrapStatus', () => {
     expect(deriveUnwrapStatus({...base, redeemed: 2}, false)).toBe('redeemable')
     // negative values are also not "set"
     expect(deriveUnwrapStatus({...base, revoked: -1}, false)).toBe('redeemable')
+  })
+})
+
+describe('computeFinalUnwrapHashes', () => {
+  const HASH = '0x' + 'ab'.repeat(32)
+
+  function view(status: UnwrapStatus, hash = HASH) {
+    return {transactionHash: hash, status}
+  }
+
+  it('a hash with a single final view is final', () => {
+    const result = computeFinalUnwrapHashes([view('redeemed')])
+    expect(result.has(normalizeEvmHash(HASH))).toBe(true)
+  })
+
+  it('bonus row redeemed but sibling main row still redeemable → NOT final', () => {
+    const result = computeFinalUnwrapHashes([view('redeemed'), view('redeemable')])
+    expect(result.has(normalizeEvmHash(HASH))).toBe(false)
+  })
+
+  it('both same-hash rows final (redeemed + revoked) → final', () => {
+    const result = computeFinalUnwrapHashes([view('redeemed'), view('revoked')])
+    expect(result.has(normalizeEvmHash(HASH))).toBe(true)
+  })
+
+  it('normalizes hash casing/prefix before grouping', () => {
+    const bare = HASH.slice(2).toUpperCase()
+    const result = computeFinalUnwrapHashes([view('redeemed', HASH), view('redeemable', bare)])
+    expect(result.has(normalizeEvmHash(HASH))).toBe(false)
+  })
+
+  it('an unrelated hash is unaffected by another hash still being live', () => {
+    const OTHER = '0x' + 'cd'.repeat(32)
+    const result = computeFinalUnwrapHashes([view('redeemed', OTHER), view('redeemable', HASH)])
+    expect(result.has(normalizeEvmHash(OTHER))).toBe(true)
+    expect(result.has(normalizeEvmHash(HASH))).toBe(false)
   })
 })

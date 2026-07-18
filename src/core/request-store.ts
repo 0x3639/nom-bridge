@@ -2,7 +2,7 @@ import {storageService} from './storage/storage-service'
 import type {TrackedRequest} from '@/types'
 import {config} from '@/config'
 import {normalizeEvmHash} from './evm-hash'
-import {AFFILIATE_LOG_INDEX_THRESHOLD} from './affiliate'
+import {isAffiliateBonusLogIndex} from './affiliate'
 
 const STORAGE_KEY = 'nom-bridge:requests:v2'
 const LOCKS_STORAGE_KEY = 'nom-bridge:action-locks:v1'
@@ -79,6 +79,19 @@ function normalizeUnwrapLockKey(id: string): string {
   return `${normalizeEvmHash(hash)}:${index}`
 }
 
+// Whether an id's `:index` part refers to a main unwrap row for the purposes
+// of the legacy bare-hash key: true for a well-formed index below the
+// affiliate bonus threshold, AND for a missing/non-numeric/negative index
+// (a still-provisional tracked row, e.g. `hash:-1`, before the node assigns
+// an authoritative logIndex — those can only ever be main rows). False only
+// for a well-formed affiliate bonus index, which must never resolve to or
+// clear the legacy key. Shared by every legacy-fallback read/clear/migrate
+// so they stay symmetric: whatever a read can surface, a clear can remove.
+function isMainRowIndexPart(index: string | undefined): boolean {
+  const n = Number(index)
+  return !Number.isFinite(n) || !isAffiliateBonusLogIndex(n)
+}
+
 // Full lock entry (hash + updatedAt) for a request id, with the same
 // id-first/legacy-fallback lookup as pendingZenonRedeemFor. Callers that need
 // staleness info (e.g. reclaiming an orphaned pre-prompt placeholder) must use
@@ -90,7 +103,7 @@ export function zenonRedeemLockFor(
   const direct = zenonRedeems[normalizeUnwrapLockKey(id)]
   if (direct) return direct
   const [hash, index] = id.split(':')
-  if (Number(index) >= AFFILIATE_LOG_INDEX_THRESHOLD) return undefined
+  if (!isMainRowIndexPart(index)) return undefined
   return zenonRedeems[normalizeEvmHash(hash)]
 }
 
@@ -228,8 +241,19 @@ async function ensureLocksLoaded(): Promise<PendingActionLocks> {
         migrated = true
       }
       if (request.kind === 'unwrap' && request.pendingZenonRedeemHash) {
-        locksMirror.zenonRedeems[normalizeUnwrapLockKey(request.id)] ??=
-          {hash: request.pendingZenonRedeemHash}
+        // A tracked row still at its provisional id (`hash:-1`, before the
+        // node assigns an authoritative logIndex) must migrate to the bare
+        // legacy key: mirroring to the full provisional id would be
+        // unreachable forever, since the real row later becomes `hash:7` and
+        // only the bare-hash legacy fallback — never `hash:-1` — is ever
+        // checked for it.
+        const [rawHash, indexPart] = request.id.split(':')
+        const indexNum = Number(indexPart)
+        const isProvisionalIndex = !Number.isFinite(indexNum) || indexNum < 0
+        const key = isProvisionalIndex
+          ? normalizeEvmHash(rawHash)
+          : normalizeUnwrapLockKey(request.id)
+        locksMirror.zenonRedeems[key] ??= {hash: request.pendingZenonRedeemHash}
         delete request.pendingZenonRedeemHash
         migrated = true
       }
@@ -440,7 +464,7 @@ export const requestStore = {
     const key = normalizeUnwrapLockKey(id)
     const [rawHash, index] = id.split(':')
     const legacyKey = normalizeEvmHash(rawHash)
-    const clearLegacy = Number(index) < AFFILIATE_LOG_INDEX_THRESHOLD
+    const clearLegacy = isMainRowIndexPart(index)
     await mutateLocks(locks => {
       const ops: LockOp[] = []
       if (locks.zenonRedeems[key]) ops.push({scope: 'zenonRedeems', op: 'delete', key})
