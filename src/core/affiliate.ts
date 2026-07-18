@@ -21,15 +21,19 @@ const UNWRAP_FLAG_BY_SYMBOL: Record<string, 'wZNN' | 'wQSR'> = {
 
 // Total bonus (in basis points of the unwrapped amount) the destination
 // address collects on an unwrap when it is its own affiliate. 0 whenever the
-// program is off or the metadata cannot be understood (fail-safe: callers
-// then send a bare receiver, which is today's behavior).
+// program is off, not yet activated at `currentBlock` (the orchestrator pays
+// only for events at block >= startingHeight), or the metadata cannot be
+// understood (fail-safe: callers then send a bare receiver, which is today's
+// behavior). Pass `currentBlock: null` when the EVM block read failed — that
+// also fails closed to 0.
 export function parseUnwrapBonusBps(
   metadata: string | null | undefined,
   evmChainId: number,
   baseSymbol: string,
+  currentBlock: bigint | null,
 ): number {
   const flag = UNWRAP_FLAG_BY_SYMBOL[baseSymbol]
-  if (!flag || !metadata) return 0
+  if (!flag || !metadata || currentBlock === null) return 0
   let parsed: unknown
   try {
     parsed = JSON.parse(metadata)
@@ -43,8 +47,20 @@ export function parseUnwrapBonusBps(
   const network = networks[String(evmChainId)]
   if (typeof network !== 'object' || network === null) return 0
   const entry = network as {startingHeight?: unknown} & Record<string, unknown>
-  if (typeof entry.startingHeight !== 'number' || entry.startingHeight <= 0) return 0
+  const startingHeight = entry.startingHeight
+  if (typeof startingHeight !== 'number' || !Number.isSafeInteger(startingHeight)) return 0
+  if (startingHeight <= 0 || currentBlock < BigInt(startingHeight)) return 0
   return entry[flag] === true ? AFFILIATE_BONUS_BPS : 0
+}
+
+// Exact payout the destination address receives for a self-referral unwrap of
+// `amount`, mirroring the orchestrator's two independent floor divisions
+// (initiator +1%, affiliate +2%). A single floor(3%) over-estimates by one
+// base unit for many remainders — e.g. 67 pays 68 on-chain, not 69.
+export function selfReferralPayout(amount: bigint): bigint {
+  const initiatorBonus = amount / 100n
+  const affiliateBonus = (amount * 2n) / 100n
+  return amount + initiatorBonus + affiliateBonus
 }
 
 export function selfReferralReceiver(zenonAddress: string): string {

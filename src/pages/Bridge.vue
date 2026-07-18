@@ -20,6 +20,7 @@ import {
   unwrapRequestProgress,
   wrapRequestProgress,
 } from '@/core/approval-ux'
+import {selfReferralPayout} from '@/core/affiliate'
 import {normalizeEvmHash} from '@/core/evm-hash'
 import {EvmSubmissionError} from '@/core/evm-service'
 import {ZenonSubmissionError} from '@/core/zenon-wallet-service'
@@ -79,7 +80,6 @@ const {
   isUnwrapping,
   phase: unwrapPhase,
   pendingRedeems: pendingUnwrapRedeems,
-  clearPendingRedeem: clearPendingUnwrapRedeem,
   clearLocalPendingRedeem: clearLocalPendingUnwrapRedeem,
   recheckZenonRedeem,
   recheckSubmittedUnwrap,
@@ -151,8 +151,12 @@ const destinationAmount = computed(() => {
       const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
       return formatAmount(base - fee, pair.decimals)
     }
-    const bonus = (base * BigInt(pair.unwrapBonusBps)) / FEE_DENOMINATOR
-    return formatAmount(base + bonus, pair.decimals)
+    // Exact protocol payout (two independent floors), not floor(base * bps):
+    // the aggregate rounding over-estimates by one base unit for many amounts.
+    return formatAmount(
+      pair.unwrapBonusBps > 0 ? selfReferralPayout(base) : base,
+      pair.decimals,
+    )
   } catch {
     return '0'
   }
@@ -602,16 +606,20 @@ watch([wrapRequests, unwrapRequests], () => {
     return
   }
 
-  const final = unwrapRequests.value.find(request =>
-    normalizeEvmHash(request.transactionHash) === awaiting.transactionHash,
-  )
+  // Exact-id match: a self-referral bonus row shares the main row's tx hash,
+  // so a hash lookup could observe the OTHER row's terminal status and clear
+  // this row's state while its redeem block is still pending. Only transient
+  // UI state is cleared here — the durable redeem lock is owned by the
+  // reconciliation layer, which releases it per-row on authoritative protocol
+  // advancement (useRequests forward-only clearing).
+  const final = unwrapRequests.value.find(request => request.id === awaiting.requestId)
   if (final?.status === 'redeemed') {
     lastCompleted.value = awaiting.explorer
     awaitingCompletion.value = null
-    void clearPendingUnwrapRedeem(awaiting.requestId)
+    clearLocalPendingUnwrapRedeem(awaiting.requestId)
   } else if (final?.status === 'revoked') {
     awaitingCompletion.value = null
-    void clearPendingUnwrapRedeem(awaiting.requestId)
+    clearLocalPendingUnwrapRedeem(awaiting.requestId)
   }
 }, {immediate: true})
 

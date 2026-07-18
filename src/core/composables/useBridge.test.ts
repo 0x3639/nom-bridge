@@ -6,6 +6,7 @@ const getOrchestratorInfo = vi.fn()
 const getNativeTokenMetadata = vi.fn()
 const getEvmTokenMetadata = vi.fn()
 const getEvmTokenInfo = vi.fn()
+const getEvmBlockNumber = vi.fn()
 
 vi.mock('../bridge-service', () => ({
   BridgeService: {
@@ -23,6 +24,7 @@ vi.mock('../evm-service', () => ({
     getInstance: () => ({
       getTokenMetadata: getEvmTokenMetadata,
       getTokenInfo: getEvmTokenInfo,
+      getBlockNumber: getEvmBlockNumber,
     }),
   },
 }))
@@ -81,6 +83,7 @@ beforeEach(() => {
     redeemable: true,
     owned: true,
   })
+  getEvmBlockNumber.mockReset().mockResolvedValue(23_000_000n)
 })
 
 describe('useBridge token metadata and safety mapping', () => {
@@ -131,6 +134,42 @@ describe('useBridge token metadata and safety mapping', () => {
     const {tokenPairs, load} = useBridge()
     await load()
 
+    expect(tokenPairs.value.every(pair => pair.unwrapBonusBps === 0)).toBe(true)
+  })
+
+  it('yields no unwrap bonus before the program activation height', async () => {
+    getBridgeInfo.mockResolvedValue({
+      halted: false,
+      allowKeyGen: false,
+      metadata: JSON.stringify({
+        affiliateProgram: {
+          networks: {'1': {startingHeight: 23_500_000, wZNN: true, wQSR: true}},
+        },
+      }),
+    })
+    const {useBridge} = await import('./useBridge')
+    const {tokenPairs, load} = useBridge()
+    await load()
+
+    expect(tokenPairs.value.every(pair => pair.unwrapBonusBps === 0)).toBe(true)
+  })
+
+  it('yields no unwrap bonus when the EVM block read fails (fail-closed), without failing load', async () => {
+    getBridgeInfo.mockResolvedValue({
+      halted: false,
+      allowKeyGen: false,
+      metadata: JSON.stringify({
+        affiliateProgram: {
+          networks: {'1': {startingHeight: 17678862, wZNN: true, wQSR: true}},
+        },
+      }),
+    })
+    getEvmBlockNumber.mockRejectedValue(new Error('rpc down'))
+    const {useBridge} = await import('./useBridge')
+    const {tokenPairs, load} = useBridge()
+    await load()
+
+    expect(tokenPairs.value).toHaveLength(2)
     expect(tokenPairs.value.every(pair => pair.unwrapBonusBps === 0)).toBe(true)
   })
 

@@ -3,7 +3,12 @@ import {selfReferralReceiver} from '../affiliate'
 import {BridgeService} from '../bridge-service'
 import {EvmService, EvmSubmissionError} from '../evm-service'
 import type {AuthoritativeEvmOutcome} from '../evm-service'
-import {requestStore, zenonRedeemLockFor} from '../request-store'
+import {
+  legacyZenonRedeemLockFor,
+  ownZenonRedeemLockFor,
+  requestStore,
+  zenonRedeemLockFor,
+} from '../request-store'
 import {useZenonWallet} from './useZenonWallet'
 import type {UnwrapRequestView} from '@/types'
 import type {Address, Hex} from 'viem'
@@ -220,12 +225,16 @@ async function redeemZenonLocked(request: UnwrapRequestView): Promise<string> {
     // outside the browser, so its prompt can outlive a crashed dApp context —
     // the placeholder must be older than any plausible prompt lifetime before
     // a new flow may overwrite it. Real-hash and ambiguous locks always refuse.
-    // Keyed by the full request id: a lock on the affiliate bonus row (or the
-    // main row) sharing this tx hash must never be visible here.
+    // BLOCKING view for the refusal (a sibling row's lock or fence, or an old
+    // bundle's bare-hash lock, must also block this row — main and bonus
+    // redeem sequentially); OWN view for the reclaim — this row may only
+    // overwrite a placeholder that belongs to it.
     const existingLock = zenonRedeemLockFor(snapshot.zenonRedeems, request.id)
+    const ownLock = ownZenonRedeemLockFor(snapshot.zenonRedeems, request.id)
     const reclaimable =
       requestStore.hasCrossContextLocks() &&
       existingLock !== undefined &&
+      existingLock === ownLock &&
       canReclaimPlaceholderLock(
         existingLock.hash,
         existingLock.updatedAt,
@@ -324,10 +333,42 @@ async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRede
   // tabs for the main and bonus rows of one unwrap event.
   return requestStore.withCrossContextLock(`zenon-redeem:${transactionHash}`, async () => {
     const snapshot = await requestStore.getSnapshot()
-    // Keyed by the full request id: a lock belonging to the bonus (or main)
-    // row sharing this tx hash must be invisible to this row's recheck.
-    const lock = zenonRedeemLockFor(snapshot.zenonRedeems, request.id)
-    if (!lock) return 'no-lock'
+    // OWN view first: this row's evidence (its own logIndex re-read) may only
+    // release the row's exact full-id lock. Without one, an unmarked bare
+    // entry is an old bundle's lock with an UNKNOWN target row — resolvable
+    // only with hash-wide evidence (block outcome / placeholder staleness),
+    // never by attributing it to this row. A marked sibling fence is simply
+    // 'kept': it dies with its writer's lock.
+    const lock = ownZenonRedeemLockFor(snapshot.zenonRedeems, request.id)
+    if (!lock) {
+      const legacy = legacyZenonRedeemLockFor(snapshot.zenonRedeems, transactionHash)
+      if (!legacy) {
+        return zenonRedeemLockFor(snapshot.zenonRedeems, request.id) ? 'kept' : 'no-lock'
+      }
+      if (legacy.hash === AWAITING_WALLET_RESULT) {
+        if (
+          requestStore.hasCrossContextLocks() &&
+          canReclaimPlaceholderLock(legacy.hash, legacy.updatedAt, Date.now(), PLACEHOLDER_LOCK_STALE_MS)
+        ) {
+          await requestStore.clearLegacyZenonRedeem(transactionHash)
+          setPendingRedeem(request.id)
+          return 'released-orphan'
+        }
+        return 'kept'
+      }
+      if (legacy.hash === AMBIGUOUS_WALLET_RESULT) return 'kept'
+      const legacyOutcome = await BridgeService.getInstance()
+        .getAccountBlockOutcome(legacy.hash)
+        .catch(() => null)
+      if (legacyOutcome !== 'processed') return 'kept'
+      // Processed proves the account block is no longer in flight for ANY
+      // row, whether the embedded call succeeded or failed — a fresh node
+      // read now reflects whichever rows remain redeemable. Deliberately no
+      // per-row redeemable re-read here: that would be target inference.
+      await requestStore.clearLegacyZenonRedeem(transactionHash)
+      setPendingRedeem(request.id)
+      return 'released-failed'
+    }
     if (lock.hash === AWAITING_WALLET_RESULT) {
       // The orphan proof requires real Web Lock exclusion to exist at all.
       if (

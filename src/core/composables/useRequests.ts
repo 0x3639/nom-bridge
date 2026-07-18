@@ -587,6 +587,12 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           : finalUnwrapHashes.has(normalizeEvmHash(request.id.split(':')[0])),
       )
     }
+    // Every row sharing these hashes is terminal, so no wallet action can
+    // still matter for them — the only state under which a target-unknown
+    // bare-hash lock (old bundle) or an orphaned fence may be swept.
+    for (const hash of finalUnwrapHashes) {
+      await requestStore.clearLegacyZenonRedeem(hash)
+    }
     return true
   }
 }

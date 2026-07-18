@@ -1,5 +1,10 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {pendingZenonRedeemFor, zenonRedeemLockFor} from './request-store'
+import {
+  legacyZenonRedeemLockFor,
+  ownZenonRedeemLockFor,
+  pendingZenonRedeemFor,
+  zenonRedeemLockFor,
+} from './request-store'
 
 // Mock the storage adapter so the store never touches real localStorage. The
 // fake holds an in-memory cell whose initial value drives ensureLoaded().
@@ -529,29 +534,65 @@ describe('zenon redeem lock keying', () => {
   const MAIN_ID = `${HASH}:7`
   const BONUS_ID = `${HASH}:4000000007`
 
-  it('keys pending redeems by full id so same-hash rows are independent', async () => {
+  it('writes a bare-hash compatibility fence alongside the full-id lock', async () => {
     const {requestStore} = await import('./request-store')
     await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
     const snapshot = await requestStore.getSnapshot()
+    // Own row reads its full-id lock; the sibling row is fence-blocked so the
+    // two rows redeem sequentially; an old bundle's bare-hash read sees it too.
     expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-main')
-    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBeUndefined()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBe('zhash-main')
+    expect(snapshot.zenonRedeems[HASH]).toMatchObject({hash: 'zhash-main', fence: true})
   })
 
-  it('clearing one row leaves the other row locked', async () => {
+  it('the fence follows its writer through the placeholder → published-hash upgrade', async () => {
+    const {requestStore} = await import('./request-store')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'placeholder')
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-published')
+    const snapshot = await requestStore.getSnapshot()
+    expect(snapshot.zenonRedeems[HASH]).toMatchObject({hash: 'zhash-published', fence: true})
+    // Value-matched fence is released with its writer's lock.
+    await requestStore.clearPendingZenonRedeem(MAIN_ID)
+    const after = await requestStore.getSnapshot()
+    expect(Object.keys(after.zenonRedeems)).toHaveLength(0)
+  })
+
+  it('clearing one row releases only its own lock and fence, never the sibling lock', async () => {
     const {requestStore} = await import('./request-store')
     await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
     await requestStore.setPendingZenonRedeem(BONUS_ID, 'zhash-bonus')
     await requestStore.clearPendingZenonRedeem(MAIN_ID)
     const snapshot = await requestStore.getSnapshot()
-    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBeUndefined()
+    // The bonus row's full-id lock survives; its refreshed fence still blocks
+    // the (now-cleared) main row — sequential redemption by design.
     expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBe('zhash-bonus')
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-bonus')
+    await requestStore.clearPendingZenonRedeem(BONUS_ID)
+    const after = await requestStore.getSnapshot()
+    expect(Object.keys(after.zenonRedeems)).toHaveLength(0)
   })
 
-  it('falls back to a legacy bare-hash entry for main rows only', () => {
+  it('a bare-hash entry blocks BOTH rows (old bundles can lock either row)', () => {
     const legacy = {[HASH]: {hash: 'zhash-legacy'}}
     expect(pendingZenonRedeemFor(legacy, MAIN_ID)).toBe('zhash-legacy')
     expect(pendingZenonRedeemFor(legacy, `${HASH}:-1`)).toBe('zhash-legacy')
-    expect(pendingZenonRedeemFor(legacy, BONUS_ID)).toBeUndefined()
+    expect(pendingZenonRedeemFor(legacy, BONUS_ID)).toBe('zhash-legacy')
+  })
+
+  it('own view is exactly the full-id entry: fences and unmarked bare entries belong to no row', () => {
+    const fence = {[HASH]: {hash: 'zhash-main', fence: true}}
+    expect(ownZenonRedeemLockFor(fence, MAIN_ID)).toBeUndefined()
+    expect(ownZenonRedeemLockFor(fence, BONUS_ID)).toBeUndefined()
+    // An unmarked bare entry is an old bundle's lock with an UNKNOWN target
+    // (old bundles can redeem either row) — no row may claim it, not even
+    // main. It surfaces only through the legacy view.
+    const legacy = {[HASH]: {hash: 'zhash-legacy'}}
+    expect(ownZenonRedeemLockFor(legacy, MAIN_ID)).toBeUndefined()
+    expect(ownZenonRedeemLockFor(legacy, BONUS_ID)).toBeUndefined()
+    expect(legacyZenonRedeemLockFor(legacy, HASH)).toMatchObject({hash: 'zhash-legacy'})
+    expect(legacyZenonRedeemLockFor(fence, HASH)).toBeUndefined()
+    const full = {[MAIN_ID]: {hash: 'zhash-main'}}
+    expect(ownZenonRedeemLockFor(full, MAIN_ID)).toMatchObject({hash: 'zhash-main'})
   })
 
   it('clearPendingZenonRedeem on a main row also clears the legacy key', async () => {
@@ -565,19 +606,40 @@ describe('zenon redeem lock keying', () => {
     expect(Object.keys(snapshot.zenonRedeems)).toHaveLength(0)
   })
 
-  it('clearing a main row also removes a genuinely-legacy bare-hash entry coexisting with it', async () => {
+  it('an unmarked legacy bare entry survives set and EVERY row-level clear — its target row is unknown', async () => {
     const {requestStore} = await import('./request-store')
-    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
-    // Simulate a pre-migration lock written under the bare tx hash (as this
-    // module did before full-id keying), coexisting alongside the new key —
-    // e.g. left over from a version skew across browser contexts.
-    const stored = h.values.get('nom-bridge:action-locks:v1') as {zenonRedeems: Record<string, unknown>}
+    // Simulate an old bundle's lock written under the bare tx hash. Its
+    // target could be EITHER row (old bundles redeem bonus rows too, e.g.
+    // rows created via another dApp's referral), so no row-level operation
+    // may release it — the exact scenario: main already redeemed, old tab
+    // redeeming the bonus, new tab's advancement clear on the terminal main
+    // row must NOT delete the old tab's still-live lock.
+    const stored = h.values.get('nom-bridge:action-locks:v1') as
+      {zenonRedeems: Record<string, unknown>} | undefined
     h.values.set('nom-bridge:action-locks:v1', {
-      ...stored,
-      zenonRedeems: {...stored.zenonRedeems, [HASH]: {hash: 'zhash-legacy'}},
+      evmClaims: {},
+      zenonRedeems: {...stored?.zenonRedeems, [HASH]: {hash: 'zhash-legacy'}},
+      evmTxFacts: {},
+      unknownWraps: {},
     })
+    // set must NOT clobber the legacy entry (it is another context's lock
+    // evidence, and it already fences old bundles by itself).
+    await requestStore.setPendingZenonRedeem(MAIN_ID, 'zhash-main')
+    let snapshot = await requestStore.getSnapshot()
+    expect(snapshot.zenonRedeems[HASH]).toMatchObject({hash: 'zhash-legacy'})
+    // Row-level clears release only their own full-id lock, never the
+    // unmarked bare entry — from the main row (with or without an own lock)
+    // or the bonus row alike.
     await requestStore.clearPendingZenonRedeem(MAIN_ID)
-    const snapshot = await requestStore.getSnapshot()
+    await requestStore.clearPendingZenonRedeem(MAIN_ID)
+    await requestStore.clearPendingZenonRedeem(BONUS_ID)
+    snapshot = await requestStore.getSnapshot()
+    expect(snapshot.zenonRedeems[MAIN_ID]).toBeUndefined()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-legacy')
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBe('zhash-legacy')
+    // Only the hash-wide evidence path may sweep it.
+    await requestStore.clearLegacyZenonRedeem(HASH)
+    snapshot = await requestStore.getSnapshot()
     expect(Object.keys(snapshot.zenonRedeems)).toHaveLength(0)
   })
 
@@ -630,7 +692,11 @@ describe('zenon redeem lock keying', () => {
     await requestStore.setPendingZenonRedeem(BONUS_ID, 'zhash-bonus')
     await requestStore.clearPendingZenonRedeem(BONUS_ID)
     const snapshot = await requestStore.getSnapshot()
+    // The legacy entry cannot be attributed, so it keeps fencing both rows
+    // until hash-wide evidence (legacy recheck or all-rows-terminal sweep)
+    // releases it via clearLegacyZenonRedeem.
     expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-legacy')
-    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBeUndefined()
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, BONUS_ID)).toBe('zhash-legacy')
+    expect(snapshot.zenonRedeems[BONUS_ID]).toBeUndefined()
   })
 })

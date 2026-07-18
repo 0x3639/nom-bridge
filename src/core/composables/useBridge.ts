@@ -46,6 +46,7 @@ async function resolvePair(
   pair: TokenPair,
   bridgeAddress: Address,
   bridgeMetadata: string | null | undefined,
+  currentEvmBlock: bigint | null,
 ): Promise<TokenPairView> {
   const zts = pair.tokenStandard.toString()
   const tokenAddress = pair.tokenAddress as Address
@@ -90,7 +91,12 @@ async function resolvePair(
     wrapEnabled: pair.bridgeable && evmBridge.redeemable,
     unwrapEnabled: pair.redeemable && evmBridge.bridgeable,
     owned: pair.owned,
-    unwrapBonusBps: parseUnwrapBonusBps(bridgeMetadata, config.evmChainId, native.symbol),
+    unwrapBonusBps: parseUnwrapBonusBps(
+      bridgeMetadata,
+      config.evmChainId,
+      native.symbol,
+      currentEvmBlock,
+    ),
   }
 }
 
@@ -100,14 +106,20 @@ async function load(force = false): Promise<void> {
   error.value = null
   try {
     const service = BridgeService.getInstance()
-    const [network, info, orch] = await Promise.all([
+    // The block number gates the unwrap bonus (orchestrator pays only for
+    // events at block >= the program's startingHeight); a failed read fails
+    // closed to bonus-off rather than failing the whole load.
+    const [network, info, orch, currentEvmBlock] = await Promise.all([
       service.getNetworkInfo(),
       service.getBridgeInfo(),
       service.getOrchestratorInfo(),
+      EvmService.getInstance().getBlockNumber().catch(() => null),
     ])
     const supportedPairs = validatePinnedNetwork(network)
     const resolvedPairs = await Promise.all(
-      supportedPairs.map(pair => resolvePair(pair, network.contractAddress as Address, info.metadata)),
+      supportedPairs.map(pair =>
+        resolvePair(pair, network.contractAddress as Address, info.metadata, currentEvmBlock),
+      ),
     )
 
     networkInfo.value = network

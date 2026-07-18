@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   prune: vi.fn(),
   setPendingZenonRedeem: vi.fn(),
   clearPendingZenonRedeem: vi.fn(),
+  clearLegacyZenonRedeem: vi.fn(),
   getTransactionOutcome: vi.fn(),
   getAuthoritativeOutcome: vi.fn(),
   getAccountBlockOutcome: vi.fn(),
@@ -60,11 +61,14 @@ vi.mock('../request-store', async importOriginal => {
   const actual = await importOriginal<typeof import('../request-store')>()
   return {
     zenonRedeemLockFor: actual.zenonRedeemLockFor,
+    ownZenonRedeemLockFor: actual.ownZenonRedeemLockFor,
+    legacyZenonRedeemLockFor: actual.legacyZenonRedeemLockFor,
     requestStore: {
       trackUnwrap: h.trackUnwrap,
       prune: h.prune,
       setPendingZenonRedeem: h.setPendingZenonRedeem,
       clearPendingZenonRedeem: h.clearPendingZenonRedeem,
+      clearLegacyZenonRedeem: h.clearLegacyZenonRedeem,
       getSnapshot: h.getSnapshot,
       withCrossContextLock: h.withCrossContextLock,
       withWalletActionLock: h.withWalletActionLock,
@@ -501,6 +505,78 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-failed')
     expect(h.clearPendingZenonRedeem).toHaveBeenCalledWith(view.id)
   })
+
+  it('keeps an unmarked legacy lock whose block is still pending, from either row', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'legacy-block', updatedAt: 1}},
+    })
+    h.getAccountBlockOutcome.mockResolvedValue('pending')
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
+    expect(h.clearLegacyZenonRedeem).not.toHaveBeenCalled()
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+  })
+
+  it('releases an unmarked legacy lock on a processed block via the hash-wide path, without target inference', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'legacy-block', updatedAt: 1}},
+    })
+    h.getAccountBlockOutcome.mockResolvedValue('processed')
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-failed')
+    expect(h.clearLegacyZenonRedeem).toHaveBeenCalledWith(transactionHash)
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+    // No per-row redeemable re-read: that would attribute the lock to a row.
+    expect(h.getUnwrapRequest).not.toHaveBeenCalled()
+  })
+
+  it('retains a fresh unmarked legacy placeholder and reclaims it only after the staleness window', async () => {
+    h.hasCrossContextLocks.mockReturnValue(true)
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'awaiting-wallet-result', updatedAt: Date.now()}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
+    expect(h.clearLegacyZenonRedeem).not.toHaveBeenCalled()
+
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'awaiting-wallet-result', updatedAt: 1}},
+    })
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-orphan')
+    expect(h.clearLegacyZenonRedeem).toHaveBeenCalledWith(transactionHash)
+  })
+
+  it('never clears an unmarked legacy ambiguous marker', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'ambiguous-wallet-result', updatedAt: 1}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
+    expect(h.clearLegacyZenonRedeem).not.toHaveBeenCalled()
+    expect(h.getAccountBlockOutcome).not.toHaveBeenCalled()
+  })
+
+  it('reports kept for a marked sibling fence without touching it', async () => {
+    h.getSnapshot.mockResolvedValue({
+      requests: [],
+      zenonRedeems: {[transactionHash]: {hash: 'sibling-block', updatedAt: 1, fence: true}},
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('kept')
+    expect(h.clearLegacyZenonRedeem).not.toHaveBeenCalled()
+    expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
+    expect(h.getAccountBlockOutcome).not.toHaveBeenCalled()
+  })
 })
 
 describe('useUnwrap.redeemZenon', () => {
@@ -739,10 +815,12 @@ describe('useUnwrap.redeemZenon', () => {
     expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
   })
 
-  it('a lock on the main row does not block redeeming the bonus row sharing its tx hash', async () => {
+  it('main and bonus rows redeem sequentially: the fence blocks the sibling, and only clearing releases it', async () => {
     // The affiliate bonus row shares its tx hash with the main unwrap
-    // (`hash:N` / `hash:N+4e9`); a persisted redeem lock on one must not be
-    // visible to, or block, the other.
+    // (`hash:N` / `hash:N+4e9`). Every persisted lock is accompanied by a
+    // bare-hash compatibility fence (old bundles key by bare hash and can
+    // lock either row), so a live lock on one row blocks BOTH rows; the
+    // sibling becomes redeemable once the lock and its fence are released.
     h.buildRedeemBlock.mockReturnValue({__block: true})
     h.send.mockResolvedValue({hash: {toString: () => 'bonushash'}})
     const transactionHash = `0x${'11'.repeat(32)}`
@@ -768,12 +846,20 @@ describe('useUnwrap.redeemZenon', () => {
       toAddress: 'z1qbonus',
       status: 'redeemable' as const,
     }
+    // Main row locked by another tab, with the fence set writes in production.
     h.getSnapshot.mockResolvedValue({
-      zenonRedeems: {[mainView.id]: {hash: 'other-tab', updatedAt: Date.now()}},
+      zenonRedeems: {
+        [mainView.id]: {hash: 'other-tab', updatedAt: Date.now()},
+        [transactionHash]: {hash: 'other-tab', updatedAt: Date.now(), fence: true},
+      },
     })
     const {useUnwrap} = await import('./useUnwrap')
 
     await expect(useUnwrap().redeemZenon(mainView)).rejects.toThrow('already in progress')
+    await expect(useUnwrap().redeemZenon(bonusView)).rejects.toThrow('already in progress')
+
+    // Main's lock and fence released (protocol advanced) → bonus proceeds.
+    h.getSnapshot.mockResolvedValue({zenonRedeems: {}})
     await expect(useUnwrap().redeemZenon(bonusView)).resolves.toBe('bonushash')
     expect(h.setPendingZenonRedeem).toHaveBeenCalledWith(bonusView.id, expect.any(String))
   })
