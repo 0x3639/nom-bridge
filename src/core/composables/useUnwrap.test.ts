@@ -131,6 +131,58 @@ describe('useUnwrap.unwrap', () => {
     })
   })
 
+  it('sends the bare receiver when bonusActive is omitted (unchanged default behavior)', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xunwraptx')
+      return {hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true}
+    })
+    h.trackUnwrap.mockResolvedValue(undefined)
+    const {useUnwrap} = await import('./useUnwrap')
+
+    const token = '0xToken0000000000000000000000000000000001' as `0x${string}`
+    const bridge = '0xBridge00000000000000000000000000000000' as `0x${string}`
+    await useUnwrap().unwrap(token, 500n, 'z1qrecipient', bridge, 'zts1znn', 8, 'ZNN', '0xFrom000000000000000000000000000000000009')
+
+    expect(h.unwrap).toHaveBeenCalledWith(
+      bridge,
+      token,
+      500n,
+      'z1qrecipient',
+      expect.any(Function),
+    )
+    expect(h.trackUnwrap).toHaveBeenCalledWith(
+      expect.objectContaining({zenonToAddress: 'z1qrecipient'}),
+    )
+  })
+
+  it('sends the concatenated self-referral receiver on-chain when the bonus is active, but tracks the clean address', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.unwrap.mockImplementation(async (...args: unknown[]) => {
+      const submitted = args[4] as (hash: string) => void
+      submitted('0xunwraptx')
+      return {hash: '0xunwraptx', provisionalLogIndex: 3, eventMatched: true}
+    })
+    h.trackUnwrap.mockResolvedValue(undefined)
+    const {useUnwrap} = await import('./useUnwrap')
+
+    const token = '0xToken0000000000000000000000000000000001' as `0x${string}`
+    const bridge = '0xBridge00000000000000000000000000000000' as `0x${string}`
+    await useUnwrap().unwrap(token, 500n, 'z1qrecipient', bridge, 'zts1znn', 8, 'ZNN', '0xFrom000000000000000000000000000000000009', true)
+
+    expect(h.unwrap).toHaveBeenCalledWith(
+      bridge,
+      token,
+      500n,
+      'z1qrecipient&z1qrecipient',
+      expect.any(Function),
+    )
+    expect(h.trackUnwrap).toHaveBeenCalledWith(
+      expect.objectContaining({zenonToAddress: 'z1qrecipient'}),
+    )
+  })
+
   it('approves an insufficient allowance before unwrap and records a three-approval path', async () => {
     const order: string[] = []
     h.getAllowance.mockImplementation(async () => {

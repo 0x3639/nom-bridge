@@ -588,6 +588,17 @@ describe('selectProvisionalLogIndex', () => {
     ]
     expect(selectProvisionalLogIndex(logs, account, zenon)).toBeNull()
   })
+
+  it('matches the exact concatenated self-referral receiver', async () => {
+    const {selectProvisionalLogIndex} = await import('./evm-service')
+    const receiver = 'z1qaddr&z1qaddr'
+    const token = '0xb2e96a63479c2edd2fd62b382c89d5ca79f572d3'
+    const logs = [
+      {logIndex: 3, args: {from: account, to: 'z1qaddr', token, amount: 5n}},
+      {logIndex: 4, args: {from: account, to: receiver, token, amount: 5n}},
+    ]
+    expect(selectProvisionalLogIndex(logs, account, receiver, token, 5n)).toBe(4)
+  })
 })
 
 describe('EvmService allowance stages', () => {

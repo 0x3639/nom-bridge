@@ -191,20 +191,21 @@ export function computeRemainingSeconds(
 
 // Pure selection of the display-only provisional logIndex from decoded
 // `Unwrapped` logs. The node value is authoritative for the actual redeem.
-// Filters on the connected account (checksum-insensitive) and the exact Zenon
-// recipient; an unmatched receipt is recovered later from the Zenon node.
+// Filters on the connected account (checksum-insensitive) and the exact
+// receiver string as sent (may be `addr&addr` for self-referral); an
+// unmatched receipt is recovered later from the Zenon node.
 export function selectProvisionalLogIndex(
   logs: Array<{
     logIndex: number
     args: {from?: string; to?: string; token?: string; amount?: bigint}
   }>,
   account: string,
-  zenonAddress: string,
+  receiver: string,
   token?: string,
   amount?: bigint,
 ): number | null {
   const match = logs.find(log => {
-    if (log.args.to !== zenonAddress) return false
+    if (log.args.to !== receiver) return false
     if (!log.args.from) return false
     try {
       if (getAddress(log.args.from) !== getAddress(account)) return false
@@ -519,7 +520,7 @@ export class EvmService {
     bridge: Address,
     token: Address,
     amount: bigint,
-    zenonAddress: string,
+    receiver: string,
     onSubmitted?: (hash: Hex) => void,
   ): Promise<{hash: Hex; provisionalLogIndex: number; eventMatched: boolean}> {
     const wallet = this.getWalletClient()
@@ -530,7 +531,7 @@ export class EvmService {
         address: bridge,
         abi: bridgeAbi,
         functionName: 'unwrap',
-        args: [token, amount, zenonAddress],
+        args: [token, amount, receiver],
         chain: CHAIN,
         account,
       })
@@ -557,7 +558,7 @@ export class EvmService {
           args: {from?: string; to?: string; token?: string; amount?: bigint}
         }>,
         account,
-        zenonAddress,
+        receiver,
         token,
         amount,
       )

@@ -698,6 +698,7 @@ async function onUnwrapSubmit(): Promise<void> {
       pair.decimals,
       pair.symbol,
       evmFrom,
+      pair.unwrapBonusBps > 0,
     )
     const {hash} = result
     toast.show(

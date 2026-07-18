@@ -1,4 +1,5 @@
 import {ref} from 'vue'
+import {selfReferralReceiver} from '../affiliate'
 import {BridgeService} from '../bridge-service'
 import {EvmService, EvmSubmissionError} from '../evm-service'
 import type {AuthoritativeEvmOutcome} from '../evm-service'
@@ -67,6 +68,7 @@ async function unwrap(
   decimals: number,
   symbol: string,
   evmFromAddress: string,
+  bonusActive = false,
 ): Promise<UnwrapSubmissionResult> {
   // Synchronous reentrancy guard: rapid double-submission races the UI's
   // awaited pre-checks, so the composable itself must refuse before any await.
@@ -85,7 +87,7 @@ async function unwrap(
       `unwrap-submit:${evmFromAddress.toLowerCase()}`,
       () => {
         lockedFlowRan = true
-        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt)
+        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt, bonusActive)
       },
     )
   } catch (e) {
@@ -107,6 +109,7 @@ async function unwrapLocked(
   decimals: number,
   symbol: string,
   clickedAt: number,
+  bonusActive: boolean,
 ): Promise<UnwrapSubmissionResult> {
   let failureStage: 'allowance' | 'token-approval' | 'bridge-transfer' = 'allowance'
   let broadcastHash: Hex | null = null
@@ -135,11 +138,12 @@ async function unwrapLocked(
     const unwrapStep = approvalRequired ? 2 : 1
     failureStage = 'bridge-transfer'
     phase.value = {kind: 'submitting-unwrap', step: unwrapStep, total}
+    const receiver = bonusActive ? selfReferralReceiver(zenonAddress) : zenonAddress
     const {hash, provisionalLogIndex, eventMatched} = await evm.unwrap(
       bridge,
       token,
       amount,
-      zenonAddress,
+      receiver,
       submittedHash => {
         broadcastHash = submittedHash
         phase.value = {
