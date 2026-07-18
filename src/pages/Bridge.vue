@@ -147,8 +147,12 @@ const destinationAmount = computed(() => {
   if (!pair || !amount.value) return '0'
   try {
     const base = parseAmount(amount.value, pair.decimals)
-    const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
-    return formatAmount(base - fee, pair.decimals)
+    if (direction.value === 'wrap') {
+      const fee = (base * BigInt(pair.feePercentage)) / FEE_DENOMINATOR
+      return formatAmount(base - fee, pair.decimals)
+    }
+    const bonus = (base * BigInt(pair.unwrapBonusBps)) / FEE_DENOMINATOR
+    return formatAmount(base + bonus, pair.decimals)
   } catch {
     return '0'
   }
@@ -353,14 +357,21 @@ const minimumLabel = computed(() => {
   if (!pair || minimum === undefined) return null
   return `Min ${formatDisplayAmount(minimum, pair.decimals)} ${fromSide.value.symbol}`
 })
-const feePercentageLabel = computed(() => {
-  const basisPoints = selectedPair.value?.feePercentage ?? 0
-  return (basisPoints / 100).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')
-})
 const rateLabel = computed(() => {
-  const basisPoints = selectedPair.value?.feePercentage ?? 0
-  const rate = (1 - basisPoints / Number(FEE_DENOMINATOR)).toFixed(4)
+  const pair = selectedPair.value
+  const basisPoints = direction.value === 'wrap'
+    ? -(pair?.feePercentage ?? 0)
+    : (pair?.unwrapBonusBps ?? 0)
+  const rate = (1 + basisPoints / Number(FEE_DENOMINATOR)).toFixed(4)
   return rate.replace(/0+$/, '').replace(/\.$/, '')
+})
+const feeSummaryLabel = computed(() => {
+  const pair = selectedPair.value
+  const formatBps = (bps: number) =>
+    (bps / 100).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')
+  if (direction.value === 'wrap') return `${formatBps(pair?.feePercentage ?? 0)}% bridge fee`
+  const bonus = pair?.unwrapBonusBps ?? 0
+  return bonus > 0 ? `includes ${formatBps(bonus)}% bonus` : 'no bridge fee'
 })
 const ctaLabel = computed(() => {
   if (!sourceConnected.value) {
@@ -1174,7 +1185,7 @@ onUnmounted(() => {
 
             <p class="mt-3.5 font-mono text-[10px] text-muted-foreground">
               1 {{ fromSide.symbol }} ≈ {{ rateLabel }} {{ toSide.symbol }} ·
-              {{ feePercentageLabel }}% bridge fee
+              {{ feeSummaryLabel }}
             </p>
           </section>
         </div>
