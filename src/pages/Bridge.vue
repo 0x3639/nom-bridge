@@ -897,6 +897,10 @@ async function onRecheckUnwrap(request: UnwrapRequestView): Promise<void> {
     await refreshRequestsSafely()
     if (result === 'released-failed') {
       toast.show('Zenon confirms the redemption failed on-chain. It is safe to retry.', 'info')
+    } else if (result === 'released-processed') {
+      // Target-unknown legacy lock: the block finished, but whether the main
+      // or bonus redemption succeeded is unknowable — neutral copy only.
+      toast.show('The previous redemption attempt finished; request statuses were refreshed.', 'info')
     } else if (result === 'released-orphan') {
       toast.show('The abandoned redemption attempt was cleared. You can redeem again.', 'info')
     } else {

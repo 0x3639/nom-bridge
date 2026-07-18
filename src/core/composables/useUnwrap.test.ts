@@ -519,7 +519,7 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
   })
 
-  it('releases an unmarked legacy lock on a processed block via the hash-wide path, without target inference', async () => {
+  it('releases an unmarked legacy lock on a processed block as released-processed, without target inference', async () => {
     h.getSnapshot.mockResolvedValue({
       requests: [],
       zenonRedeems: {[transactionHash]: {hash: 'legacy-block', updatedAt: 1}},
@@ -527,7 +527,9 @@ describe('useUnwrap.recheckZenonRedeem', () => {
     h.getAccountBlockOutcome.mockResolvedValue('processed')
     const {useUnwrap} = await import('./useUnwrap')
 
-    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-failed')
+    // NOT 'released-failed': with an unknown target row, success or failure
+    // of the embedded call is unknowable, so no "safe to retry" claim.
+    await expect(useUnwrap().recheckZenonRedeem(view)).resolves.toBe('released-processed')
     expect(h.clearLegacyZenonRedeem).toHaveBeenCalledWith(transactionHash)
     expect(h.clearPendingZenonRedeem).not.toHaveBeenCalled()
     // No per-row redeemable re-read: that would attribute the lock to a row.

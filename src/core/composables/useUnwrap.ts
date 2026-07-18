@@ -317,7 +317,12 @@ async function dismissPendingZenonRedeem(id: string): Promise<void> {
   setPendingRedeem(id)
 }
 
-export type ZenonRedeemRecheckResult = 'released-failed' | 'released-orphan' | 'kept' | 'no-lock'
+export type ZenonRedeemRecheckResult =
+  | 'released-failed'
+  | 'released-orphan'
+  | 'released-processed'
+  | 'kept'
+  | 'no-lock'
 
 // Evidence-based resolution of a persisted Zenon redeem lock, runnable from
 // the UI's Recheck action. A real block hash is probed on the account chain:
@@ -362,12 +367,14 @@ async function recheckZenonRedeem(request: UnwrapRequestView): Promise<ZenonRede
         .catch(() => null)
       if (legacyOutcome !== 'processed') return 'kept'
       // Processed proves the account block is no longer in flight for ANY
-      // row, whether the embedded call succeeded or failed — a fresh node
-      // read now reflects whichever rows remain redeemable. Deliberately no
-      // per-row redeemable re-read here: that would be target inference.
+      // row — but with an unknown target row, whether the embedded call
+      // succeeded or failed is unknowable here, so this is NOT
+      // 'released-failed' (which implies "safe to retry"). Deliberately no
+      // per-row redeemable re-read either: that would be target inference.
+      // A fresh node read now reflects whichever rows remain redeemable.
       await requestStore.clearLegacyZenonRedeem(transactionHash)
       setPendingRedeem(request.id)
-      return 'released-failed'
+      return 'released-processed'
     }
     if (lock.hash === AWAITING_WALLET_RESULT) {
       // The orphan proof requires real Web Lock exclusion to exist at all.
