@@ -73,6 +73,19 @@ describe('ZenonService initialization', () => {
 
     expect(h.zenon.initialize).toHaveBeenCalledTimes(1)
   })
+
+  it('retries after a transient initialization failure', async () => {
+    const {ZenonService} = await import('./zenon-service')
+    const svc = ZenonService.getInstance()
+
+    h.zenon.initialize.mockRejectedValueOnce(new Error('node unreachable'))
+    await expect(svc.initialize()).rejects.toThrow('node unreachable')
+    expect(svc.isConnected()).toBe(false)
+
+    await svc.initialize()
+    expect(h.zenon.initialize).toHaveBeenCalledTimes(2)
+    expect(svc.isConnected()).toBe(true)
+  })
 })
 
 describe('ZenonService disconnect', () => {

@@ -679,6 +679,33 @@ describe('zenon redeem lock keying', () => {
     )
   })
 
+  it('migrates a node-indexed legacy redeem lock with a fence for its sibling row', async () => {
+    h.get.mockImplementation(async (key: string) => key === 'nom-bridge:requests:v2'
+      ? [{
+          kind: 'unwrap',
+          evmChainId: 1,
+          zenonChainId: 1,
+          id: BONUS_ID,
+          zts: 'zts1znn',
+          amount: '100000000',
+          decimals: 8,
+          symbol: 'ZNN',
+          zenonToAddress: 'z1qrecipient',
+          createdAt: 1,
+          pendingZenonRedeemHash: 'zhash-bonus',
+        }]
+      : h.values.get(key) ?? null)
+    const {requestStore} = await import('./request-store')
+
+    const snapshot = await requestStore.getSnapshot()
+    expect(snapshot.zenonRedeems[BONUS_ID]).toMatchObject({hash: 'zhash-bonus'})
+    expect(pendingZenonRedeemFor(snapshot.zenonRedeems, MAIN_ID)).toBe('zhash-bonus')
+    expect(snapshot.zenonRedeems[HASH]).toMatchObject({
+      hash: 'zhash-bonus',
+      fence: true,
+    })
+  })
+
   it('clearing a bonus row leaves a genuinely-legacy bare-hash entry alone', async () => {
     const {requestStore} = await import('./request-store')
     const stored = h.values.get('nom-bridge:action-locks:v1') as

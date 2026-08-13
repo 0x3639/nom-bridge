@@ -267,10 +267,24 @@ async function ensureLocksLoaded(): Promise<PendingActionLocks> {
         const [rawHash, indexPart] = request.id.split(':')
         const indexNum = Number(indexPart)
         const isProvisionalIndex = !Number.isFinite(indexNum) || indexNum < 0
-        const key = isProvisionalIndex
-          ? normalizeEvmHash(rawHash)
-          : normalizeUnwrapLockKey(request.id)
-        locksMirror.zenonRedeems[key] ??= {hash: request.pendingZenonRedeemHash}
+        const legacyKey = normalizeEvmHash(rawHash)
+        if (isProvisionalIndex) {
+          locksMirror.zenonRedeems[legacyKey] ??= {hash: request.pendingZenonRedeemHash}
+        } else {
+          const key = normalizeUnwrapLockKey(request.id)
+          const own = locksMirror.zenonRedeems[key] ?? {
+            hash: request.pendingZenonRedeemHash,
+          }
+          locksMirror.zenonRedeems[key] ??= own
+
+          // Match setPendingZenonRedeem(): a node-indexed row also needs a
+          // marked bare-hash fence so a sibling main/bonus row cannot redeem
+          // concurrently. Preserve genuine unmarked legacy evidence.
+          const bare = locksMirror.zenonRedeems[legacyKey]
+          if (legacyKey !== key && (!bare || bare.fence === true)) {
+            locksMirror.zenonRedeems[legacyKey] = {...own, fence: true}
+          }
+        }
         delete request.pendingZenonRedeemHash
         migrated = true
       }

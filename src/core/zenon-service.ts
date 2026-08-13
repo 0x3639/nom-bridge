@@ -130,7 +130,14 @@ export class ZenonService {
       this.isInitialized = true
     })()
 
-    await this.initializePromise
+    try {
+      await this.initializePromise
+    } catch (error) {
+      // A rejected handshake must not remain cached: a later retry or
+      // changeNode() call needs to be able to start a fresh connection.
+      this.initializePromise = null
+      throw error
+    }
   }
 
   async ensureInitialized(): Promise<void> {
