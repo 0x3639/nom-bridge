@@ -224,3 +224,30 @@ describe('useBridge failure handling', () => {
     expect(isLoading.value).toBe(false)
   })
 })
+
+describe('useBridge metadata verification failures', () => {
+  it('surfaces the underlying RPC error when a pair cannot be verified', async () => {
+    getEvmTokenInfo.mockRejectedValue(new Error('HTTP request failed (429)'))
+    const {useBridge} = await import('./useBridge')
+    const {error, load} = useBridge()
+
+    await expect(load()).rejects.toThrow(
+      'Failed to verify bridge metadata for zts1znnxxxxxxxxxxxxx9z4ulx: HTTP request failed (429)',
+    )
+    expect(error.value).toContain('HTTP request failed (429)')
+  })
+
+  it('prefers a viem-style shortMessage over the verbose message', async () => {
+    const viemLike = Object.assign(new Error('HTTP request failed.\n\nURL: https://rpc\nRequest body: {...}'), {
+      shortMessage: 'HTTP request failed.',
+    })
+    getEvmTokenMetadata.mockRejectedValue(viemLike)
+    const {useBridge} = await import('./useBridge')
+    const {error, load} = useBridge()
+
+    await expect(load()).rejects.toThrow(
+      'Failed to verify bridge metadata for zts1znnxxxxxxxxxxxxx9z4ulx: HTTP request failed.',
+    )
+    expect(error.value).not.toContain('Request body')
+  })
+})
