@@ -131,9 +131,22 @@ describe('BridgeService.getWrapRequests', () => {
     h.getAllWrapTokenRequestsByToAddress.mockResolvedValue({count: 0, list: []})
     const {BridgeService} = await import('./bridge-service')
 
-    await BridgeService.getInstance().getWrapRequests('0xRecipient')
+    await BridgeService.getInstance().getWrapRequests('0xabc123')
 
-    expect(h.getAllWrapTokenRequestsByToAddress).toHaveBeenCalledWith('0xRecipient', 0, 50)
+    expect(h.getAllWrapTokenRequestsByToAddress).toHaveBeenCalledWith('0xabc123', 0, 50)
+  })
+
+  it('lowercases the EVM address: the node matches toAddress case-sensitively', async () => {
+    h.getAllWrapTokenRequestsByToAddress.mockResolvedValue({count: 0, list: []})
+    const {BridgeService} = await import('./bridge-service')
+
+    await BridgeService.getInstance().getWrapRequests('0x559D33eDb4BdE79A70Be70Db77bF27E7B86c5479')
+
+    expect(h.getAllWrapTokenRequestsByToAddress).toHaveBeenCalledWith(
+      '0x559d33edb4bde79a70be70db77bf27e7b86c5479',
+      0,
+      50,
+    )
   })
 })
 

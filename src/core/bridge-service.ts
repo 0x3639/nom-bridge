@@ -94,9 +94,11 @@ export class BridgeService {
     size = 50,
   ): Promise<WrapTokenRequestList> {
     await this.ensureInitialized()
+    // The node stores wrap toAddress lowercase and matches it case-sensitively;
+    // an EIP-55 checksummed address (as wallets report it) returns zero rows.
     return this.zenonService
       .getZenon()
-      .embedded.bridge.getAllWrapTokenRequestsByToAddress(evmToAddress, page, size)
+      .embedded.bridge.getAllWrapTokenRequestsByToAddress(evmToAddress.toLowerCase(), page, size)
   }
 
   async getUnwrapRequests(
