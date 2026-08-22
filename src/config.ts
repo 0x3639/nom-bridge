@@ -24,7 +24,7 @@ const mainnet: NetworkConfig = {
   evmChainId: 1,
   evmRpcUrls: [
     'https://ethereum-rpc.publicnode.com',
-    'https://eth.llamarpc.com',
+    'https://eth.drpc.org',
     'https://eth.merkle.io',
   ],
   evmExplorerTxUrl: 'https://etherscan.io/tx/',

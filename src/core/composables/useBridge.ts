@@ -42,6 +42,18 @@ export function validatePinnedNetwork(info: BridgeNetworkInfo): TokenPair[] {
   return supported
 }
 
+// viem errors carry a one-line shortMessage; their full message spans
+// several lines of request details that are noise in the UI.
+function describeCause(e: unknown): string {
+  if (e && typeof e === 'object') {
+    const short = (e as {shortMessage?: unknown}).shortMessage
+    if (typeof short === 'string' && short) return short
+    const msg = (e as {message?: unknown}).message
+    if (typeof msg === 'string' && msg) return msg
+  }
+  return String(e)
+}
+
 async function resolvePair(
   pair: TokenPair,
   bridgeAddress: Address,
@@ -64,8 +76,8 @@ async function resolvePair(
     native = resolved[0]
     evmToken = resolved[1]
     evmBridge = resolved[2]
-  } catch {
-    throw new Error(`Failed to verify bridge metadata for ${zts}`)
+  } catch (e) {
+    throw new Error(`Failed to verify bridge metadata for ${zts}: ${describeCause(e)}`)
   }
   if (native.decimals !== evmToken.decimals) {
     throw new Error(
