@@ -114,4 +114,8 @@ post-audit commit remains a release requirement.
 - Keep the pinned bridge and token configuration under code review.
 - Run tests, type checking, the production build, and dependency audit for every
   release.
+- The GitHub Pages workflow re-runs `npm run check` and
+  `npm run test:security` on the exact `main` commit before it uploads a Pages
+  artifact. The separate CI and Security workflows provide review feedback but
+  are not treated as cross-workflow deployment gates.
 - Publish the exact git commit and artifact hashes used by the deployment.

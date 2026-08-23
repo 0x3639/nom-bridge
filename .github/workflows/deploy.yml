@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    name: Build production bundle
+    name: Validate and build production bundle
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -40,10 +40,16 @@ jobs:
           VITE_WC_PROJECT_ID: ${{ secrets.VITE_WC_PROJECT_ID }}
         run: test -n "$VITE_WC_PROJECT_ID"
 
-      - name: Build
+      # CI and Security are independent push workflows, so their completion
+      # cannot gate this workflow directly. Re-run both release gates here on
+      # the exact commit and dependency set that will become the Pages artifact.
+      - name: Audit shipped dependencies
+        run: npm run test:security
+
+      - name: Validate and build release
         env:
           VITE_WC_PROJECT_ID: ${{ secrets.VITE_WC_PROJECT_ID }}
-        run: npm run build
+        run: npm run check
 
       # SPA fallback: the router uses web history, so a direct navigation to
       # /requests must serve index.html instead of GitHub Pages' 404.
