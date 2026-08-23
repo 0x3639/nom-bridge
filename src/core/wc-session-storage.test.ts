@@ -64,14 +64,22 @@ describe('createWcStorage', () => {
     expect(local.getItem('nom-bridge:requests')).toBe('{}')
   })
 
-  it('returns undefined (WalletConnect default storage) when sessionStorage is unavailable', () => {
+  it('falls back to an ephemeral in-memory store (never WalletConnect persistent default) when sessionStorage is unavailable', async () => {
+    const local = memoryStorage({'wc@2:client:0.3//session': '[]'})
     vi.stubGlobal('window', {
       get sessionStorage(): Storage {
         throw new Error('SecurityError')
       },
-      localStorage: memoryStorage(),
+      localStorage: local,
     })
 
-    expect(createWcStorage()).toBeUndefined()
+    const storage = createWcStorage()
+
+    await storage.setItem('k', {v: 1})
+    expect(await storage.getItem('k')).toEqual({v: 1})
+    expect(await storage.getKeys()).toEqual(['k'])
+    // Nothing reached a persistent store, and legacy state was still purged.
+    expect(local.getItem('wc@2:client:0.3//session')).toBeNull()
+    expect(local.length).toBe(0)
   })
 })

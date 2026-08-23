@@ -66,16 +66,30 @@ function purgeLegacyWcState(): void {
   }
 }
 
-// Undefined when sessionStorage cannot be used; the SignClient then falls back
-// to its default store rather than failing to initialize.
-export function createWcStorage(): IKeyValueStorage | undefined {
-  let session: Storage
-  try {
-    session = window.sessionStorage
-    if (!session) return undefined
-  } catch {
-    return undefined
+// Minimal Storage over a Map for contexts where sessionStorage is inaccessible
+// (e.g. site data blocked). Ephemeral by construction — the SignClient must
+// never fall through to its persistent default store (IndexedDB/localStorage).
+function memoryStorage(): Storage {
+  const map = new Map<string, string>()
+  return {
+    get length() {
+      return map.size
+    },
+    key: index => Array.from(map.keys())[index] ?? null,
+    getItem: key => map.get(key) ?? null,
+    setItem: (key, value) => void map.set(key, String(value)),
+    removeItem: key => void map.delete(key),
+    clear: () => map.clear(),
   }
+}
+
+export function createWcStorage(): IKeyValueStorage {
   purgeLegacyWcState()
-  return new SessionKeyValueStorage(session)
+  let backing: Storage | null = null
+  try {
+    backing = window.sessionStorage ?? null
+  } catch {
+    backing = null
+  }
+  return new SessionKeyValueStorage(backing ?? memoryStorage())
 }
