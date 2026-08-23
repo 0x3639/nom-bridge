@@ -25,7 +25,12 @@ const emit = defineEmits<{
 }>()
 
 const progress = computed(() =>
-  unwrapRequestProgress(props.request.status, props.pending, props.request.totalApprovals),
+  unwrapRequestProgress(
+    props.request.status,
+    props.pending,
+    props.request.totalApprovals,
+    props.request.finality,
+  ),
 )
 const badgeLabel = computed(() =>
   props.request.status === 'waiting'

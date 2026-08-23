@@ -57,6 +57,9 @@ export interface UnwrapRequestView {
   remainingSeconds?: number
   totalApprovals?: 2 | 3
   pendingZenonRedeemHash?: string
+  // Display-only Ethereum finality countdown while the node has not yet
+  // registered the event (status 'pending').
+  finality?: {confirmations: number; required: number; remainingSeconds: number}
 }
 
 export interface TrackedRequest {

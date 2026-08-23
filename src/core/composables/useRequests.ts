@@ -17,8 +17,10 @@ import {
 } from '../approval-ux'
 import {
   isNonceConsumed,
+  computeFinalityProgress,
   isRedeemStateAdvancedForStage,
   isRedeemStateUnclaimedForStage,
+  type FinalityProgress,
   type UnwrappedEventRecord,
 } from '../evm-service'
 export {normalizeEvmHash} from '../evm-hash'
@@ -66,6 +68,7 @@ let getEvmAddressFn: (() => string | null) | null = null
 let getBridgeFn: (() => string | null) | null = null
 let getZenonAddressFn: (() => string | null) | null = null
 let getMomentumTimeFn: (() => number) | null = null
+let getConfirmationsToFinalityFn: (() => number | null) | null = null
 let getTokenPairsFn: (() => TokenPairView[]) | null = null
 
 export function findTrackedUnwrapByHash(
@@ -283,6 +286,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const outcomes = new Map(
       outcomeEntries.map(([hash, result]) => [hash, result.outcome] as const),
     )
+    const confirmedBlocks = new Map(
+      outcomeEntries.flatMap(([hash, result]) =>
+        result.blockNumber !== undefined ? [[hash, result.blockNumber] as const] : [],
+      ),
+    )
 
     // Capture sender+nonce while a transaction is still visible on some RPC —
     // the only facts that can later PROVE a vanished hash is dead.
@@ -443,6 +451,21 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const zenonAddr = getZenonAddressFn?.() ?? null
     if (zenonAddr) {
       const momentumTime = getMomentumTimeFn?.() ?? DEFAULT_MOMENTUM_TIME
+      // Finality countdown inputs are fetched at most once per poll, and only
+      // when a confirmed-but-unregistered unwrap needs them. Display-only: a
+      // failed read just omits the countdown.
+      const required = getConfirmationsToFinalityFn?.() ?? null
+      let finalityContext: Promise<{currentBlock: bigint; blockTime: bigint} | null> | null = null
+      const finalityFor = async (receiptBlock: bigint): Promise<FinalityProgress | undefined> => {
+        if (required === null || !bridge) return undefined
+        finalityContext ??= Promise.all([
+          EvmService.getInstance().getBlockNumber(),
+          EvmService.getInstance().getEstimatedBlockTime(bridge as Address),
+        ]).then(([currentBlock, blockTime]) => ({currentBlock, blockTime})).catch(() => null)
+        const ctx = await finalityContext
+        if (!ctx) return undefined
+        return computeFinalityProgress(receiptBlock, ctx.currentBlock, required, ctx.blockTime)
+      }
       const list = await getAllUnwrapRequests(zenonAddr)
       const unwrapViews: UnwrapRequestView[] = []
       const nodeIds = new Set<string>()
@@ -556,6 +579,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
             }
           }
         }
+        const receiptBlock = confirmedBlocks.get(hash)
+        const finality =
+          outcome === 'confirmed' && receiptBlock !== undefined
+            ? await finalityFor(receiptBlock)
+            : undefined
         unwrapViews.push({
           id,
           transactionHash: hash,
@@ -568,6 +596,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           status: outcome === 'confirmed' ? 'pending' : 'submitted',
           totalApprovals: t.approvalCount,
           pendingZenonRedeemHash: pendingZenonRedeemFor(zenonRedeems, id),
+          ...(finality ? {finality} : {}),
         })
       }
 
@@ -613,12 +642,14 @@ export function useRequests() {
     getZenonAddress: () => string | null,
     getMomentumTime: () => number,
     getTokenPairs: () => TokenPairView[],
+    getConfirmationsToFinality: () => number | null = () => null,
   ): void {
     getEvmAddressFn = getEvmAddress
     getBridgeFn = getBridge
     getZenonAddressFn = getZenonAddress
     getMomentumTimeFn = getMomentumTime
     getTokenPairsFn = getTokenPairs
+    getConfirmationsToFinalityFn = getConfirmationsToFinality
     // Enforce durable safety records immediately — never wait for the first
     // full network poll to finish before the form can be gated.
     ensureLockSubscription()

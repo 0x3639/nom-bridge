@@ -6,7 +6,7 @@ import {useBridge, useEvmWallet, useRequests, useZenonWallet} from '@/core'
 import {isAffiliateBonusLogIndex} from '@/core/affiliate'
 import {formatAmount, truncateAddress} from '@/core/composables/utils/formatters'
 
-const {tokenPairs, bridgeAddress, momentumTime, error: bridgeError, load} = useBridge()
+const {tokenPairs, bridgeAddress, momentumTime, confirmationsToFinality, error: bridgeError, load} = useBridge()
 const {account: evmAccount} = useEvmWallet()
 const {address: zenonAddress} = useZenonWallet()
 const {
@@ -35,6 +35,7 @@ onMounted(async () => {
     () => zenonAddress.value,
     () => momentumTime.value,
     () => tokenPairs.value,
+    () => confirmationsToFinality.value,
   )
 })
 

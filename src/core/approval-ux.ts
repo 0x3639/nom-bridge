@@ -1,4 +1,5 @@
 import type {UnwrapStatus, WrapStatus} from '@/types'
+import type {FinalityProgress} from './evm-service'
 
 export type PendingRedeemPhase = 'wallet' | 'confirming'
 
@@ -169,10 +170,24 @@ export function wrapRequestProgress(
   }
 }
 
+function formatMinutes(seconds: number): string {
+  const minutes = Math.max(1, Math.ceil(seconds / 60))
+  return `~${minutes} min`
+}
+
+export function describeFinality(finality: FinalityProgress): string {
+  const count = `${finality.confirmations} / ${finality.required} Ethereum confirmations`
+  if (finality.confirmations >= finality.required) {
+    return `${count} · finalized. Waiting for the orchestrators to register the event on Zenon (usually a few minutes).`
+  }
+  return `${count} · ${formatMinutes(finality.remainingSeconds)} to finality. The Zenon node registers the event after the orchestrators see it finalized.`
+}
+
 export function unwrapRequestProgress(
   status: UnwrapStatus,
   pending?: PendingRedeemPhase,
   knownTotalApprovals?: 2 | 3,
+  finality?: FinalityProgress,
 ): RequestProgressCopy {
   const totalApprovals = knownTotalApprovals ?? 2
   const completedBeforeRedeem = totalApprovals - 1
@@ -213,7 +228,9 @@ export function unwrapRequestProgress(
       return {
         badge: 'Source confirmed',
         title: 'Waiting for Ethereum event indexing',
-        description: 'The bridge transfer is confirmed. The Zenon node is locating the event.',
+        description: finality
+          ? describeFinality(finality)
+          : 'The bridge transfer is confirmed. The Zenon node is locating the event.',
         actionable: false,
         completedApprovals: completedBeforeRedeem,
         totalApprovals,
