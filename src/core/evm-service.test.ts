@@ -68,8 +68,7 @@ describe('EvmService RPC transports', () => {
       expect(viem.http).toHaveBeenCalledWith(url, expect.objectContaining({retryCount: 0}))
       const calls = vi.mocked(viem.http).mock.calls.filter(([u]) => u === url)
       for (const [, opts] of calls) {
-        expect(opts?.timeout).toBeGreaterThan(0)
-        expect(opts?.timeout).toBeLessThanOrEqual(20_000)
+        expect(opts?.timeout).toBe(15_000)
       }
     }
     expect(viem.fallback).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({retryCount: 0}))
