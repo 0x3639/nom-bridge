@@ -2,7 +2,8 @@ import {SignClient} from '@walletconnect/sign-client'
 import type {SessionTypes} from '@walletconnect/types'
 import {AccountBlockTemplate, Address} from 'znn-typescript-sdk'
 import {config, WC_PROJECT_ID, ZENON_CHAIN} from '@/config'
-import {classifyWalletError, delay, WC_TIMING, withTimeout} from './wc-reliability'
+import {classifyWalletError, delay, WalletTimeoutError, WC_TIMING, withTimeout} from './wc-reliability'
+import {createWcStorage} from './wc-session-storage'
 
 const ZENON_NAMESPACE = {
   methods: ['znn_info', 'znn_sign', 'znn_send'],
@@ -66,6 +67,8 @@ export class ZenonWalletService {
   private async initClient(): Promise<SignClientInstance> {
     const client = await SignClient.init({
       projectId: WC_PROJECT_ID,
+      // Tab-scoped: a pairing must not outlive the tab (see wc-session-storage).
+      storage: createWcStorage(),
       metadata: {
         name: 'NoM Bridge',
         description: 'Zenon <-> EVM bridge',
@@ -88,8 +91,22 @@ export class ZenonWalletService {
     if (!isWcConfigured()) {
       throw new Error('WalletConnect is not configured — set VITE_WC_PROJECT_ID in .env (see .env.example)')
     }
-    await this.ensureSession()
-    return this.getInfo()
+    const reused = await this.ensureSession()
+    if (!reused) return this.getInfo()
+    try {
+      return await this.getInfo()
+    } catch (e) {
+      if (!(e instanceof WalletTimeoutError)) throw e
+      // A stored session the wallet no longer holds (Syrius or the machine
+      // restarted) never answers. Discard it and offer a fresh pairing instead
+      // of timing out on the dead topic on every Connect.
+      console.debug('[wc] stored session unresponsive, pairing afresh:', e.message)
+      const client = await this.getClient()
+      await client.session.delete(reused.topic, {code: 6000, message: 'Stale session'}).catch(() => undefined)
+      this.session = null
+      await this.ensureSession()
+      return this.getInfo()
+    }
   }
 
   // Non-interactive session restore for app startup: adopt a still-live
@@ -129,12 +146,13 @@ export class ZenonWalletService {
     return null
   }
 
-  private async ensureSession(): Promise<void> {
+  // Resolves to the reused stored session, or null when a fresh pairing was made.
+  private async ensureSession(): Promise<SessionTypes.Struct | null> {
     const client = await this.getClient()
     const existing = this.findLiveZenonSession(client)
     if (existing) {
       this.session = existing
-      return
+      return existing
     }
     let modal: {openModal: (opts: {uri: string}) => Promise<unknown>; closeModal: () => void} | null = null
     try {
@@ -167,6 +185,7 @@ export class ZenonWalletService {
       // then prefer the store's copy of the newest live zenon session.
       await delay(WC_TIMING.settleMs)
       this.session = this.findLiveZenonSession(client) ?? approved
+      return null
     } catch (e) {
       throw mapWcError(e)
     } finally {

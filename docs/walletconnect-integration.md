@@ -156,6 +156,14 @@ the WalletConnect session-event mechanism.)
   disconnected"`); handle the teardown cleanly.
 - The bridge reuses the most recent **non-expired** `zenon` session if one
   exists, so honor session `expiry` correctly.
+- The bridge's WalletConnect store is **tab-scoped** (`sessionStorage`): a
+  session survives a page refresh but ends when the tab or browser closes. Do
+  not expect a dApp session to be reusable across browser restarts; the wallet
+  may still hold it until `expiry` or a `session_delete`.
+- If a reused stored session never answers `znn_info` (request timeout —
+  typically the wallet or machine restarted and the wallet no longer holds the
+  session), the bridge deletes that session locally with reason code **6000**
+  (`"Stale session"`) and opens a fresh pairing.
 
 ---
 
