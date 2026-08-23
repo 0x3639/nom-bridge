@@ -13,6 +13,7 @@ import {
   shouldHandoffLocalWrapLock,
   unwrapRequestProgress,
   wrapRequestProgress,
+  describeAffiliateBonusRow,
 } from './approval-ux'
 
 describe('isUnwrapSourceConfirmed', () => {
@@ -160,6 +161,39 @@ describe('wrapRequestProgress', () => {
       title: 'Confirming final claim',
       completedApprovals: 2,
     })
+  })
+})
+
+describe('describeAffiliateBonusRow', () => {
+  it('explains why the bonus has its own countdown and redeem', () => {
+    expect(describeAffiliateBonusRow()).toBe(
+      '2% affiliate bonus for this bridge transfer. The bridge registers it as a separate request shortly after the main one, so its security delay ends a little later and it needs its own Syrius redeem.',
+    )
+  })
+})
+
+describe('unwrapRequestProgress finality countdown', () => {
+  it('shows confirmations and an estimate while finality is pending', () => {
+    expect(
+      unwrapRequestProgress('pending', undefined, 3, {confirmations: 81, required: 90, remainingSeconds: 108}),
+    ).toMatchObject({
+      title: 'Waiting for Ethereum event indexing',
+      description: '81 / 90 Ethereum confirmations · ~2 min to finality. The Zenon node registers the event after the orchestrators see it finalized.',
+    })
+  })
+
+  it('keeps required/required visible while the orchestrators register the event', () => {
+    expect(
+      unwrapRequestProgress('pending', undefined, 3, {confirmations: 90, required: 90, remainingSeconds: 0}),
+    ).toMatchObject({
+      description: '90 / 90 Ethereum confirmations · finalized. Waiting for the orchestrators to register the event on Zenon (usually a few minutes).',
+    })
+  })
+
+  it('falls back to the generic copy without finality data', () => {
+    expect(unwrapRequestProgress('pending', undefined, 3).description).toBe(
+      'The bridge transfer is confirmed. The Zenon node is locating the event.',
+    )
   })
 })
 

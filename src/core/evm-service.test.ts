@@ -479,6 +479,62 @@ describe('tssSignatureToHex', () => {
   })
 })
 
+describe('computeFinalityProgress', () => {
+  it('counts confirmations since the receipt block and estimates time to finality', async () => {
+    const {computeFinalityProgress} = await import('./evm-service')
+    expect(computeFinalityProgress(25814312n, 25814393n, 90, 12n)).toEqual({
+      confirmations: 81,
+      required: 90,
+      remainingSeconds: 108,
+    })
+  })
+
+  it('keeps showing required/required once finality is reached (orchestrators still pending)', async () => {
+    const {computeFinalityProgress} = await import('./evm-service')
+    expect(computeFinalityProgress(100n, 300n, 90, 12n)).toEqual({
+      confirmations: 90,
+      required: 90,
+      remainingSeconds: 0,
+    })
+  })
+
+  it('never goes negative when an RPC lags behind the receipt block', async () => {
+    const {computeFinalityProgress} = await import('./evm-service')
+    expect(computeFinalityProgress(100n, 98n, 90, 12n)).toEqual({
+      confirmations: 0,
+      required: 90,
+      remainingSeconds: 1080,
+    })
+  })
+})
+
+describe('pickConfirmedBlock', () => {
+  it('returns the highest block reported by a successful receipt so confirmations are conservative', async () => {
+    const {pickConfirmedBlock} = await import('./evm-service')
+    expect(pickConfirmedBlock([
+      {outcome: 'success', blockNumber: 100n},
+      {outcome: 'success', blockNumber: 101n},
+      {outcome: 'unavailable'},
+    ])).toBe(101n)
+  })
+
+  it('is undefined without a successful receipt', async () => {
+    const {pickConfirmedBlock} = await import('./evm-service')
+    expect(pickConfirmedBlock([{outcome: 'pending'}, {outcome: 'reverted', blockNumber: 5n}])).toBeUndefined()
+  })
+})
+
+describe('getAuthoritativeOutcomeWithFacts block number', () => {
+  it('exposes the confirmed receipt block', async () => {
+    h.publicClient.getTransactionReceipt.mockResolvedValue({status: 'success', blockNumber: 777n})
+    const {EvmService} = await import('./evm-service')
+
+    const result = await EvmService.getInstance().getAuthoritativeOutcomeWithFacts('0xabc')
+
+    expect(result).toMatchObject({outcome: 'confirmed', blockNumber: 777n})
+  })
+})
+
 describe('computeRemainingSeconds', () => {
   it('delay not elapsed → positive seconds including the +1 safety block', async () => {
     const {computeRemainingSeconds} = await import('./evm-service')

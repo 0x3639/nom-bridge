@@ -9,7 +9,7 @@ import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, Wra
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
-import {beneficiaryOf} from '../affiliate'
+import {AFFILIATE_LOG_INDEX_THRESHOLD, beneficiaryOf, isAffiliateBonusLogIndex} from '../affiliate'
 import {
   hasUnwrapProtocolAdvanced,
   hasWrapProtocolAdvanced,
@@ -17,8 +17,10 @@ import {
 } from '../approval-ux'
 import {
   isNonceConsumed,
+  computeFinalityProgress,
   isRedeemStateAdvancedForStage,
   isRedeemStateUnclaimedForStage,
+  type FinalityProgress,
   type UnwrappedEventRecord,
 } from '../evm-service'
 export {normalizeEvmHash} from '../evm-hash'
@@ -66,6 +68,7 @@ let getEvmAddressFn: (() => string | null) | null = null
 let getBridgeFn: (() => string | null) | null = null
 let getZenonAddressFn: (() => string | null) | null = null
 let getMomentumTimeFn: (() => number) | null = null
+let getConfirmationsToFinalityFn: (() => number | null) | null = null
 let getTokenPairsFn: (() => TokenPairView[]) | null = null
 
 export function findTrackedUnwrapByHash(
@@ -143,6 +146,34 @@ async function runPoll(): Promise<void> {
   const addr = getEvmAddressFn?.() ?? null
   const bridge = getBridgeFn?.() ?? null
   await poll(addr, bridge)
+}
+
+// Presentation order: each affiliate bonus row (logIndex + 4e9) directly
+// after its parent transfer so the two countdowns read as one transfer.
+// Rows are otherwise kept in their incoming order; an orphaned bonus (parent
+// not listed) stays where it is.
+export function orderUnwrapRequests(views: UnwrapRequestView[]): UnwrapRequestView[] {
+  const byId = new Map(views.map(view => [view.id, view]))
+  const bonuses = new Map<string, UnwrapRequestView[]>()
+  for (const view of views) {
+    if (!isAffiliateBonusLogIndex(view.logIndex)) continue
+    const parentId = `${view.transactionHash}:${view.logIndex - AFFILIATE_LOG_INDEX_THRESHOLD}`
+    if (!byId.has(parentId)) continue
+    bonuses.set(parentId, [...(bonuses.get(parentId) ?? []), view])
+  }
+  const parentOf = new Map<string, string>()
+  for (const [parentId, rows] of bonuses) for (const row of rows) parentOf.set(row.id, parentId)
+  // A transfer group (parent + bonuses) takes the slot of whichever member
+  // appears first in the incoming order.
+  const emitted = new Set<string>()
+  const ordered: UnwrapRequestView[] = []
+  for (const view of views) {
+    const groupId = parentOf.get(view.id) ?? view.id
+    if (emitted.has(groupId)) continue
+    emitted.add(groupId)
+    ordered.push(byId.get(groupId)!, ...(bonuses.get(groupId) ?? []))
+  }
+  return ordered
 }
 
 async function getAllWrapRequests(evmAddress: string): Promise<WrapTokenRequest[]> {
@@ -282,6 +313,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     )
     const outcomes = new Map(
       outcomeEntries.map(([hash, result]) => [hash, result.outcome] as const),
+    )
+    const confirmedBlocks = new Map(
+      outcomeEntries.flatMap(([hash, result]) =>
+        result.blockNumber !== undefined ? [[hash, result.blockNumber] as const] : [],
+      ),
     )
 
     // Capture sender+nonce while a transaction is still visible on some RPC —
@@ -443,6 +479,21 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const zenonAddr = getZenonAddressFn?.() ?? null
     if (zenonAddr) {
       const momentumTime = getMomentumTimeFn?.() ?? DEFAULT_MOMENTUM_TIME
+      // Finality countdown inputs are fetched at most once per poll, and only
+      // when a confirmed-but-unregistered unwrap needs them. Display-only: a
+      // failed read just omits the countdown.
+      const required = getConfirmationsToFinalityFn?.() ?? null
+      let finalityContext: Promise<{currentBlock: bigint; blockTime: bigint} | null> | null = null
+      const finalityFor = async (receiptBlock: bigint): Promise<FinalityProgress | undefined> => {
+        if (required === null || !bridge) return undefined
+        finalityContext ??= Promise.all([
+          EvmService.getInstance().getBlockNumber(),
+          EvmService.getInstance().getEstimatedBlockTime(bridge as Address),
+        ]).then(([currentBlock, blockTime]) => ({currentBlock, blockTime})).catch(() => null)
+        const ctx = await finalityContext
+        if (!ctx) return undefined
+        return computeFinalityProgress(receiptBlock, ctx.currentBlock, required, ctx.blockTime)
+      }
       const list = await getAllUnwrapRequests(zenonAddr)
       const unwrapViews: UnwrapRequestView[] = []
       const nodeIds = new Set<string>()
@@ -556,6 +607,11 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
             }
           }
         }
+        const receiptBlock = confirmedBlocks.get(hash)
+        const finality =
+          outcome === 'confirmed' && receiptBlock !== undefined
+            ? await finalityFor(receiptBlock)
+            : undefined
         unwrapViews.push({
           id,
           transactionHash: hash,
@@ -568,11 +624,14 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
           status: outcome === 'confirmed' ? 'pending' : 'submitted',
           totalApprovals: t.approvalCount,
           pendingZenonRedeemHash: pendingZenonRedeemFor(zenonRedeems, id),
+          ...(finality ? {finality} : {}),
         })
       }
 
       if (requestStore.getRevision() !== snapshot.revision) return false
-      if ((getZenonAddressFn?.() ?? '') === zenonAddr) unwrapRequests.value = unwrapViews
+      if ((getZenonAddressFn?.() ?? '') === zenonAddr) {
+        unwrapRequests.value = orderUnwrapRequests(unwrapViews)
+      }
     } else {
       unwrapRequests.value = []
     }
@@ -613,12 +672,14 @@ export function useRequests() {
     getZenonAddress: () => string | null,
     getMomentumTime: () => number,
     getTokenPairs: () => TokenPairView[],
+    getConfirmationsToFinality: () => number | null = () => null,
   ): void {
     getEvmAddressFn = getEvmAddress
     getBridgeFn = getBridge
     getZenonAddressFn = getZenonAddress
     getMomentumTimeFn = getMomentumTime
     getTokenPairsFn = getTokenPairs
+    getConfirmationsToFinalityFn = getConfirmationsToFinality
     // Enforce durable safety records immediately — never wait for the first
     // full network poll to finish before the form can be gated.
     ensureLockSubscription()

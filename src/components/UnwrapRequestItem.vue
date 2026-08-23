@@ -10,7 +10,7 @@ import {
   ItemTitle,
 } from 'nom-ui'
 import {formatAmount, formatCountdown, truncateAddress} from '@/core/composables/utils/formatters'
-import {unwrapRequestProgress, type PendingRedeemPhase} from '@/core/approval-ux'
+import {describeAffiliateBonusRow, unwrapRequestProgress, type PendingRedeemPhase} from '@/core/approval-ux'
 import {isAffiliateBonusLogIndex} from '@/core/affiliate'
 import type {UnwrapRequestView} from '@/types'
 
@@ -25,7 +25,12 @@ const emit = defineEmits<{
 }>()
 
 const progress = computed(() =>
-  unwrapRequestProgress(props.request.status, props.pending, props.request.totalApprovals),
+  unwrapRequestProgress(
+    props.request.status,
+    props.pending,
+    props.request.totalApprovals,
+    props.request.finality,
+  ),
 )
 const badgeLabel = computed(() =>
   props.request.status === 'waiting'
@@ -44,12 +49,13 @@ function redeem(): void {
     <ItemContent>
       <ItemTitle>
         {{ formatAmount(props.request.amount, props.request.decimals) }} {{ props.request.symbol }}
-        <Badge v-if="isBonus" variant="outline">Bonus</Badge>
+        <Badge v-if="isBonus" variant="outline">2% bonus</Badge>
         <Badge :variant="progress.actionable ? 'default' : 'secondary'">{{ badgeLabel }}</Badge>
       </ItemTitle>
       <ItemDescription class="space-y-1">
         <span class="block font-medium text-foreground">{{ progress.title }}</span>
         <span class="block">{{ progress.description }}</span>
+        <span v-if="isBonus" class="block">{{ describeAffiliateBonusRow() }}</span>
         <span class="block">To {{ truncateAddress(props.request.toAddress) }}</span>
       </ItemDescription>
     </ItemContent>

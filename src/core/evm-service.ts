@@ -109,6 +109,47 @@ export interface AuthoritativeOutcomeWithFacts {
   outcome: AuthoritativeEvmOutcome
   from?: string
   nonce?: number
+  // Block of the successful receipt (display-only: finality countdown).
+  blockNumber?: bigint
+}
+
+export interface FinalityProgress {
+  confirmations: number
+  required: number
+  remainingSeconds: number
+}
+
+// Display-only progress toward the orchestrators' Ethereum finality window.
+// Confirmations are clamped to [0, required] so a lagging RPC never shows a
+// negative count and a finalized event keeps reading required/required until
+// the node registers it.
+export function computeFinalityProgress(
+  receiptBlock: bigint,
+  currentBlock: bigint,
+  required: number,
+  estimatedBlockTime: bigint,
+): FinalityProgress {
+  const elapsed = currentBlock - receiptBlock
+  const clamped = elapsed < 0n ? 0n : elapsed > BigInt(required) ? BigInt(required) : elapsed
+  const confirmations = Number(clamped)
+  return {
+    confirmations,
+    required,
+    remainingSeconds: (required - confirmations) * Number(estimatedBlockTime),
+  }
+}
+
+// The HIGHEST receipt block across RPCs: a forked/lagging RPC reporting an
+// earlier block would otherwise overstate confirmations.
+export function pickConfirmedBlock(
+  results: Array<{outcome: EvmTransactionOutcome; blockNumber?: bigint}>,
+): bigint | undefined {
+  let best: bigint | undefined
+  for (const result of results) {
+    if (result.outcome !== 'success' || result.blockNumber === undefined) continue
+    if (best === undefined || result.blockNumber > best) best = result.blockNumber
+  }
+  return best
 }
 
 // On-chain redeem state for a wrap request id: 'unredeemed' — no claim ever
@@ -326,7 +367,12 @@ export class EvmService {
     )
     const outcome = collapseAuthoritativeOutcomes(results.map(result => result.outcome))
     const facts = corroborateTxFacts(results, this.outcomeClients.length)
-    return facts ? {outcome, from: facts.from, nonce: facts.nonce} : {outcome}
+    const blockNumber = outcome === 'confirmed' ? pickConfirmedBlock(results) : undefined
+    return {
+      outcome,
+      ...(facts ? {from: facts.from, nonce: facts.nonce} : {}),
+      ...(blockNumber !== undefined ? {blockNumber} : {}),
+    }
   }
 
   // Corroborated confirmed transaction count for dropped-tx evidence; null
@@ -410,10 +456,13 @@ export class EvmService {
   private async getTransactionOutcomeFrom(
     client: PublicClient,
     hash: Hex,
-  ): Promise<{outcome: EvmTransactionOutcome; from?: string; nonce?: number}> {
+  ): Promise<{outcome: EvmTransactionOutcome; from?: string; nonce?: number; blockNumber?: bigint}> {
     try {
       const receipt = await client.getTransactionReceipt({hash})
-      return {outcome: receipt.status === 'success' ? 'success' : 'reverted'}
+      return {
+        outcome: receipt.status === 'success' ? 'success' : 'reverted',
+        blockNumber: receipt.blockNumber,
+      }
     } catch (e) {
       if (!(e instanceof TransactionReceiptNotFoundError)) return {outcome: 'unavailable'}
       try {

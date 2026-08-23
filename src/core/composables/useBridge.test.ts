@@ -213,6 +213,27 @@ describe('useBridge token metadata and safety mapping', () => {
   })
 })
 
+describe('useBridge orchestrator finality', () => {
+  it('exposes confirmationsToFinality from the orchestrator info', async () => {
+    getOrchestratorInfo.mockResolvedValue({estimatedMomentumTime: 10, confirmationsToFinality: 90})
+    const {useBridge} = await import('./useBridge')
+    const {confirmationsToFinality, load} = useBridge()
+
+    await load()
+
+    expect(confirmationsToFinality.value).toBe(90)
+  })
+
+  it('leaves confirmationsToFinality null when the orchestrator does not report it', async () => {
+    const {useBridge} = await import('./useBridge')
+    const {confirmationsToFinality, load} = useBridge()
+
+    await load()
+
+    expect(confirmationsToFinality.value).toBeNull()
+  })
+})
+
 describe('useBridge failure handling', () => {
   it('sets error and rethrows when the node rejects', async () => {
     getNetworkInfo.mockRejectedValue(new Error('node unreachable'))

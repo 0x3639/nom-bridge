@@ -12,6 +12,9 @@ const tokenPairs = ref<TokenPairView[]>([])
 const halted = ref(false)
 const allowKeyGen = ref(false)
 const momentumTime = ref(DEFAULT_MOMENTUM_TIME)
+// Ethereum confirmations the orchestrators wait for before processing an
+// event; display-only (unwrap finality countdown). Null when unreported.
+const confirmationsToFinality = ref<number | null>(null)
 const isLoading = ref(false)
 const error = ref<string | null>(null)
 
@@ -139,6 +142,10 @@ async function load(force = false): Promise<void> {
     halted.value = info.halted
     allowKeyGen.value = info.allowKeyGen
     momentumTime.value = orch.estimatedMomentumTime || DEFAULT_MOMENTUM_TIME
+    confirmationsToFinality.value =
+      Number.isSafeInteger(orch.confirmationsToFinality) && orch.confirmationsToFinality > 0
+        ? orch.confirmationsToFinality
+        : null
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to load bridge network info'
     throw e
@@ -158,6 +165,7 @@ export function useBridge() {
     halted,
     allowKeyGen,
     momentumTime,
+    confirmationsToFinality,
     isLoading,
     error,
     load,

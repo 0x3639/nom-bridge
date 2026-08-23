@@ -39,6 +39,7 @@ const {
   halted,
   allowKeyGen,
   momentumTime,
+  confirmationsToFinality,
   error: bridgeError,
   load,
   refresh: refreshBridge,
@@ -946,6 +947,7 @@ onMounted(async () => {
     () => zenonAddress.value,
     () => momentumTime.value,
     () => tokenPairs.value,
+    () => confirmationsToFinality.value,
   )
 })
 

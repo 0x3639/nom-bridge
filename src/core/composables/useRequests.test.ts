@@ -6,6 +6,7 @@ import {
   findTrackedUnwrapByHash,
   matchesTrackedUnwrapEvent,
   normalizeEvmHash,
+  orderUnwrapRequests,
   reconcileUnknownWrapOperations,
 } from './useRequests'
 import type {UnwrapStatus} from '@/types'
@@ -264,5 +265,24 @@ describe('computeFinalUnwrapHashes', () => {
     const result = computeFinalUnwrapHashes([view('redeemed', OTHER), view('redeemable', HASH)])
     expect(result.has(normalizeEvmHash(OTHER))).toBe(true)
     expect(result.has(normalizeEvmHash(HASH))).toBe(false)
+  })
+})
+
+describe('orderUnwrapRequests', () => {
+  const view = (transactionHash: string, logIndex: number) =>
+    ({id: `${transactionHash}:${logIndex}`, transactionHash, logIndex}) as never
+
+  it('places each affiliate bonus row directly after its parent transfer', () => {
+    const ordered = orderUnwrapRequests([
+      view('0xaaa', 4_000_000_248),
+      view('0xbbb', 7),
+      view('0xaaa', 248),
+    ])
+    expect(ordered.map(v => v.id)).toEqual(['0xaaa:248', '0xaaa:4000000248', '0xbbb:7'])
+  })
+
+  it('keeps an orphaned bonus row (parent not listed) in place', () => {
+    const ordered = orderUnwrapRequests([view('0xbbb', 7), view('0xccc', 4_000_000_001)])
+    expect(ordered.map(v => v.id)).toEqual(['0xbbb:7', '0xccc:4000000001'])
   })
 })
