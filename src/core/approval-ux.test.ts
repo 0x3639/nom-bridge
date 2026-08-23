@@ -167,7 +167,7 @@ describe('wrapRequestProgress', () => {
 describe('describeAffiliateBonusRow', () => {
   it('explains why the bonus has its own countdown and redeem', () => {
     expect(describeAffiliateBonusRow()).toBe(
-      '2% affiliate bonus from the transfer above. The bridge registers it as a separate request shortly after the main one, so its security delay ends a little later and it needs its own Syrius redeem.',
+      '2% affiliate bonus for this bridge transfer. The bridge registers it as a separate request shortly after the main one, so its security delay ends a little later and it needs its own Syrius redeem.',
     )
   })
 })
