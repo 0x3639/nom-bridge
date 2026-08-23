@@ -26,6 +26,8 @@ vi.mock('viem', async (importOriginal) => {
   const actual = await importOriginal<typeof import('viem')>()
   return {
     ...actual,
+    http: vi.fn(actual.http),
+    fallback: vi.fn(actual.fallback),
     createPublicClient: vi.fn(() => h.publicClient),
     createWalletClient: vi.fn(() => h.walletClient),
   }
@@ -51,6 +53,27 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe('EvmService RPC transports', () => {
+  it('never sleeps on a rate-limited RPC: per-RPC transports use retryCount 0 and a bounded timeout', async () => {
+    const viem = await import('viem')
+    const {config} = await import('@/config')
+    const {EvmService} = await import('./evm-service')
+    EvmService.getInstance()
+
+    // A 429 with `Retry-After: 270` would otherwise make viem sleep 270 s per
+    // retry inside the quorum Promise.all, stalling every Requests poll.
+    for (const url of config.evmRpcUrls) {
+      expect(viem.http).toHaveBeenCalledWith(url, expect.objectContaining({retryCount: 0}))
+      const calls = vi.mocked(viem.http).mock.calls.filter(([u]) => u === url)
+      for (const [, opts] of calls) {
+        expect(opts?.timeout).toBeGreaterThan(0)
+        expect(opts?.timeout).toBeLessThanOrEqual(20_000)
+      }
+    }
+    expect(viem.fallback).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({retryCount: 0}))
+  })
 })
 
 describe('EvmService singleton', () => {

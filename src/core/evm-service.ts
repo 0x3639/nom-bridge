@@ -40,6 +40,14 @@ const bridgeAbi = parseAbi([
 
 export const UINT256_MAX = (1n << 256n) - 1n
 
+// Per-RPC transports must fail fast. viem honours a 429's `Retry-After`
+// header on retry (public RPCs send values in the hundreds of seconds), so a
+// rate-limited RPC with default retries would park a quorum Promise.all for
+// many minutes and stall every Requests poll. The fallback transport still
+// moves to the next RPC, and the quorum reads already treat a failed client
+// as non-responsive.
+export const RPC_TRANSPORT_OPTIONS = {retryCount: 0, timeout: 15_000} as const
+
 export type WrapRedeemProgress =
   | {kind: 'unredeemed'}
   | {kind: 'waiting-delay'; remainingSeconds: number}
@@ -234,11 +242,16 @@ export class EvmService {
   private constructor() {
     this.publicClient = createPublicClient({
       chain: CHAIN,
-      transport: fallback(config.evmRpcUrls.map(url => http(url))),
+      // The outer retry would sleep on a trailing 429's Retry-After as well;
+      // one pass over every RPC is the whole retry budget for a read.
+      transport: fallback(
+        config.evmRpcUrls.map(url => http(url, RPC_TRANSPORT_OPTIONS)),
+        {retryCount: 0},
+      ),
     })
     this.outcomeClients = config.evmRpcUrls.map(url => createPublicClient({
       chain: CHAIN,
-      transport: http(url),
+      transport: http(url, RPC_TRANSPORT_OPTIONS),
     }))
   }
 
