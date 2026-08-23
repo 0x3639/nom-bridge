@@ -60,7 +60,18 @@ function ensureLockSubscription(): void {
 // handler can source the SDK fields (amount/fee/signature/tokenAddress/toAddress).
 let rawById = new Map<string, WrapTokenRequest>()
 
-let intervalId: ReturnType<typeof setInterval> | null = null
+let intervalId: ReturnType<typeof setTimeout> | null = null
+let consecutivePollFailures = 0
+
+export const POLL_BASE_MS = 30_000
+export const POLL_MAX_MS = 300_000
+
+// Exponential backoff while polls fail (network down floods the console and
+// hammers dead RPCs at a fixed 30 s otherwise); one success resets to base.
+export function nextPollDelay(consecutiveFailures: number): number {
+  const factor = 2 ** Math.min(consecutiveFailures, 10)
+  return Math.min(POLL_BASE_MS * factor, POLL_MAX_MS)
+}
 let polling = false
 let rerunRequested = false
 let rerunWaiters: Array<{resolve: () => void; reject: (error: unknown) => void}> = []
@@ -685,11 +696,24 @@ export function useRequests() {
     ensureLockSubscription()
     void hydrateUnknownWraps()
     if (intervalId === null) {
-      intervalId = setInterval(() => {
-        void runPoll().catch(e => {
-          pollingError.value = e instanceof Error ? e.message : 'Failed to refresh requests'
-        })
-      }, 30_000)
+      const scheduleNext = (): void => {
+        intervalId = setTimeout(() => {
+          void runPoll()
+            .then(() => {
+              consecutivePollFailures = 0
+              pollingError.value = null
+            })
+            .catch(e => {
+              consecutivePollFailures += 1
+              pollingError.value = e instanceof Error ? e.message : 'Failed to refresh requests'
+            })
+            .finally(() => {
+              // Stopped while this poll ran — do not reschedule.
+              if (intervalId !== null) scheduleNext()
+            })
+        }, nextPollDelay(consecutivePollFailures))
+      }
+      scheduleNext()
     }
     isLoading.value = true
     void runPoll()
@@ -706,7 +730,7 @@ export function useRequests() {
 
   function stopPolling(): void {
     if (intervalId !== null) {
-      clearInterval(intervalId)
+      clearTimeout(intervalId)
       intervalId = null
     }
   }

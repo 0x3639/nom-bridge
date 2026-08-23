@@ -6,6 +6,7 @@ import {
   findTrackedUnwrapByHash,
   matchesTrackedUnwrapEvent,
   normalizeEvmHash,
+  nextPollDelay,
   orderUnwrapRequests,
   reconcileUnknownWrapOperations,
 } from './useRequests'
@@ -284,5 +285,16 @@ describe('orderUnwrapRequests', () => {
   it('keeps an orphaned bonus row (parent not listed) in place', () => {
     const ordered = orderUnwrapRequests([view('0xbbb', 7), view('0xccc', 4_000_000_001)])
     expect(ordered.map(v => v.id)).toEqual(['0xbbb:7', '0xccc:4000000001'])
+  })
+})
+
+describe('nextPollDelay', () => {
+  it('polls at the base interval while healthy and doubles per consecutive failure up to a cap', () => {
+    expect(nextPollDelay(0)).toBe(30_000)
+    expect(nextPollDelay(1)).toBe(60_000)
+    expect(nextPollDelay(2)).toBe(120_000)
+    expect(nextPollDelay(3)).toBe(240_000)
+    expect(nextPollDelay(4)).toBe(300_000)
+    expect(nextPollDelay(50)).toBe(300_000)
   })
 })
