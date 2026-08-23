@@ -31,6 +31,15 @@ Bridge availability and signing still depend on the Zenon orchestrator set.
 Users should expect finality delays and verify operator health at
 <https://status.bridge.zenon.community/>.
 
+An ambiguous wrap response leaves a durable duplicate-submit lock before the
+wallet call. Automatic recovery is deliberately stricter than ordinary reads:
+the pre-send account frontier is the highest height observed by both pinned
+Zenon RPCs, and the lock is released only when both RPCs return the same
+confirmed account-block hash, source account, bridge destination, token,
+amount, decoded EVM recipient/network tuple, and confirmation momentum. If
+either endpoint is unavailable or disagrees, reconciliation fails closed and
+the lock remains.
+
 ## Unwrap self-referral bonus
 
 On unwrap the app passes `<zenonAddress>&<zenonAddress>` as the bridge

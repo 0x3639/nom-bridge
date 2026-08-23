@@ -12,6 +12,11 @@ const h = vi.hoisted(() => {
   const redeem = vi.fn()
   const getByZts = vi.fn()
   const getAccountInfoByAddress = vi.fn()
+  const getFrontierAccountBlock = vi.fn()
+  const getAccountBlocksByPage = vi.fn()
+  const getNodeUrl = vi.fn()
+  const getZenonRpcFrontierHeight = vi.fn()
+  const getZenonRpcAccountBlock = vi.fn()
   const ensureInitialized = vi.fn().mockResolvedValue(undefined)
   const zenon = {
     embedded: {
@@ -24,9 +29,9 @@ const h = vi.hoisted(() => {
       },
       token: {getByZts},
     },
-    ledger: {getAccountInfoByAddress},
+    ledger: {getAccountInfoByAddress, getFrontierAccountBlock, getAccountBlocksByPage},
   }
-  const zenonService = {ensureInitialized, getZenon: vi.fn(() => zenon)}
+  const zenonService = {ensureInitialized, getZenon: vi.fn(() => zenon), getNodeUrl}
   const extractNumberDecimals = vi.fn()
   const parse = vi.fn()
   const hashParse = vi.fn()
@@ -45,11 +50,21 @@ const h = vi.hoisted(() => {
     addressParse,
     getByZts,
     getAccountInfoByAddress,
+    getFrontierAccountBlock,
+    getAccountBlocksByPage,
+    getNodeUrl,
+    getZenonRpcFrontierHeight,
+    getZenonRpcAccountBlock,
   }
 })
 
 vi.mock('./zenon-service', () => ({
   ZenonService: {getInstance: vi.fn(() => h.zenonService)},
+}))
+
+vi.mock('./zenon-rpc', () => ({
+  getZenonRpcFrontierHeight: h.getZenonRpcFrontierHeight,
+  getZenonRpcAccountBlock: h.getZenonRpcAccountBlock,
 }))
 
 vi.mock('znn-typescript-sdk', async importOriginal => {
@@ -59,6 +74,7 @@ vi.mock('znn-typescript-sdk', async importOriginal => {
     TokenStandard: {parse: h.parse},
     Hash: {parse: h.hashParse},
     Address: {parse: h.addressParse},
+    BlockTypeEnum: actual.BlockTypeEnum,
     // Real ABI machinery: the WrapToken calldata decode must be genuine.
     BridgeContract: actual.BridgeContract,
     BRIDGE_ADDRESS: actual.BRIDGE_ADDRESS,
@@ -78,6 +94,12 @@ beforeEach(() => {
   h.addressParse.mockReset()
   h.getByZts.mockReset()
   h.getAccountInfoByAddress.mockReset()
+  h.getFrontierAccountBlock.mockReset()
+  h.getAccountBlocksByPage.mockReset()
+  h.getNodeUrl.mockReset()
+  h.getNodeUrl.mockReturnValue(config.nodeUrl)
+  h.getZenonRpcFrontierHeight.mockReset()
+  h.getZenonRpcAccountBlock.mockReset()
   h.ensureInitialized.mockClear()
 })
 
@@ -164,6 +186,16 @@ describe('BridgeService token reads', () => {
     expect(h.getByZts).toHaveBeenCalledWith(parsed)
   })
 
+  it('fails closed when the Zenon token registry does not know the ZTS', async () => {
+    h.parse.mockReturnValue({zts: true})
+    h.getByZts.mockResolvedValue(null)
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().getTokenMetadata('zts1unknown')).rejects.toThrow(
+      'Unknown Zenon token zts1unknown',
+    )
+  })
+
   it('reads a scoped account balance by token standard', async () => {
     const parsed = {address: true}
     h.addressParse.mockReturnValue(parsed)
@@ -174,6 +206,202 @@ describe('BridgeService token reads', () => {
 
     await expect(BridgeService.getInstance().getTokenBalance('z1owner', 'zts1znn')).resolves.toBe(123n)
     expect(h.getAccountInfoByAddress).toHaveBeenCalledWith(parsed)
+  })
+
+  it('returns zero when the account has no balance entry for the token', async () => {
+    h.addressParse.mockReturnValue({address: true})
+    h.getAccountInfoByAddress.mockResolvedValue(null)
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(
+      BridgeService.getInstance().getTokenBalance('z1owner', 'zts1missing'),
+    ).resolves.toBe(0n)
+  })
+})
+
+describe('BridgeService Zenon corroboration', () => {
+  it('records the highest frontier observed by both configured RPCs', async () => {
+    const parsed = {toString: () => 'z1qsender'}
+    h.addressParse.mockReturnValue(parsed)
+    h.getFrontierAccountBlock.mockResolvedValue({
+      address: parsed,
+      height: 41,
+    })
+    h.getZenonRpcFrontierHeight.mockResolvedValue(43)
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().getAccountFrontierHeight('z1qsender')).resolves.toBe(43)
+    expect(h.getZenonRpcFrontierHeight).toHaveBeenCalledWith(
+      'wss://my.hc1node.com:35998',
+      'z1qsender',
+    )
+  })
+
+  it('fails closed when the corroborating frontier cannot be read', async () => {
+    const parsed = {toString: () => 'z1qsender'}
+    h.addressParse.mockReturnValue(parsed)
+    h.getFrontierAccountBlock.mockResolvedValue({address: parsed, height: 41})
+    h.getZenonRpcFrontierHeight.mockRejectedValue(new Error('secondary unavailable'))
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(
+      BridgeService.getInstance().getAccountFrontierHeight('z1qsender'),
+    ).rejects.toThrow('secondary unavailable')
+  })
+
+  it('rejects a primary frontier for a different account', async () => {
+    h.addressParse.mockReturnValue({toString: () => 'z1qsender'})
+    h.getFrontierAccountBlock.mockResolvedValue({
+      address: {toString: () => 'z1qother'},
+      height: 41,
+    })
+    h.getZenonRpcFrontierHeight.mockResolvedValue(41)
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(
+      BridgeService.getInstance().getAccountFrontierHeight('z1qsender'),
+    ).rejects.toThrow('invalid account frontier')
+  })
+
+  it('does not expose an unconfirmed primary block as reconciliation evidence', async () => {
+    const actual = await vi.importActual<typeof import('znn-typescript-sdk')>('znn-typescript-sdk')
+    const address = 'z1qsender'
+    const parsed = {toString: () => address}
+    h.addressParse.mockReturnValue(parsed)
+    h.getAccountBlocksByPage
+      .mockResolvedValueOnce({
+        list: [{
+          chainIdentifier: config.zenonChainId,
+          blockType: actual.BlockTypeEnum.UserSend,
+          hash: {toString: () => 'ab'.repeat(32)},
+          height: 42,
+          address: parsed,
+          toAddress: actual.BRIDGE_ADDRESS,
+          tokenStandard: {toString: () => 'zts1znn'},
+          amount: 150000000n,
+          data: Buffer.from([]),
+          confirmationDetail: undefined,
+        }],
+      })
+      .mockResolvedValue({list: []})
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().findWrapSendsAfter(address, 41)).resolves.toEqual([])
+    expect(h.getZenonRpcAccountBlock).not.toHaveBeenCalled()
+  })
+
+  it('counts a confirmed wrap only when the second RPC returns the exact same block tuple', async () => {
+    const actual = await vi.importActual<typeof import('znn-typescript-sdk')>('znn-typescript-sdk')
+    const hash = 'ab'.repeat(32)
+    const momentumHash = 'cd'.repeat(32)
+    const address = 'z1qsender'
+    const encoded = actual.BridgeContract.encodeCall('WrapToken', [2, 1, '0xRecipient'])
+    const data = Buffer.from(encoded.replace(/^0x/i, ''), 'hex')
+    const parsed = {toString: () => address}
+    h.addressParse.mockReturnValue(parsed)
+    h.getAccountBlocksByPage
+      .mockResolvedValueOnce({
+        list: [{
+          chainIdentifier: config.zenonChainId,
+          blockType: actual.BlockTypeEnum.UserSend,
+          hash: {toString: () => hash},
+          height: 42,
+          address: parsed,
+          toAddress: actual.BRIDGE_ADDRESS,
+          tokenStandard: {toString: () => 'zts1znn'},
+          amount: 150000000n,
+          data,
+          confirmationDetail: {
+            momentumHeight: 100,
+            momentumHash: {toString: () => momentumHash},
+            momentumTimestamp: 1_700_000_000,
+          },
+        }],
+      })
+      .mockResolvedValue({list: []})
+    h.getZenonRpcAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId,
+      blockType: actual.BlockTypeEnum.UserSend,
+      hash,
+      height: 42,
+      address,
+      toAddress: actual.BRIDGE_ADDRESS.toString(),
+      tokenStandard: 'zts1znn',
+      amount: '150000000',
+      data: data.toString('base64'),
+      confirmationDetail: {
+        numConfirmations: 2,
+        momentumHeight: 100,
+        momentumHash,
+        momentumTimestamp: 1_700_000_000,
+      },
+    })
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(BridgeService.getInstance().findWrapSendsAfter(address, 41)).resolves.toEqual([
+      expect.objectContaining({
+        hash,
+        height: 42,
+        zts: 'zts1znn',
+        amount: '150000000',
+        evmToAddress: '0xRecipient',
+        networkClass: 2,
+        chainId: 1,
+        corroborations: 2,
+      }),
+    ])
+  })
+
+  it('keeps a primary observation uncorroborated when the second RPC tuple differs', async () => {
+    const actual = await vi.importActual<typeof import('znn-typescript-sdk')>('znn-typescript-sdk')
+    const hash = 'ab'.repeat(32)
+    const momentumHash = 'cd'.repeat(32)
+    const address = 'z1qsender'
+    const encoded = actual.BridgeContract.encodeCall('WrapToken', [2, 1, '0xRecipient'])
+    const data = Buffer.from(encoded.replace(/^0x/i, ''), 'hex')
+    const parsed = {toString: () => address}
+    h.addressParse.mockReturnValue(parsed)
+    h.getAccountBlocksByPage
+      .mockResolvedValueOnce({
+        list: [{
+          chainIdentifier: config.zenonChainId,
+          blockType: actual.BlockTypeEnum.UserSend,
+          hash: {toString: () => hash},
+          height: 42,
+          address: parsed,
+          toAddress: actual.BRIDGE_ADDRESS,
+          tokenStandard: {toString: () => 'zts1znn'},
+          amount: 150000000n,
+          data,
+          confirmationDetail: {
+            momentumHeight: 100,
+            momentumHash: {toString: () => momentumHash},
+            momentumTimestamp: 1_700_000_000,
+          },
+        }],
+      })
+      .mockResolvedValue({list: []})
+    h.getZenonRpcAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId,
+      blockType: actual.BlockTypeEnum.UserSend,
+      hash,
+      height: 42,
+      address,
+      toAddress: actual.BRIDGE_ADDRESS.toString(),
+      tokenStandard: 'zts1znn',
+      amount: '1',
+      data: data.toString('base64'),
+      confirmationDetail: {
+        numConfirmations: 2,
+        momentumHeight: 100,
+        momentumHash,
+        momentumTimestamp: 1_700_000_000,
+      },
+    })
+    const {BridgeService} = await import('./bridge-service')
+
+    const [candidate] = await BridgeService.getInstance().findWrapSendsAfter(address, 41)
+    expect(candidate.corroborations).toBe(1)
   })
 })
 

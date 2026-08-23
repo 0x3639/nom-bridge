@@ -42,6 +42,8 @@ describe('network selection by MODE', () => {
     expect(config.zenonChainId).toBe(1)
     expect(config.zenonNetworkId).toBe(1)
     expect(config.evmChainId).toBe(1)
+    expect(new Set(config.zenonRpcUrls).size).toBeGreaterThanOrEqual(2)
+    expect(config.zenonRpcUrls).toContain(config.nodeUrl)
     expect(config.evmRpcUrls.length).toBeGreaterThan(1)
     expect(ZENON_CHAIN).toBe('zenon:1')
   })

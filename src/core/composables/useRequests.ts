@@ -23,6 +23,7 @@ import {
   type FinalityProgress,
   type UnwrappedEventRecord,
 } from '../evm-service'
+import {MIN_ZENON_RPC_CORROBORATIONS} from '../zenon-rpc'
 export {normalizeEvmHash} from '../evm-hash'
 import {createPollScheduler} from './poll-scheduler'
 
@@ -119,7 +120,9 @@ export function matchesTrackedUnwrapEvent(
 // amount wrap to another destination, an undecodable payload, or a wrong
 // chain never matches. Candidate blocks are consumed one-to-one (oldest
 // operation first) so a single published block can never clear multiple
-// ambiguous operations. A null frontier (pre-send read failed) never
+// ambiguous operations. The same block and tuple must be confirmed by at
+// least two configured Zenon RPCs; one node can never release the safety
+// record by itself. A null frontier (pre-send read failed) never
 // auto-reconciles. Returns the ids of proven operations.
 export function reconcileUnknownWrapOperations(
   operations: Array<{id: string} & UnknownWrapOperation>,
@@ -131,6 +134,7 @@ export function reconcileUnknownWrapOperations(
     evmToAddress: string | null
     networkClass: number | null
     chainId: number | null
+    corroborations: number
   }>,
   expected: {networkClass: number; evmChainId: number},
 ): string[] {
@@ -140,6 +144,7 @@ export function reconcileUnknownWrapOperations(
   for (const operation of ordered) {
     if (operation.frontierHeight === null) continue
     const index = availableBlocks.findIndex(block =>
+      block.corroborations >= MIN_ZENON_RPC_CORROBORATIONS &&
       block.height > (operation.frontierHeight as number) &&
       block.zts === operation.zts &&
       block.amount === operation.amount &&

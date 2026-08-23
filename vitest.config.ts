@@ -44,6 +44,7 @@ export default defineConfig({
         'src/core/amount.ts': {statements: 100, branches: 100, functions: 100, lines: 100},
         'src/core/approval-ux.ts': {statements: 100, branches: 100, functions: 100, lines: 100},
         'src/core/evm-hash.ts': {statements: 100, branches: 100, functions: 100, lines: 100},
+        'src/core/zenon-rpc.ts': {statements: 90, branches: 70, functions: 80, lines: 90},
         'src/core/wc-reliability.ts': {statements: 100, branches: 100, functions: 100, lines: 100},
         'src/core/request-store.ts': {statements: 95, branches: 80, functions: 90, lines: 95},
         'src/core/evm-service.ts': {statements: 90, branches: 85, functions: 90, lines: 90},

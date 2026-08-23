@@ -1,7 +1,19 @@
 import {ZenonService} from './zenon-service'
 import {config} from '@/config'
-import {Address, BRIDGE_ADDRESS, BridgeContract, Hash, TokenStandard} from 'znn-typescript-sdk'
+import {
+  Address,
+  BlockTypeEnum,
+  BRIDGE_ADDRESS,
+  BridgeContract,
+  Hash,
+  TokenStandard,
+} from 'znn-typescript-sdk'
 import {parseAmount} from './amount'
+import {
+  getZenonRpcAccountBlock,
+  getZenonRpcFrontierHeight,
+  type ZenonRpcAccountBlock,
+} from './zenon-rpc'
 import type {
   AccountBlockTemplate,
   BridgeInfo,
@@ -36,6 +48,82 @@ export function decodeWrapTokenCall(data: Buffer | Uint8Array | undefined): {
   } catch {
     return empty
   }
+}
+
+interface CorroboratedWrapSend {
+  hash: string
+  height: number
+  sourceAddress: string
+  zts: string
+  amount: string
+  evmToAddress: string | null
+  networkClass: number | null
+  chainId: number | null
+  confirmationMomentumHeight: number
+  confirmationMomentumHash: string
+  confirmationMomentumTimestamp: number
+  corroborations: number
+}
+
+function comparableRpcUrl(url: string): string {
+  return url.replace(/\/+$/, '').toLowerCase()
+}
+
+function secondaryRpcUrls(primaryUrl: string): string[] {
+  const primary = comparableRpcUrl(primaryUrl)
+  const unique = new Map(
+    config.zenonRpcUrls.map(url => [comparableRpcUrl(url), url] as const),
+  )
+  unique.delete(primary)
+  return [...unique.values()]
+}
+
+function wrapSendFingerprint(candidate: CorroboratedWrapSend): string {
+  return JSON.stringify([
+    config.zenonChainId,
+    BlockTypeEnum.UserSend,
+    candidate.hash.toLowerCase(),
+    candidate.height,
+    candidate.sourceAddress,
+    BRIDGE_ADDRESS.toString(),
+    candidate.zts,
+    candidate.amount,
+    candidate.evmToAddress?.toLowerCase() ?? null,
+    candidate.networkClass,
+    candidate.chainId,
+    candidate.confirmationMomentumHeight,
+    candidate.confirmationMomentumHash,
+    candidate.confirmationMomentumTimestamp,
+  ])
+}
+
+function rpcWrapSendFingerprint(block: ZenonRpcAccountBlock): string | null {
+  const confirmation = block.confirmationDetail
+  if (!confirmation) return null
+  const decoded = decodeWrapTokenCall(Buffer.from(block.data, 'base64'))
+  return JSON.stringify([
+    block.chainIdentifier,
+    block.blockType,
+    block.hash,
+    block.height,
+    block.address,
+    block.toAddress,
+    block.tokenStandard,
+    block.amount,
+    decoded.evmToAddress?.toLowerCase() ?? null,
+    decoded.networkClass,
+    decoded.chainId,
+    confirmation.momentumHeight,
+    confirmation.momentumHash,
+    confirmation.momentumTimestamp,
+  ])
+}
+
+function matchesCorroboratingBlock(
+  candidate: CorroboratedWrapSend,
+  block: ZenonRpcAccountBlock,
+): boolean {
+  return rpcWrapSendFingerprint(block) === wrapSendFingerprint(candidate)
 }
 
 export class BridgeService {
@@ -127,10 +215,26 @@ export class BridgeService {
   // an ambiguous submission can later be reconciled against blocks above it.
   async getAccountFrontierHeight(address: string): Promise<number> {
     await this.ensureInitialized()
-    const frontier = await this.zenonService
+    const primaryUrl = this.zenonService.getNodeUrl()
+    const frontierPromise = this.zenonService
       .getZenon()
       .ledger.getFrontierAccountBlock(Address.parse(address))
-    return frontier?.height ?? 0
+    const [frontier, ...secondaryHeights] = await Promise.all([
+      frontierPromise,
+      ...secondaryRpcUrls(primaryUrl).map(url => getZenonRpcFrontierHeight(url, address)),
+    ])
+    let primaryHeight = 0
+    if (frontier) {
+      if (
+        frontier.address.toString() !== address ||
+        !Number.isSafeInteger(frontier.height) ||
+        frontier.height < 0
+      ) {
+        throw new Error('Primary Zenon RPC returned an invalid account frontier')
+      }
+      primaryHeight = frontier.height
+    }
+    return Math.max(primaryHeight, ...secondaryHeights)
   }
 
   // Sends from `address` to the embedded bridge contract with height above
@@ -143,27 +247,12 @@ export class BridgeService {
   async findWrapSendsAfter(
     address: string,
     afterHeight: number,
-  ): Promise<Array<{
-    hash: string
-    height: number
-    zts: string
-    amount: string
-    evmToAddress: string | null
-    networkClass: number | null
-    chainId: number | null
-  }>> {
+  ): Promise<CorroboratedWrapSend[]> {
     await this.ensureInitialized()
     const ledger = this.zenonService.getZenon().ledger
+    const primaryUrl = this.zenonService.getNodeUrl()
     const parsed = Address.parse(address)
-    const results: Array<{
-      hash: string
-      height: number
-      zts: string
-      amount: string
-      evmToAddress: string | null
-      networkClass: number | null
-      chainId: number | null
-    }> = []
+    const results: CorroboratedWrapSend[] = []
     for (let page = 0; page < 20; page += 1) {
       const response = await ledger.getAccountBlocksByPage(parsed, page, 50)
       const blocks = response.list ?? []
@@ -174,14 +263,35 @@ export class BridgeService {
           reachedBaseline = true
           continue
         }
+        if (block.chainIdentifier !== config.zenonChainId) continue
+        if (block.blockType !== BlockTypeEnum.UserSend) continue
+        if (block.address.toString() !== address) continue
         if (block.toAddress.toString() !== BRIDGE_ADDRESS.toString()) continue
-        results.push({
+        const confirmation = block.confirmationDetail
+        if (!confirmation) continue
+        const candidate: CorroboratedWrapSend = {
           hash: block.hash.toString(),
           height: block.height,
+          sourceAddress: address,
           zts: block.tokenStandard.toString(),
           amount: block.amount.toString(),
           ...decodeWrapTokenCall(block.data),
-        })
+          confirmationMomentumHeight: confirmation.momentumHeight,
+          confirmationMomentumHash: confirmation.momentumHash.toString(),
+          confirmationMomentumTimestamp: confirmation.momentumTimestamp,
+          corroborations: 1,
+        }
+        const observations = await Promise.all(
+          secondaryRpcUrls(primaryUrl).map(url =>
+            getZenonRpcAccountBlock(url, candidate.hash).catch(() => null),
+          ),
+        )
+        for (const observation of observations) {
+          if (observation && matchesCorroboratingBlock(candidate, observation)) {
+            candidate.corroborations += 1
+          }
+        }
+        results.push(candidate)
       }
       if (reachedBaseline) break
     }

@@ -93,6 +93,7 @@ describe('reconcileUnknownWrapOperations', () => {
     evmToAddress: string | null
     networkClass: number | null
     chainId: number | null
+    corroborations: number
   }> = {}) => ({
     hash: 'blockhash-1',
     height: 42,
@@ -101,12 +102,21 @@ describe('reconcileUnknownWrapOperations', () => {
     evmToAddress: '0xrecipient',
     networkClass: 2,
     chainId: 1,
+    corroborations: 2,
     ...overrides,
   })
   const expected = {networkClass: 2, evmChainId: 1}
 
   it('reconciles an operation against an account-chain wrap send above its frontier', () => {
     expect(reconcileUnknownWrapOperations([operation()], [block()], expected)).toEqual(['op-1'])
+  })
+
+  it('does not release a safety record from one uncorroborated RPC observation', () => {
+    expect(reconcileUnknownWrapOperations(
+      [operation()],
+      [block({corroborations: 1})],
+      expected,
+    )).toEqual([])
   })
 
   it('ignores blocks at or below the recorded frontier or with a different tuple', () => {
