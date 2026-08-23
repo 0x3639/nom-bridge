@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import PairingDialog from '@/components/PairingDialog.vue'
 import {computed, nextTick, onMounted, onUnmounted, ref, watch} from 'vue'
 import {
   Alert,
@@ -957,6 +958,7 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <PairingDialog />
   <div class="space-y-4">
     <Card class="overflow-hidden rounded-[18px] border-border/80 bg-card shadow-2xl shadow-black/20">
       <CardContent class="space-y-4 !p-5">

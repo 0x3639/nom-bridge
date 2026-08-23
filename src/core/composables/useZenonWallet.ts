@@ -1,11 +1,14 @@
 import {ref} from 'vue'
-import {ZenonWalletService} from '../zenon-wallet-service'
+import {PairingCancelledError, ZenonWalletService} from '../zenon-wallet-service'
 import {BridgeService} from '../bridge-service'
 import type {AccountBlockTemplate} from 'znn-typescript-sdk'
 
 const address = ref<string | null>(null)
 const isConnecting = ref(false)
 const error = ref<string | null>(null)
+// Non-null while a fresh WalletConnect pairing awaits approval in Syrius;
+// PairingDialog renders it as a QR code + copyable URI.
+const pairingUri = ref<string | null>(null)
 
 const service = ZenonWalletService.getInstance()
 service.onDisconnect = () => {
@@ -13,6 +16,12 @@ service.onDisconnect = () => {
 }
 service.onInfoChange = info => {
   address.value = info.address
+}
+service.onPairingUri = uri => {
+  pairingUri.value = uri
+}
+service.onPairingClosed = () => {
+  pairingUri.value = null
 }
 
 // Adopt a still-live WalletConnect session on app load so a page refresh
@@ -32,6 +41,8 @@ export function useZenonWallet() {
       const info = await service.connect()
       address.value = info.address
     } catch (e) {
+      // Closing the pairing dialog is a normal outcome, not a failure.
+      if (e instanceof PairingCancelledError) return
       error.value = e instanceof Error ? e.message : 'Failed to connect Zenon wallet'
       throw e
     } finally {
@@ -44,6 +55,10 @@ export function useZenonWallet() {
     return service.send(address.value, block)
   }
 
+  function cancelPairing(): void {
+    service.cancelPairing()
+  }
+
   async function disconnect(): Promise<void> {
     await service.disconnect()
     address.value = null
@@ -54,5 +69,15 @@ export function useZenonWallet() {
     return BridgeService.getInstance().getTokenBalance(address.value, zts)
   }
 
-  return {address, isConnecting, error, connect, send, disconnect, getTokenBalance}
+  return {
+    address,
+    isConnecting,
+    error,
+    pairingUri,
+    connect,
+    cancelPairing,
+    send,
+    disconnect,
+    getTokenBalance,
+  }
 }

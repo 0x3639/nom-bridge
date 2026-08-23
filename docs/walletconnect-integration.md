@@ -4,9 +4,14 @@
 **Purpose:** define exactly what your WalletConnect integration must expose so the
 NoM Bridge dApp can connect to it and submit bridge transactions.
 
-The bridge is a WalletConnect **v2 Sign** dApp (`@walletconnect/sign-client` +
-`@walletconnect/modal`). Everything below is derived from the bridge's actual
-client code (`src/core/zenon-wallet-service.ts`), not a wish-list.
+The bridge is a WalletConnect **v2 Sign** dApp built directly on
+`@walletconnect/sign-client` (the protocol-level client Reown still maintains).
+It does **not** use Reown AppKit or the deprecated `@walletconnect/modal`: the
+pairing URI is rendered in-app as a QR code plus a copyable `wc:` link
+(`src/components/PairingDialog.vue`), so your wallet must accept a pairing by
+**scanning a QR** or by **pasting the URI** — there is no wallet-explorer
+listing or deep link involved. Everything below is derived from the bridge's
+actual client code (`src/core/zenon-wallet-service.ts`), not a wish-list.
 
 ---
 

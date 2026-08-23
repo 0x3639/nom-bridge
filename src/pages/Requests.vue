@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import PairingDialog from '@/components/PairingDialog.vue'
 import {onMounted, onUnmounted, watch} from 'vue'
 import {Alert, AlertDescription, AlertTitle, Badge, Card, CardContent, CardHeader, CardTitle} from 'nom-ui'
 import {config} from '@/config'
@@ -43,6 +44,7 @@ onUnmounted(stopPolling)
 </script>
 
 <template>
+  <PairingDialog />
   <Card>
     <CardHeader>
       <CardTitle>Bridge history</CardTitle>
