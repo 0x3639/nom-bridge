@@ -172,6 +172,53 @@ describe('describeAffiliateBonusRow', () => {
   })
 })
 
+describe('step badges count wallet approvals consistently in both directions', () => {
+  it('wrap: the first claim badge counts approvals, not claims', () => {
+    expect(wrapRequestProgress('redeemable').badge).toBe('Step 2 of 3 ready')
+    expect(wrapRequestProgress('redeemable-2').badge).toBe('Step 3 of 3 ready')
+  })
+
+  it.each([
+    [2, 'submitted', 'Step 1 of 2 · confirming'],
+    [2, 'pending', '1 of 2 confirmed'],
+    [2, 'signing', '1 of 2 confirmed'],
+    [2, 'waiting', '1 of 2 confirmed'],
+    [2, 'redeemable', 'Step 2 of 2 ready'],
+    [2, 'redeemed', '2 of 2 confirmed'],
+    [3, 'submitted', 'Step 2 of 3 · confirming'],
+    [3, 'pending', '2 of 3 confirmed'],
+    [3, 'redeemable', 'Step 3 of 3 ready'],
+    [3, 'redeemed', '3 of 3 confirmed'],
+  ] as const)('unwrap with %i known approvals: %s → "%s"', (total, status, badge) => {
+    expect(unwrapRequestProgress(status, undefined, total).badge).toBe(badge)
+  })
+
+  it('unwrap: wallet/confirming phases are numbered when the total is known', () => {
+    expect(unwrapRequestProgress('redeemable', 'wallet', 3).badge).toBe('Step 3 of 3')
+    expect(unwrapRequestProgress('redeemable', 'confirming', 2).badge).toBe('Step 2 of 2')
+    expect(unwrapRequestProgress('redeemable', 'wallet', 3).action).toBe('Waiting for Syrius…')
+  })
+
+  it('unwrap: keeps neutral wording when the approval count is unknown (node-only rows)', () => {
+    expect(unwrapRequestProgress('submitted').badge).toBe('Submitted')
+    expect(unwrapRequestProgress('pending').badge).toBe('Source confirmed')
+    expect(unwrapRequestProgress('redeemable').badge).toBe('Final redemption ready')
+    expect(unwrapRequestProgress('redeemable', 'wallet').badge).toBe('Final approval')
+    expect(unwrapRequestProgress('redeemed').badge).toBe('Complete')
+    expect(unwrapRequestProgress('redeemable').action).toBe('Redeem on Zenon · Final step')
+  })
+
+  it('unwrap: the redeem action names the step when the total is known', () => {
+    expect(unwrapRequestProgress('redeemable', undefined, 3).action).toBe('Redeem on Zenon · Step 3/3')
+    expect(unwrapRequestProgress('redeemable', undefined, 2).action).toBe('Redeem on Zenon · Step 2/2')
+  })
+
+  it('unwrap: terminal non-success states stay descriptive', () => {
+    expect(unwrapRequestProgress('revoked', undefined, 3).badge).toBe('Revoked')
+    expect(unwrapRequestProgress('broken', undefined, 3).badge).toBe('Support required')
+  })
+})
+
 describe('unwrapRequestProgress finality countdown', () => {
   it('shows confirmations and an estimate while finality is pending', () => {
     expect(
@@ -212,7 +259,7 @@ describe('unwrapRequestProgress', () => {
   it('identifies the final Zenon action without calling it a generic redeem', () => {
     expect(unwrapRequestProgress('redeemable', undefined, 3)).toMatchObject({
       title: 'Redeem on Zenon',
-      action: 'Redeem on Zenon · Final step',
+      action: 'Redeem on Zenon · Step 3/3',
       actionable: true,
     })
   })
