@@ -3,7 +3,8 @@ import {readonly, ref} from 'vue'
 export interface BridgeSubmitIntent {
   direction: 'wrap' | 'unwrap'
   zts: string
-  amount: string
+  amount: bigint
+  decimals: number
   evmAccount: string
   zenonAddress: string
   evmChainId: number | null
@@ -23,6 +24,7 @@ export function sameBridgeSubmitIntent(
     left.direction === right.direction &&
     left.zts === right.zts &&
     left.amount === right.amount &&
+    left.decimals === right.decimals &&
     left.evmAccount.toLowerCase() === right.evmAccount.toLowerCase() &&
     left.zenonAddress === right.zenonAddress &&
     left.evmChainId === right.evmChainId &&

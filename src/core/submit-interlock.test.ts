@@ -8,7 +8,8 @@ import {
 const intent = (overrides: Partial<BridgeSubmitIntent> = {}): BridgeSubmitIntent => ({
   direction: 'wrap',
   zts: 'zts1znn',
-  amount: '1.25',
+  amount: 125000000n,
+  decimals: 8,
   evmAccount: '0xA98706106f7710d743186031be2245F33acEA106',
   zenonAddress: 'z1qsender',
   evmChainId: 1,
@@ -61,7 +62,8 @@ describe('sameBridgeSubmitIntent', () => {
   it.each([
     {field: 'direction', change: {direction: 'unwrap' as const}},
     {field: 'token', change: {zts: 'zts1qsr'}},
-    {field: 'amount', change: {amount: '2'}},
+    {field: 'amount', change: {amount: 200000000n}},
+    {field: 'decimals', change: {decimals: 18}},
     {field: 'EVM account', change: {evmAccount: '0x0000000000000000000000000000000000000001'}},
     {field: 'Zenon account', change: {zenonAddress: 'z1qother'}},
     {field: 'EVM chain', change: {evmChainId: 5}},

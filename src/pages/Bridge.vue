@@ -10,7 +10,17 @@ import {
 } from 'nom-ui'
 import {ArrowUpDown, Clock3, Wallet} from 'lucide-vue-next'
 import TransferProgress from '@/components/TransferProgress.vue'
-import {useBridge, useEvmWallet, useRequests, useUnwrap, useWrap, useZenonWallet} from '@/core'
+import {
+  createSubmitInterlock,
+  sameBridgeSubmitIntent,
+  type BridgeSubmitIntent,
+  useBridge,
+  useEvmWallet,
+  useRequests,
+  useUnwrap,
+  useWrap,
+  useZenonWallet,
+} from '@/core'
 import {
   approvalPlan,
   isAuthoritativeLockHash,
@@ -23,11 +33,6 @@ import {
 import {selfReferralPayout} from '@/core/affiliate'
 import {normalizeEvmHash} from '@/core/evm-hash'
 import {EvmSubmissionError} from '@/core/evm-service'
-import {
-  createSubmitInterlock,
-  sameBridgeSubmitIntent,
-  type BridgeSubmitIntent,
-} from '@/core/submit-interlock'
 import {ZenonSubmissionError} from '@/core/zenon-wallet-service'
 import type {UnwrapRequestView, WrapRequestView} from '@/types'
 import type {Address} from 'viem'
@@ -647,11 +652,18 @@ function captureSubmitIntent(): BridgeSubmitIntent | null {
   const bridge = bridgeAddress.value
   if (!pair || !amount.value || !evm || !zenon) return null
   if (direction.value === 'unwrap' && !bridge) return null
+  let baseAmount: bigint
+  try {
+    baseAmount = parseAmount(amount.value, pair.decimals)
+  } catch {
+    return null
+  }
 
   return {
     direction: direction.value,
     zts: pair.zts,
-    amount: amount.value,
+    amount: baseAmount,
+    decimals: pair.decimals,
     evmAccount: evm,
     zenonAddress: zenon,
     evmChainId: evmChainId.value,
@@ -689,12 +701,21 @@ async function onSubmitLocked(intent: BridgeSubmitIntent): Promise<void> {
     }
     const pair = tokenPairs.value.find(candidate => candidate.zts === intent.zts)
     if (!pair || !pair.wrapEnabled) throw new Error('Wrapping is disabled for this token pair')
-    const base = parseAmount(intent.amount, pair.decimals)
+    const base = intent.amount
     if (base < pair.wrapMinAmount) throw new Error('Amount is below the current wrap minimum')
+    await refreshBalances()
+    assertSubmitIntentUnchanged(intent)
+    const refreshedBalance = zenonBalance.value
+    if (refreshedBalance === undefined) {
+      throw new Error('Could not refresh the Zenon balance; the wrap was not submitted')
+    }
+    if (base > refreshedBalance) {
+      throw new Error('Zenon balance changed and is now insufficient for this wrap')
+    }
     const {id: hash, trackingFailed} = await wrap(
       intent.evmAccount,
-      intent.amount,
-      pair.decimals,
+      formatAmount(base, intent.decimals),
+      intent.decimals,
       pair.zts,
       pair.symbol,
       intent.zenonAddress,
@@ -738,8 +759,17 @@ async function onUnwrapSubmit(intent: BridgeSubmitIntent): Promise<void> {
     }
     const pair = tokenPairs.value.find(candidate => candidate.zts === intent.zts)
     if (!pair || !pair.unwrapEnabled) throw new Error('Unwrapping is disabled for this token pair')
-    const base = parseAmount(intent.amount, pair.decimals)
+    const base = intent.amount
     if (base < pair.unwrapMinAmount) throw new Error('Amount is below the current unwrap minimum')
+    await refreshBalances()
+    assertSubmitIntentUnchanged(intent)
+    const refreshedBalance = evmBalance.value
+    if (refreshedBalance === undefined) {
+      throw new Error('Could not refresh the EVM token balance; the unwrap was not submitted')
+    }
+    if (base > refreshedBalance) {
+      throw new Error('EVM token balance changed and is now insufficient for this unwrap')
+    }
     const result = await doUnwrap(
       pair.tokenAddress as Address,
       base,
