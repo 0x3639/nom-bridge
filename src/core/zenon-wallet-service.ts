@@ -21,6 +21,12 @@ export interface ZenonWalletInfo {
   nodeUrl?: string
 }
 
+// `wc:<pairingTopic>@2?...` — the topic the wallet would pair on.
+export function pairingTopicOf(uri: string): string | null {
+  const match = /^wc:([0-9a-f]+)@\d/i.exec(uri)
+  return match ? match[1] : null
+}
+
 // The user closed the pairing dialog before Syrius approved. A rejection
 // (no session, nothing signed) that callers treat as "nothing happened".
 export class PairingCancelledError extends Error {
@@ -183,10 +189,34 @@ export class ZenonWalletService {
         pairingShown = true
         this.onPairingUri?.(uri)
       }
-      const approved = await Promise.race([
-        withTimeout(approval(), WC_TIMING.approvalTimeoutMs, 'Wallet approval'),
-        cancelled,
-      ])
+      const approvalPromise = approval()
+      let cancelledEarly = false
+      // Racing does not stop approval(): if Syrius approves after the user
+      // cancelled, the session would land in the store and be silently reused
+      // by the next connect(). Tear it down instead.
+      void approvalPromise.then(
+        session => {
+          if (!cancelledEarly) return
+          void client
+            .disconnect({topic: session.topic, reason: {code: 6000, message: 'Pairing cancelled'}})
+            .catch(() => undefined)
+        },
+        () => undefined,
+      )
+      let approved: SessionTypes.Struct
+      try {
+        approved = await Promise.race([
+          withTimeout(approvalPromise, WC_TIMING.approvalTimeoutMs, 'Wallet approval'),
+          cancelled,
+        ])
+      } catch (e) {
+        if (e instanceof PairingCancelledError && uri) {
+          cancelledEarly = true
+          const topic = pairingTopicOf(uri)
+          if (topic) await client.core.pairing.disconnect({topic}).catch(() => undefined)
+        }
+        throw e
+      }
       // The SignClient session store lags behind approval(); give it a moment,
       // then prefer the store's copy of the newest live zenon session.
       await delay(WC_TIMING.settleMs)

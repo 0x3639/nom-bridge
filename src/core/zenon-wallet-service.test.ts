@@ -16,7 +16,10 @@ const h = vi.hoisted(() => {
     connect: vi.fn(),
     request: vi.fn(),
     disconnect: vi.fn().mockResolvedValue(undefined),
-    core: {relayer: {connected: true, transportOpen: vi.fn().mockResolvedValue(undefined)}},
+    core: {
+      relayer: {connected: true, transportOpen: vi.fn().mockResolvedValue(undefined)},
+      pairing: {disconnect: vi.fn().mockResolvedValue(undefined)},
+    },
   }
   const pairing = {uri: vi.fn(), closed: vi.fn()}
   return {
@@ -55,6 +58,7 @@ beforeEach(() => {
   h.client.disconnect.mockClear()
   h.client.core.relayer.connected = true
   h.client.core.relayer.transportOpen.mockClear()
+  h.client.core.pairing.disconnect.mockClear()
   h.pairing.uri.mockClear()
   h.pairing.closed.mockClear()
   h.fromJson.mockClear()
@@ -240,6 +244,30 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
     expect(h.pairing.closed).toHaveBeenCalledTimes(1)
   })
 
+  it('cancelPairing() tears down the pairing topic, and a late approval is disconnected rather than kept', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    let approveLate: (session: unknown) => void = () => {}
+    h.client.connect.mockResolvedValue({
+      uri: `wc:${'ab'.repeat(32)}@2?relay-protocol=irn&symKey=ff`,
+      approval: vi.fn().mockReturnValue(new Promise(resolve => {
+        approveLate = resolve
+      })),
+    })
+    const {ZenonWalletService, PairingCancelledError} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    service.onPairingUri = () => service.cancelPairing()
+
+    await expect(service.connect()).rejects.toBeInstanceOf(PairingCancelledError)
+    expect(h.client.core.pairing.disconnect).toHaveBeenCalledWith({topic: 'ab'.repeat(32)})
+
+    approveLate(zenonSession('session-late', future()))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(h.client.disconnect).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'session-late', reason: expect.objectContaining({code: 6000})}),
+    )
+  })
+
   it('cancelPairing() is a no-op when no pairing is pending', async () => {
     const {ZenonWalletService} = await import('./zenon-wallet-service')
     expect(() => ZenonWalletService.getInstance().cancelPairing()).not.toThrow()
@@ -256,6 +284,15 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
 
     expect(h.pairing.uri).not.toHaveBeenCalled()
     expect(h.pairing.closed).not.toHaveBeenCalled()
+  })
+})
+
+describe('pairingTopicOf', () => {
+  it('extracts the pairing topic from a v2 uri and rejects anything else', async () => {
+    const {pairingTopicOf} = await import('./zenon-wallet-service')
+    expect(pairingTopicOf(`wc:${'0f'.repeat(32)}@2?relay-protocol=irn&symKey=aa`)).toBe('0f'.repeat(32))
+    expect(pairingTopicOf('wc:not-hex@2?x=1')).toBeNull()
+    expect(pairingTopicOf('https://example.com')).toBeNull()
   })
 })
 
