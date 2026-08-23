@@ -245,7 +245,35 @@ export class ZenonWalletService {
   }
 
   async send(fromAddress: string, block: AccountBlockTemplate): Promise<AccountBlockTemplate> {
-    const info = await this.getInfo()
+    // Captured BEFORE the pre-check: a concurrent connect() can replace the
+    // session while getInfo is mid-retry, and only the session this send
+    // started with may be condemned by its timeout.
+    const sessionAtStart = this.session
+    let info: ZenonWalletInfo
+    try {
+      info = await this.getInfo()
+    } catch (e) {
+      // The pre-check timed out even after transport restarts: the session is
+      // one Syrius no longer answers (wallet or machine restarted). znn_send
+      // was never sent, so nothing can have been signed — typed 'rejected' so
+      // callers release their safety locks. Drop the session so the UI offers
+      // a fresh pairing instead of timing out again — unless a concurrent
+      // re-pair already replaced it, which must survive untouched.
+      if (e instanceof WalletTimeoutError) {
+        if (this.session === sessionAtStart) this.clearSession()
+        if (sessionAtStart) {
+          void this.clientPromise
+            ?.then(client => client.session.delete(sessionAtStart.topic, {code: 6000, message: 'Session unresponsive'}))
+            .catch(() => undefined)
+        }
+        throw new ZenonSubmissionError(
+          'rejected',
+          'Syrius did not respond, so the connection was reset. Reconnect the Zenon wallet and try again.',
+          e,
+        )
+      }
+      throw e
+    }
     if (info.address !== fromAddress) {
       throw new Error('Zenon wallet address changed. Review the recipient and try again.')
     }
@@ -327,6 +355,18 @@ export class ZenonWalletService {
         return await this.request<T>(method, params)
       } catch (e) {
         lastError = e
+        // After a network drop the relayer often still claims `connected`
+        // while its socket is dead, so requests vanish and only the timeout
+        // fires. Read-only methods are safe to repeat: restart the transport
+        // and retry. znn_send is NOT — the wallet may already be showing the
+        // prompt — so its timeout falls through to the fatal path (ambiguous).
+        if (e instanceof WalletTimeoutError && method !== 'znn_send') {
+          if (attempt < WC_TIMING.maxAttempts) {
+            await this.restartRelayTransport()
+            continue
+          }
+          break
+        }
         switch (classifyWalletError(e)) {
           case 'locked':
             // A locked wallet provably did not sign — typed like a rejection so
@@ -352,6 +392,15 @@ export class ZenonWalletService {
       }
     }
     throw mapWcError(lastError)
+  }
+
+  private async restartRelayTransport(): Promise<void> {
+    try {
+      const client = await this.getClient()
+      await client.core.relayer.restartTransport()
+    } catch {
+      // Best-effort: the retry itself will surface a persistent failure.
+    }
   }
 
   private clearSession(): void {

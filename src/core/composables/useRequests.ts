@@ -24,6 +24,7 @@ import {
   type UnwrappedEventRecord,
 } from '../evm-service'
 export {normalizeEvmHash} from '../evm-hash'
+import {createPollScheduler} from './poll-scheduler'
 
 const wrapRequests = ref<WrapRequestView[]>([])
 const unwrapRequests = ref<UnwrapRequestView[]>([])
@@ -60,7 +61,19 @@ function ensureLockSubscription(): void {
 // handler can source the SDK fields (amount/fee/signature/tokenAddress/toAddress).
 let rawById = new Map<string, WrapTokenRequest>()
 
-let intervalId: ReturnType<typeof setInterval> | null = null
+export const POLL_BASE_MS = 30_000
+export const POLL_MAX_MS = 300_000
+
+// Exponential backoff while polls fail (network down floods the console and
+// hammers dead RPCs at a fixed 30 s otherwise); one success resets to base.
+export function nextPollDelay(consecutiveFailures: number): number {
+  const factor = 2 ** Math.min(consecutiveFailures, 10)
+  return Math.min(POLL_BASE_MS * factor, POLL_MAX_MS)
+}
+
+const pollScheduler = createPollScheduler(runPoll, nextPollDelay, error => {
+  pollingError.value = error ? error.message : null
+})
 let polling = false
 let rerunRequested = false
 let rerunWaiters: Array<{resolve: () => void; reject: (error: unknown) => void}> = []
@@ -684,13 +697,7 @@ export function useRequests() {
     // full network poll to finish before the form can be gated.
     ensureLockSubscription()
     void hydrateUnknownWraps()
-    if (intervalId === null) {
-      intervalId = setInterval(() => {
-        void runPoll().catch(e => {
-          pollingError.value = e instanceof Error ? e.message : 'Failed to refresh requests'
-        })
-      }, 30_000)
-    }
+    pollScheduler.start()
     isLoading.value = true
     void runPoll()
       .then(() => {
@@ -705,10 +712,7 @@ export function useRequests() {
   }
 
   function stopPolling(): void {
-    if (intervalId !== null) {
-      clearInterval(intervalId)
-      intervalId = null
-    }
+    pollScheduler.stop()
   }
 
   async function refresh(): Promise<void> {
