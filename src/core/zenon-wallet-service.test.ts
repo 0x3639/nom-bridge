@@ -18,13 +18,11 @@ const h = vi.hoisted(() => {
     disconnect: vi.fn().mockResolvedValue(undefined),
     core: {relayer: {connected: true, transportOpen: vi.fn().mockResolvedValue(undefined)}},
   }
-  const modal = {openModal: vi.fn().mockResolvedValue(undefined), closeModal: vi.fn()}
-  const modalCtor = vi.fn(() => modal)
+  const pairing = {uri: vi.fn(), closed: vi.fn()}
   return {
     onHandlers,
     client,
-    modal,
-    modalCtor,
+    pairing,
     initSpy: vi.fn(async () => client),
     fromJson: vi.fn((json: unknown) => ({fromJson: json})),
     addressParse: vi.fn((address: string) => address),
@@ -32,7 +30,6 @@ const h = vi.hoisted(() => {
 })
 
 vi.mock('@walletconnect/sign-client', () => ({SignClient: {init: h.initSpy}}))
-vi.mock('@walletconnect/modal', () => ({WalletConnectModal: h.modalCtor}))
 vi.mock('znn-typescript-sdk', () => ({
   AccountBlockTemplate: {fromJson: h.fromJson},
   Address: {parse: h.addressParse},
@@ -58,9 +55,8 @@ beforeEach(() => {
   h.client.disconnect.mockClear()
   h.client.core.relayer.connected = true
   h.client.core.relayer.transportOpen.mockClear()
-  h.modal.openModal.mockClear()
-  h.modal.closeModal.mockClear()
-  h.modalCtor.mockClear()
+  h.pairing.uri.mockClear()
+  h.pairing.closed.mockClear()
   h.fromJson.mockClear()
   h.addressParse.mockClear()
   h.initSpy.mockClear()
@@ -95,7 +91,6 @@ describe('ZenonWalletService.connect — session reuse', () => {
 
     // No new pairing was opened...
     expect(h.client.connect).not.toHaveBeenCalled()
-    expect(h.modal.openModal).not.toHaveBeenCalled()
     // ...and the reused session is the LAST matching one (topic-B).
     expect(h.client.request).toHaveBeenCalledWith(
       expect.objectContaining({topic: 'topic-B'}),
@@ -160,12 +155,14 @@ describe('ZenonWalletService.connect — stale stored session', () => {
     const {WC_TIMING} = await import('./wc-reliability')
     WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    service.onPairingUri = h.pairing.uri
 
-    const info = await ZenonWalletService.getInstance().connect()
+    const info = await service.connect()
 
     expect(info.address).toBe('z1addr')
     expect(h.client.session.delete).toHaveBeenCalledWith('topic-stale', expect.anything())
-    expect(h.modal.openModal).toHaveBeenCalledWith({uri: 'wc:fresh'})
+    expect(h.pairing.uri).toHaveBeenCalledWith('wc:fresh')
     expect(h.client.request).toHaveBeenLastCalledWith(expect.objectContaining({topic: 'topic-new'}))
   })
 
@@ -181,7 +178,7 @@ describe('ZenonWalletService.connect — stale stored session', () => {
 })
 
 describe('ZenonWalletService.connect — fresh pairing', () => {
-  it('opens the modal with the uri and stores the approved session when none to reuse', async () => {
+  it('hands the pairing uri to the UI, then signals close and stores the approved session', async () => {
     h.client.session.getAll.mockReturnValue([])
     h.client.connect.mockResolvedValue({
       uri: 'wc:deadbeef',
@@ -190,8 +187,11 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
     const {WC_TIMING} = await import('./wc-reliability')
     WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    service.onPairingUri = h.pairing.uri
+    service.onPairingClosed = h.pairing.closed
 
-    await ZenonWalletService.getInstance().connect()
+    await service.connect()
 
     expect(h.client.connect).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -200,68 +200,62 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
         }),
       }),
     )
-    expect(h.modal.openModal).toHaveBeenCalledWith({uri: 'wc:deadbeef'})
-    expect(h.modal.closeModal).toHaveBeenCalled()
+    expect(h.pairing.uri).toHaveBeenCalledWith('wc:deadbeef')
+    expect(h.pairing.closed).toHaveBeenCalledTimes(1)
     expect(h.client.request).toHaveBeenCalledWith(
       expect.objectContaining({topic: 'topic-new'}),
     )
   })
 
-  it('closes the modal even when pairing approval rejects', async () => {
+  it('signals close even when pairing approval rejects', async () => {
     h.client.session.getAll.mockReturnValue([])
     h.client.connect.mockResolvedValue({
       uri: 'wc:abc',
       approval: vi.fn().mockRejectedValue(Object.assign(new Error('rejected'), {code: 5000})),
     })
     const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    service.onPairingClosed = h.pairing.closed
 
-    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow(
-      'Request rejected in the wallet',
-    )
-    expect(h.modal.closeModal).toHaveBeenCalled()
+    await expect(service.connect()).rejects.toThrow('Request rejected in the wallet')
+    expect(h.pairing.closed).toHaveBeenCalledTimes(1)
   })
 
-  it('configures the modal for Syrius: explorer off, syrius desktop deep-link', async () => {
+  it('cancelPairing() aborts a pending approval as a wallet rejection and closes the UI', async () => {
     h.client.session.getAll.mockReturnValue([])
     h.client.connect.mockResolvedValue({
-      uri: 'wc:deadbeef',
-      approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
+      uri: 'wc:hang',
+      approval: vi.fn().mockReturnValue(new Promise(() => {})),
     })
-    const {WC_TIMING} = await import('./wc-reliability')
-    WC_TIMING.settleMs = 0
-    const {ZenonWalletService} = await import('./zenon-wallet-service')
-
-    await ZenonWalletService.getInstance().connect()
-
-    expect(h.modalCtor).toHaveBeenCalledWith(
-      expect.objectContaining({
-        enableExplorer: false,
-        mobileWallets: [],
-        desktopWallets: [
-          expect.objectContaining({id: 'syrius', name: 'Syrius', links: expect.objectContaining({native: 'syrius:'})}),
-        ],
-      }),
-    )
-  })
-
-  it('hands the uri to onPairingUri and skips the modal entirely when the seam is set', async () => {
-    h.client.session.getAll.mockReturnValue([])
-    h.client.connect.mockResolvedValue({
-      uri: 'wc:seam',
-      approval: vi.fn().mockResolvedValue(zenonSession('topic-seam', future())),
-    })
-    const {WC_TIMING} = await import('./wc-reliability')
-    WC_TIMING.settleMs = 0
     const {ZenonWalletService} = await import('./zenon-wallet-service')
     const service = ZenonWalletService.getInstance()
-    const seen: string[] = []
-    service.onPairingUri = uri => seen.push(uri)
+    service.onPairingUri = uri => {
+      h.pairing.uri(uri)
+      service.cancelPairing()
+    }
+    service.onPairingClosed = h.pairing.closed
+
+    const {PairingCancelledError} = await import('./zenon-wallet-service')
+    await expect(service.connect()).rejects.toBeInstanceOf(PairingCancelledError)
+    expect(h.pairing.closed).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancelPairing() is a no-op when no pairing is pending', async () => {
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    expect(() => ZenonWalletService.getInstance().cancelPairing()).not.toThrow()
+  })
+
+  it('does not signal close when a stored session was reused', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    service.onPairingUri = h.pairing.uri
+    service.onPairingClosed = h.pairing.closed
 
     await service.connect()
 
-    expect(seen).toEqual(['wc:seam'])
-    expect(h.modalCtor).not.toHaveBeenCalled()
-    expect(h.modal.openModal).not.toHaveBeenCalled()
+    expect(h.pairing.uri).not.toHaveBeenCalled()
+    expect(h.pairing.closed).not.toHaveBeenCalled()
   })
 })
 
@@ -581,8 +575,11 @@ describe('ZenonWalletService relay guard and timeouts', () => {
     WC_TIMING.approvalTimeoutMs = 10
     const {ZenonWalletService} = await import('./zenon-wallet-service')
 
-    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow('timed out')
-    expect(h.modal.closeModal).toHaveBeenCalled()
+    const service = ZenonWalletService.getInstance()
+    service.onPairingClosed = h.pairing.closed
+
+    await expect(service.connect()).rejects.toThrow('timed out')
+    expect(h.pairing.closed).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -706,7 +703,6 @@ describe('ZenonWalletService placeholder guard and restore', () => {
 
     expect(info).toEqual({address: 'z1addr', chainId: 1})
     expect(h.client.connect).not.toHaveBeenCalled()
-    expect(h.modal.openModal).not.toHaveBeenCalled()
   })
 
   it('restore() swallows znn_info failures and returns null', async () => {

@@ -21,6 +21,15 @@ export interface ZenonWalletInfo {
   nodeUrl?: string
 }
 
+// The user closed the pairing dialog before Syrius approved. A rejection
+// (no session, nothing signed) that callers treat as "nothing happened".
+export class PairingCancelledError extends Error {
+  constructor() {
+    super('Pairing cancelled')
+    this.name = 'PairingCancelledError'
+  }
+}
+
 export class ZenonSubmissionError extends Error {
   constructor(
     readonly kind: 'rejected' | 'ambiguous',
@@ -40,9 +49,12 @@ export class ZenonWalletService {
   private session: SessionTypes.Struct | null = null
   onDisconnect: (() => void) | null = null
   onInfoChange: ((info: ZenonWalletInfo) => void) | null = null
-  // When set, fresh pairings hand the URI to this callback instead of opening
-  // the WalletConnect modal (used by the integration test harness).
+  // Fresh pairings hand the URI to this callback for display (the in-app
+  // PairingDialog, or the integration test harness); onPairingClosed fires
+  // once the pairing resolves, fails, times out, or is cancelled.
   onPairingUri: ((uri: string) => void) | null = null
+  onPairingClosed: (() => void) | null = null
+  private pairingCancel: (() => void) | null = null
 
   static getInstance(): ZenonWalletService {
     if (!ZenonWalletService.instance) {
@@ -154,43 +166,44 @@ export class ZenonWalletService {
       this.session = existing
       return existing
     }
-    let modal: {openModal: (opts: {uri: string}) => Promise<unknown>; closeModal: () => void} | null = null
+    let pairingShown = false
     try {
       const {uri, approval} = await client.connect({
         requiredNamespaces: {zenon: ZENON_NAMESPACE},
       })
+      // Cancellation must be armed BEFORE the UI sees the uri: a handler may
+      // cancel synchronously.
+      const cancelled = new Promise<never>((_, reject) => {
+        this.pairingCancel = () => reject(new PairingCancelledError())
+      })
       if (uri) {
-        if (this.onPairingUri) {
-          this.onPairingUri(uri)
-        } else {
-          const {WalletConnectModal} = await import('@walletconnect/modal')
-          modal = new WalletConnectModal({
-            projectId: WC_PROJECT_ID,
-            chains: [ZENON_CHAIN],
-            enableExplorer: false, // the WC explorer can never list Syrius
-            mobileWallets: [],
-            desktopWallets: [
-              {
-                id: 'syrius',
-                name: 'Syrius',
-                links: {native: 'syrius:', universal: 'https://zenon.network'},
-              },
-            ],
-          })
-          await modal.openModal({uri})
-        }
+        // The UI renders the pairing QR/URI (see PairingDialog); the deprecated
+        // @walletconnect/modal is no longer used. Without a handler (headless
+        // harness) the approval simply waits.
+        pairingShown = true
+        this.onPairingUri?.(uri)
       }
-      const approved = await withTimeout(approval(), WC_TIMING.approvalTimeoutMs, 'Wallet approval')
+      const approved = await Promise.race([
+        withTimeout(approval(), WC_TIMING.approvalTimeoutMs, 'Wallet approval'),
+        cancelled,
+      ])
       // The SignClient session store lags behind approval(); give it a moment,
       // then prefer the store's copy of the newest live zenon session.
       await delay(WC_TIMING.settleMs)
       this.session = this.findLiveZenonSession(client) ?? approved
       return null
     } catch (e) {
+      if (e instanceof PairingCancelledError) throw e
       throw mapWcError(e)
     } finally {
-      modal?.closeModal()
+      this.pairingCancel = null
+      if (pairingShown) this.onPairingClosed?.()
     }
+  }
+
+  // Abort a pending fresh pairing (user closed the QR dialog).
+  cancelPairing(): void {
+    this.pairingCancel?.()
   }
 
   async getInfo(): Promise<ZenonWalletInfo> {

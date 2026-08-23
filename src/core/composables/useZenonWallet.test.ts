@@ -8,11 +8,15 @@ const mocks = vi.hoisted(() => ({
     disconnect: vi.fn(),
     onDisconnect: undefined as undefined | (() => void),
     onInfoChange: undefined as undefined | ((info: {address: string}) => void),
+    onPairingUri: undefined as undefined | ((uri: string) => void),
+    onPairingClosed: undefined as undefined | (() => void),
+    cancelPairing: vi.fn(),
   },
   getTokenBalance: vi.fn(),
 }))
 
-vi.mock('../zenon-wallet-service', () => ({
+vi.mock('../zenon-wallet-service', async importOriginal => ({
+  ...(await importOriginal<typeof import('../zenon-wallet-service')>()),
   ZenonWalletService: {getInstance: () => mocks.wallet},
 }))
 
@@ -25,6 +29,8 @@ beforeEach(() => {
   vi.resetAllMocks()
   mocks.wallet.onDisconnect = undefined
   mocks.wallet.onInfoChange = undefined
+  mocks.wallet.onPairingUri = undefined
+  mocks.wallet.onPairingClosed = undefined
   mocks.wallet.restore.mockResolvedValue(null)
   mocks.wallet.disconnect.mockResolvedValue(undefined)
 })
@@ -109,5 +115,37 @@ describe('useZenonWallet', () => {
     await wallet.disconnect()
     expect(mocks.wallet.disconnect).toHaveBeenCalledOnce()
     expect(wallet.address.value).toBeNull()
+  })
+})
+
+describe('useZenonWallet pairing UI state', () => {
+  it('exposes the pairing uri while the service waits for approval and clears it on close', async () => {
+    const {useZenonWallet} = await import('./useZenonWallet')
+    const {pairingUri} = useZenonWallet()
+
+    expect(pairingUri.value).toBeNull()
+    mocks.wallet.onPairingUri?.('wc:abc@2?relay-protocol=irn&symKey=ff')
+    expect(pairingUri.value).toBe('wc:abc@2?relay-protocol=irn&symKey=ff')
+    mocks.wallet.onPairingClosed?.()
+    expect(pairingUri.value).toBeNull()
+  })
+
+  it('treats a user-cancelled pairing as a quiet no-op, not an error', async () => {
+    const {PairingCancelledError} = await import('../zenon-wallet-service')
+    mocks.wallet.connect.mockRejectedValue(new PairingCancelledError())
+    const {useZenonWallet} = await import('./useZenonWallet')
+    const {connect, error, address, isConnecting} = useZenonWallet()
+
+    await expect(connect()).resolves.toBeUndefined()
+
+    expect(error.value).toBeNull()
+    expect(address.value).toBeNull()
+    expect(isConnecting.value).toBe(false)
+  })
+
+  it('cancelPairing forwards to the service', async () => {
+    const {useZenonWallet} = await import('./useZenonWallet')
+    useZenonWallet().cancelPairing()
+    expect(mocks.wallet.cancelPairing).toHaveBeenCalledTimes(1)
   })
 })
