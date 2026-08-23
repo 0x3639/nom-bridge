@@ -201,13 +201,17 @@ The bridge now enforces the following on its side; wallets should be aware:
   races a **2 min timeout because signing is human-paced**; pairing approval
   races **5 min** (the pairing-URI lifetime). A hung request surfaces to the
   user as a timeout — respond or error, never go silent.
-- `znn_info`/`znn_send` are attempted up to **3 times**. Three error shapes get
-  special handling, matching known Syrius behavior:
+- Read-only `znn_info` requests are attempted up to **3 times**. Three error
+  shapes get special handling, matching known Syrius behavior:
   - `code 9000` + message containing `Wallet is locked` → surfaced as
     "unlock your wallet", no retry.
   - `code -32602` + `Bad state: No element` → the bridge drops the session,
     re-pairs/reuses, and retries.
   - `code -32602` + `No matching key` → retried as-is.
+- Non-idempotent `znn_send` requests are attempted **exactly once**. A timeout
+  or any non-rejection error may arrive after the wallet signed or broadcast
+  the block, so the bridge treats it as ambiguous and keeps its safety lock;
+  it never automatically sends the same transfer again.
 - If the relay transport is down when a request is made, the bridge reopens it
   and waits ~2 s before sending.
 - After session approval the bridge waits ~5 s and re-reads its session store

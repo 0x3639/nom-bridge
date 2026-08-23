@@ -240,7 +240,7 @@ export class ZenonWalletService {
   }
 
   async getInfo(): Promise<ZenonWalletInfo> {
-    const info = await this.requestWithRetry<ZenonWalletInfo>('znn_info', undefined)
+    const info = await this.requestInfoWithRetry()
     return validateZenonWalletInfo(info)
   }
 
@@ -279,16 +279,23 @@ export class ZenonWalletService {
     }
     let result: unknown
     try {
-      result = await this.requestWithRetry<unknown>('znn_send', {
+      // znn_send is non-idempotent. A response can be lost after Syrius has
+      // already signed and broadcast the block, so never replay it here.
+      result = await this.request<unknown>('znn_send', {
         fromAddress,
         accountBlock: block.toJson(),
       })
     } catch (e) {
-      // Rejections are recognized structurally (typed by requestWithRetry from
-      // the wallet's error code), never by matching a message string. Anything
-      // not provably a rejection is ambiguous: the wallet may still have
-      // signed and broadcast the block, so callers must keep safety locks.
-      if (e instanceof ZenonSubmissionError) throw e
+      // Only explicit rejection/locked codes prove that Syrius did not submit.
+      // Session errors such as "No matching key" or "Bad state" can arrive
+      // after a side effect and therefore remain ambiguous without a retry.
+      const action = classifyWalletError(e)
+      if (action === 'locked') {
+        throw new ZenonSubmissionError('rejected', 'Your wallet is locked — please unlock Syrius', e)
+      }
+      if (action === 'rejected') {
+        throw new ZenonSubmissionError('rejected', 'Request rejected in the wallet', e)
+      }
       throw new ZenonSubmissionError(
         'ambiguous',
         'Zenon redemption may have been submitted, but WalletConnect did not return a result',
@@ -348,11 +355,13 @@ export class ZenonWalletService {
     )
   }
 
-  private async requestWithRetry<T>(method: string, params: unknown): Promise<T> {
+  // znn_info is read-only, so known session-desync failures can be retried.
+  // Keep this policy separate from request() so write methods cannot inherit it.
+  private async requestInfoWithRetry(): Promise<ZenonWalletInfo> {
     let lastError: unknown = null
     for (let attempt = 1; attempt <= WC_TIMING.maxAttempts; attempt++) {
       try {
-        return await this.request<T>(method, params)
+        return await this.request<ZenonWalletInfo>('znn_info', undefined)
       } catch (e) {
         lastError = e
         // After a network drop the relayer often still claims `connected`

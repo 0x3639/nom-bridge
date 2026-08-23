@@ -432,6 +432,10 @@ describe('ZenonWalletService.send', () => {
       name: 'ZenonSubmissionError',
       kind: 'ambiguous',
     })
+    const sendCalls = h.client.request.mock.calls.filter(([request]) =>
+      (request as {request?: {method?: string}}).request?.method === 'znn_send',
+    )
+    expect(sendCalls).toHaveLength(1)
   })
 
   it('classifies a post-send result-decoding failure as ambiguous, never as a plain failure', async () => {
@@ -498,6 +502,32 @@ describe('ZenonWalletService.send', () => {
       name: 'ZenonSubmissionError',
       kind: 'rejected',
     })
+  })
+
+  it.each([
+    {code: -32602, message: 'No matching key. session topic does not exist'},
+    {code: -32602, message: 'Bad state: No element'},
+  ])('does not automatically retry a non-idempotent znn_send after $message', async ({code, message}) => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
+    h.client.request.mockReset()
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect -> znn_info
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // send safety re-check
+      .mockRejectedValue(Object.assign(new Error(message), {code}))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+
+    const block = {toJson: vi.fn(() => ({cell: 'serialized'}))}
+    await expect(service.send('z1addr', block as never)).rejects.toMatchObject({
+      name: 'ZenonSubmissionError',
+      kind: 'ambiguous',
+    })
+
+    const sendCalls = h.client.request.mock.calls.filter(([request]) =>
+      (request as {request?: {method?: string}}).request?.method === 'znn_send',
+    )
+    expect(sendCalls).toHaveLength(1)
   })
 })
 

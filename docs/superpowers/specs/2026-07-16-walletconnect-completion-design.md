@@ -52,15 +52,16 @@ Additions:
   `client.session.getAll()` for the newest live `zenon` session, falling back
   to the `approval()` result. (The SignClient session store lags behind
   `approval()`; the reference app ships this exact workaround.)
-- **Retry + Syrius error map** — `znn_info`/`znn_send` retry up to 3 attempts:
+- **Method-aware retry + Syrius error map** — read-only `znn_info` retries up
+  to 3 attempts; non-idempotent `znn_send` is sent exactly once:
 
-  | Wallet error | Handling |
-  |---|---|
-  | `-32602` + "Bad state: No element" | drop session, full reconnect, retry |
-  | `-32602` + "No matching key" | plain retry |
-  | `9000` + "Wallet is locked" | no retry; surface "Your wallet is locked — please unlock Syrius" |
-  | `5000`–`5999` | no retry; "Request rejected in the wallet" (existing behavior) |
-  | anything else | generic WC failure (existing behavior) |
+  | Wallet error | `znn_info` | `znn_send` |
+  |---|---|---|
+  | `-32602` + "Bad state: No element" | drop session, full reconnect, retry | ambiguous; no retry |
+  | `-32602` + "No matching key" | plain retry | ambiguous; no retry |
+  | `9000` + "Wallet is locked" | no retry; surface unlock guidance | definite rejection; no retry |
+  | `4001` or `5000`–`5999` | no retry; "Request rejected in the wallet" | definite rejection; no retry |
+  | anything else | generic WC failure | ambiguous; no retry |
 
 - **Placeholder guard** — `connect()` throws "Set VITE_WC_PROJECT_ID in .env"
   when the project ID is still `REPLACE_ME_WC_PROJECT_ID`, instead of failing
