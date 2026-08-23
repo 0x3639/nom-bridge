@@ -245,6 +245,10 @@ export class ZenonWalletService {
   }
 
   async send(fromAddress: string, block: AccountBlockTemplate): Promise<AccountBlockTemplate> {
+    // Captured BEFORE the pre-check: a concurrent connect() can replace the
+    // session while getInfo is mid-retry, and only the session this send
+    // started with may be condemned by its timeout.
+    const sessionAtStart = this.session
     let info: ZenonWalletInfo
     try {
       info = await this.getInfo()
@@ -253,13 +257,13 @@ export class ZenonWalletService {
       // one Syrius no longer answers (wallet or machine restarted). znn_send
       // was never sent, so nothing can have been signed — typed 'rejected' so
       // callers release their safety locks. Drop the session so the UI offers
-      // a fresh pairing instead of timing out again.
+      // a fresh pairing instead of timing out again — unless a concurrent
+      // re-pair already replaced it, which must survive untouched.
       if (e instanceof WalletTimeoutError) {
-        const dead = this.session
-        this.clearSession()
-        if (dead) {
+        if (this.session === sessionAtStart) this.clearSession()
+        if (sessionAtStart) {
           void this.clientPromise
-            ?.then(client => client.session.delete(dead.topic, {code: 6000, message: 'Session unresponsive'}))
+            ?.then(client => client.session.delete(sessionAtStart.topic, {code: 6000, message: 'Session unresponsive'}))
             .catch(() => undefined)
         }
         throw new ZenonSubmissionError(

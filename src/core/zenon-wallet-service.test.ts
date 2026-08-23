@@ -921,6 +921,42 @@ describe('ZenonWalletService.send — unresponsive session self-heal', () => {
     expect(disconnected).toHaveBeenCalled()
   })
 
+  it('spares a session re-paired concurrently: only the session the send started with is condemned', async () => {
+    h.client.session.getAll
+      .mockReturnValueOnce([zenonSession('topic-stale', future())]) // connect #1 adopts
+      .mockReturnValue([]) // connect #2 must pair afresh
+    const {WalletTimeoutError} = await import('./wc-reliability')
+    h.client.request
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect #1 handshake
+      .mockRejectedValueOnce(new WalletTimeoutError('Syrius request (znn_info)')) // send attempt 1
+      .mockResolvedValueOnce({address: 'z1addr', chainId: 1}) // connect #2 handshake
+      .mockRejectedValue(new WalletTimeoutError('Syrius request (znn_info)')) // send attempts 2..n
+    h.client.connect.mockResolvedValue({
+      uri: `wc:${'aa'.repeat(32)}@2?relay-protocol=irn&symKey=ff`,
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
+    const {ZenonWalletService, ZenonSubmissionError} = await import('./zenon-wallet-service')
+    const service = ZenonWalletService.getInstance()
+    await service.connect()
+    const disconnected = vi.fn()
+    service.onDisconnect = disconnected
+    // A concurrent connect() replaces the session while send's pre-check is
+    // mid-retry (driven from the transport-restart hook for determinism).
+    h.client.core.relayer.restartTransport.mockImplementationOnce(async () => {
+      await service.connect()
+    })
+
+    const failure = await service.send('z1addr', {toJson: () => ({})} as never).catch(e => e)
+
+    expect(failure).toBeInstanceOf(ZenonSubmissionError)
+    expect(h.client.session.delete).toHaveBeenCalledWith('topic-stale', expect.anything())
+    expect(h.client.session.delete).not.toHaveBeenCalledWith('topic-new', expect.anything())
+    // The re-paired session stays active: no disconnect signalled to the UI.
+    expect(disconnected).not.toHaveBeenCalled()
+  })
+
   it('a non-timeout znn_info failure does not tear down the session', async () => {
     h.client.session.getAll.mockReturnValue([zenonSession('topic-A', future())])
     h.client.request
