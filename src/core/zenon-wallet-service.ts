@@ -369,7 +369,7 @@ export class ZenonWalletService {
         // fires. Read-only methods are safe to repeat: restart the transport
         // and retry. znn_send is NOT — the wallet may already be showing the
         // prompt — so its timeout falls through to the fatal path (ambiguous).
-        if (e instanceof WalletTimeoutError && method !== 'znn_send') {
+        if (e instanceof WalletTimeoutError) {
           if (attempt < WC_TIMING.maxAttempts) {
             await this.restartRelayTransport()
             continue
