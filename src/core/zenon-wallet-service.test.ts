@@ -12,7 +12,7 @@ const h = vi.hoisted(() => {
     on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
       onHandlers[event] = cb
     }),
-    session: {getAll: vi.fn(() => [] as unknown[])},
+    session: {getAll: vi.fn(() => [] as unknown[]), delete: vi.fn().mockResolvedValue(undefined)},
     connect: vi.fn(),
     request: vi.fn(),
     disconnect: vi.fn().mockResolvedValue(undefined),
@@ -52,6 +52,7 @@ beforeEach(() => {
   Object.keys(h.onHandlers).forEach(k => delete h.onHandlers[k])
   h.client.on.mockClear()
   h.client.session.getAll.mockReset().mockReturnValue([])
+  h.client.session.delete.mockClear()
   h.client.connect.mockReset()
   h.client.request.mockReset().mockResolvedValue({address: 'z1addr', chainId: 1})
   h.client.disconnect.mockClear()
@@ -63,7 +64,18 @@ beforeEach(() => {
   h.fromJson.mockClear()
   h.addressParse.mockClear()
   h.initSpy.mockClear()
-  vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}})
+  const memory = new Map<string, string>()
+  const sessionStorage = {
+    get length() {
+      return memory.size
+    },
+    key: (i: number) => Array.from(memory.keys())[i] ?? null,
+    getItem: (k: string) => memory.get(k) ?? null,
+    setItem: (k: string, v: string) => void memory.set(k, v),
+    removeItem: (k: string) => void memory.delete(k),
+    clear: () => memory.clear(),
+  }
+  vi.stubGlobal('window', {location: {origin: 'https://bridge.test'}, sessionStorage, localStorage: sessionStorage})
 })
 
 afterEach(() => {
@@ -116,6 +128,55 @@ describe('ZenonWalletService.connect — session reuse', () => {
     expect(h.client.request).toHaveBeenCalledWith(
       expect.objectContaining({topic: 'topic-zenon'}),
     )
+  })
+})
+
+describe('ZenonWalletService storage', () => {
+  it('backs the SignClient with tab-scoped session storage so pairings end with the tab', async () => {
+    const {SessionKeyValueStorage} = await import('./wc-session-storage')
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await ZenonWalletService.getInstance().connect().catch(() => undefined)
+
+    expect(h.initSpy).toHaveBeenCalledWith(
+      expect.objectContaining({storage: expect.any(SessionKeyValueStorage)}),
+    )
+  })
+})
+
+describe('ZenonWalletService.connect — stale stored session', () => {
+  it('drops a stored session whose handshake fails and pairs afresh', async () => {
+    h.client.session.getAll
+      .mockReturnValueOnce([zenonSession('topic-stale', future())])
+      .mockReturnValue([])
+    const {WalletTimeoutError} = await import('./wc-reliability')
+    h.client.request
+      .mockRejectedValueOnce(new WalletTimeoutError('Syrius request (znn_info)'))
+      .mockResolvedValue({address: 'z1addr', chainId: 1})
+    h.client.connect.mockResolvedValue({
+      uri: 'wc:fresh',
+      approval: vi.fn().mockResolvedValue(zenonSession('topic-new', future())),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.settleMs = 0
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    const info = await ZenonWalletService.getInstance().connect()
+
+    expect(info.address).toBe('z1addr')
+    expect(h.client.session.delete).toHaveBeenCalledWith('topic-stale', expect.anything())
+    expect(h.modal.openModal).toHaveBeenCalledWith({uri: 'wc:fresh'})
+    expect(h.client.request).toHaveBeenLastCalledWith(expect.objectContaining({topic: 'topic-new'}))
+  })
+
+  it('does not discard a stored session when the wallet merely rejects the handshake', async () => {
+    h.client.session.getAll.mockReturnValue([zenonSession('topic-live', future())])
+    h.client.request.mockRejectedValue(Object.assign(new Error('rejected'), {code: 5000}))
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow('Request rejected in the wallet')
+    expect(h.client.session.delete).not.toHaveBeenCalled()
+    expect(h.client.connect).not.toHaveBeenCalled()
   })
 })
 

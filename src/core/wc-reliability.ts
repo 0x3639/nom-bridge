@@ -15,12 +15,18 @@ export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+// Typed so callers can react to "the wallet never answered" structurally —
+// e.g. connect() discards a stored session that only ever times out.
+export class WalletTimeoutError extends Error {
+  constructor(label: string) {
+    super(`${label} timed out — check that Syrius is open and responsive`)
+    this.name = 'WalletTimeoutError'
+  }
+}
+
 export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${label} timed out — check that Syrius is open and responsive`)),
-      ms,
-    )
+    const timer = setTimeout(() => reject(new WalletTimeoutError(label)), ms)
     promise.then(
       value => {
         clearTimeout(timer)
