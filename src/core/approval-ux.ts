@@ -170,6 +170,13 @@ export function wrapRequestProgress(
   }
 }
 
+// The 2% affiliate bonus is a distinct unwrap request (logIndex + 4e9) the
+// orchestrators register a few momentums after the main one; it therefore
+// carries its own delay countdown and its own redeem.
+export function describeAffiliateBonusRow(): string {
+  return '2% affiliate bonus from the transfer above. The bridge registers it as a separate request shortly after the main one, so its security delay ends a little later and it needs its own Syrius redeem.'
+}
+
 function formatMinutes(seconds: number): string {
   const minutes = Math.max(1, Math.ceil(seconds / 60))
   return `~${minutes} min`

@@ -13,6 +13,7 @@ import {
   shouldHandoffLocalWrapLock,
   unwrapRequestProgress,
   wrapRequestProgress,
+  describeAffiliateBonusRow,
 } from './approval-ux'
 
 describe('isUnwrapSourceConfirmed', () => {
@@ -160,6 +161,14 @@ describe('wrapRequestProgress', () => {
       title: 'Confirming final claim',
       completedApprovals: 2,
     })
+  })
+})
+
+describe('describeAffiliateBonusRow', () => {
+  it('explains why the bonus has its own countdown and redeem', () => {
+    expect(describeAffiliateBonusRow()).toBe(
+      '2% affiliate bonus from the transfer above. The bridge registers it as a separate request shortly after the main one, so its security delay ends a little later and it needs its own Syrius redeem.',
+    )
   })
 })
 

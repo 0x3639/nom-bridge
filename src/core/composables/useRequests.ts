@@ -9,7 +9,7 @@ import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, Wra
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
-import {beneficiaryOf} from '../affiliate'
+import {AFFILIATE_LOG_INDEX_THRESHOLD, beneficiaryOf, isAffiliateBonusLogIndex} from '../affiliate'
 import {
   hasUnwrapProtocolAdvanced,
   hasWrapProtocolAdvanced,
@@ -146,6 +146,34 @@ async function runPoll(): Promise<void> {
   const addr = getEvmAddressFn?.() ?? null
   const bridge = getBridgeFn?.() ?? null
   await poll(addr, bridge)
+}
+
+// Presentation order: each affiliate bonus row (logIndex + 4e9) directly
+// after its parent transfer so the two countdowns read as one transfer.
+// Rows are otherwise kept in their incoming order; an orphaned bonus (parent
+// not listed) stays where it is.
+export function orderUnwrapRequests(views: UnwrapRequestView[]): UnwrapRequestView[] {
+  const byId = new Map(views.map(view => [view.id, view]))
+  const bonuses = new Map<string, UnwrapRequestView[]>()
+  for (const view of views) {
+    if (!isAffiliateBonusLogIndex(view.logIndex)) continue
+    const parentId = `${view.transactionHash}:${view.logIndex - AFFILIATE_LOG_INDEX_THRESHOLD}`
+    if (!byId.has(parentId)) continue
+    bonuses.set(parentId, [...(bonuses.get(parentId) ?? []), view])
+  }
+  const parentOf = new Map<string, string>()
+  for (const [parentId, rows] of bonuses) for (const row of rows) parentOf.set(row.id, parentId)
+  // A transfer group (parent + bonuses) takes the slot of whichever member
+  // appears first in the incoming order.
+  const emitted = new Set<string>()
+  const ordered: UnwrapRequestView[] = []
+  for (const view of views) {
+    const groupId = parentOf.get(view.id) ?? view.id
+    if (emitted.has(groupId)) continue
+    emitted.add(groupId)
+    ordered.push(byId.get(groupId)!, ...(bonuses.get(groupId) ?? []))
+  }
+  return ordered
 }
 
 async function getAllWrapRequests(evmAddress: string): Promise<WrapTokenRequest[]> {
@@ -601,7 +629,9 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
       }
 
       if (requestStore.getRevision() !== snapshot.revision) return false
-      if ((getZenonAddressFn?.() ?? '') === zenonAddr) unwrapRequests.value = unwrapViews
+      if ((getZenonAddressFn?.() ?? '') === zenonAddr) {
+        unwrapRequests.value = orderUnwrapRequests(unwrapViews)
+      }
     } else {
       unwrapRequests.value = []
     }
