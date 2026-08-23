@@ -23,6 +23,11 @@ import {
 import {selfReferralPayout} from '@/core/affiliate'
 import {normalizeEvmHash} from '@/core/evm-hash'
 import {EvmSubmissionError} from '@/core/evm-service'
+import {
+  createSubmitInterlock,
+  sameBridgeSubmitIntent,
+  type BridgeSubmitIntent,
+} from '@/core/submit-interlock'
 import {ZenonSubmissionError} from '@/core/zenon-wallet-service'
 import type {UnwrapRequestView, WrapRequestView} from '@/types'
 import type {Address} from 'viem'
@@ -117,6 +122,7 @@ const awaitingCompletion = ref<{
 } | null>(null)
 const progressRegion = ref<HTMLElement | null>(null)
 const sourceRechecking = ref(false)
+const {inFlight: submitInFlight, run: withSubmitInterlock} = createSubmitInterlock()
 // Durable hashless safety records for ambiguous Zenon wrap submissions by the
 // connected account; polling reconciles them against the node's request list.
 const relevantUnknownWraps = computed(() =>
@@ -177,7 +183,9 @@ const sourceConnecting = computed(() =>
 const destinationConnecting = computed(() =>
   direction.value === 'wrap' ? isEvmConnecting.value : isZenonConnecting.value,
 )
-const isSubmitting = computed(() => isWrapping.value || isUnwrapping.value)
+const isSubmitting = computed(() =>
+  submitInFlight.value || isWrapping.value || isUnwrapping.value,
+)
 const hasSubmittedSafetyState = computed(() =>
   wrapPhase.value.kind === 'submitted-untracked' ||
   wrapPhase.value.kind === 'submitted-unknown' ||
@@ -400,6 +408,7 @@ const ctaLabel = computed(() => {
   return `Bridge to ${toSide.value.network}`
 })
 const ctaDisabled = computed(() => {
+  if (isSubmitting.value) return true
   if (hasSubmittedSafetyState.value) return true
   if (!sourceConnected.value) return sourceConnecting.value
   if (!destinationConnected.value) return destinationConnecting.value
@@ -414,14 +423,17 @@ function formatDisplayAmount(base: bigint, decimals: number): string {
 }
 
 function updateAmount(event: Event): void {
+  if (isSubmitting.value) return
   amount.value = (event.target as HTMLInputElement).value
 }
 
 function updateTokenPair(event: Event): void {
+  if (isSubmitting.value) return
   selectedZts.value = (event.target as HTMLSelectElement).value
 }
 
 function setBalanceFraction(percent: 25 | 50 | 100): void {
+  if (isSubmitting.value) return
   const pair = selectedPair.value
   const balance = sourceBalance.value
   if (!pair || balance === undefined) return
@@ -430,6 +442,7 @@ function setBalanceFraction(percent: 25 | 50 | 100): void {
 }
 
 async function connectWallet(accent: 'zenon' | 'evm'): Promise<void> {
+  if (isSubmitting.value) return
   try {
     if (accent === 'zenon') await connectZenon()
     else await connectEvm()
@@ -439,6 +452,7 @@ async function connectWallet(accent: 'zenon' | 'evm'): Promise<void> {
 }
 
 async function disconnectWallet(accent: 'zenon' | 'evm'): Promise<void> {
+  if (isSubmitting.value) return
   try {
     if (accent === 'zenon') await disconnectZenon()
     else disconnectEvm()
@@ -448,6 +462,7 @@ async function disconnectWallet(accent: 'zenon' | 'evm'): Promise<void> {
 }
 
 async function onCtaClick(): Promise<void> {
+  if (isSubmitting.value) return
   if (!sourceConnected.value) return connectWallet(fromSide.value.accent)
   if (!destinationConnected.value) return connectWallet(toSide.value.accent)
   return onSubmit()
@@ -461,6 +476,7 @@ function swapDirection(): void {
 const canSubmit = computed<boolean>(() => {
   // Durable safety records must be enforced before any submission is possible;
   // until hydration completes the form cannot know whether a lock exists.
+  if (isSubmitting.value) return false
   if (!unknownWrapsHydrated.value) return false
   if (!selectedPair.value || !amount.value) return false
   if (halted.value || allowKeyGen.value) return false
@@ -624,48 +640,64 @@ watch([wrapRequests, unwrapRequests], () => {
   }
 }, {immediate: true})
 
-// Synchronous submit mutex: both submit paths await refreshBridge() before the
-// composables set their in-flight flags, so a second click during that network
-// request would otherwise start a second source transfer.
-let submitInFlight = false
+function captureSubmitIntent(): BridgeSubmitIntent | null {
+  const pair = selectedPair.value
+  const evm = evmAccount.value
+  const zenon = zenonAddress.value
+  const bridge = bridgeAddress.value
+  if (!pair || !amount.value || !evm || !zenon) return null
+  if (direction.value === 'unwrap' && !bridge) return null
 
-async function onSubmit(): Promise<void> {
-  if (submitInFlight) return
-  submitInFlight = true
-  try {
-    await onSubmitLocked()
-  } finally {
-    submitInFlight = false
+  return {
+    direction: direction.value,
+    zts: pair.zts,
+    amount: amount.value,
+    evmAccount: evm,
+    zenonAddress: zenon,
+    evmChainId: evmChainId.value,
+    bridgeAddress: bridge,
   }
 }
 
-async function onSubmitLocked(): Promise<void> {
+function assertSubmitIntentUnchanged(intent: BridgeSubmitIntent): void {
+  const current = captureSubmitIntent()
+  if (!current || !sameBridgeSubmitIntent(intent, current)) {
+    throw new Error('Transfer details changed during the safety check. Review them and submit again.')
+  }
+}
+
+async function onSubmit(): Promise<void> {
+  if (!canSubmit.value) return
+  const intent = captureSubmitIntent()
+  if (!intent) return
+  await withSubmitInterlock(() => onSubmitLocked(intent))
+}
+
+async function onSubmitLocked(intent: BridgeSubmitIntent): Promise<void> {
   localError.value = null
   lastSubmitted.value = null
   lastCompleted.value = null
-  if (!selectedPair.value || !evmAccount.value) return
-  if (direction.value === 'unwrap') return onUnwrapSubmit()
-  const zts = selectedPair.value.zts
+  if (intent.direction === 'unwrap') return onUnwrapSubmit(intent)
   try {
     await refreshBridge()
+    assertSubmitIntentUnchanged(intent)
     if (halted.value || allowKeyGen.value) {
       localError.value = halted.value
         ? 'The bridge is currently halted.'
         : 'Transfers are disabled while bridge key generation is enabled.'
       return
     }
-    const pair = tokenPairs.value.find(candidate => candidate.zts === zts)
+    const pair = tokenPairs.value.find(candidate => candidate.zts === intent.zts)
     if (!pair || !pair.wrapEnabled) throw new Error('Wrapping is disabled for this token pair')
-    const base = parseAmount(amount.value, pair.decimals)
+    const base = parseAmount(intent.amount, pair.decimals)
     if (base < pair.wrapMinAmount) throw new Error('Amount is below the current wrap minimum')
-    if (!zenonAddress.value) return
     const {id: hash, trackingFailed} = await wrap(
-      evmAccount.value,
-      amount.value,
+      intent.evmAccount,
+      intent.amount,
       pair.decimals,
       pair.zts,
       pair.symbol,
-      zenonAddress.value,
+      intent.zenonAddress,
     )
     toast.show('Wrap submitted', 'success')
     if (trackingFailed) {
@@ -691,33 +723,32 @@ async function onSubmitLocked(): Promise<void> {
   }
 }
 
-async function onUnwrapSubmit(): Promise<void> {
+async function onUnwrapSubmit(intent: BridgeSubmitIntent): Promise<void> {
   localError.value = null
-  const bridge = bridgeAddress.value
-  const zts = selectedPair.value?.zts
-  const evmFrom = evmAccount.value
-  if (!zts || !zenonAddress.value || !bridge || !evmFrom) return
+  const bridge = intent.bridgeAddress
+  if (!bridge) return
   try {
     await refreshBridge()
+    assertSubmitIntentUnchanged(intent)
     if (halted.value || allowKeyGen.value) {
       localError.value = halted.value
         ? 'The bridge is currently halted.'
         : 'Transfers are disabled while bridge key generation is enabled.'
       return
     }
-    const pair = tokenPairs.value.find(candidate => candidate.zts === zts)
+    const pair = tokenPairs.value.find(candidate => candidate.zts === intent.zts)
     if (!pair || !pair.unwrapEnabled) throw new Error('Unwrapping is disabled for this token pair')
-    const base = parseAmount(amount.value, pair.decimals)
+    const base = parseAmount(intent.amount, pair.decimals)
     if (base < pair.unwrapMinAmount) throw new Error('Amount is below the current unwrap minimum')
     const result = await doUnwrap(
       pair.tokenAddress as Address,
       base,
-      zenonAddress.value,
+      intent.zenonAddress,
       bridge as Address,
       pair.zts,
       pair.decimals,
       pair.symbol,
-      evmFrom,
+      intent.evmAccount,
       pair.unwrapBonusBps > 0,
     )
     const {hash} = result
@@ -1031,7 +1062,7 @@ onUnmounted(() => {
                 v-if="!sourceConnected"
                 type="button"
                 class="flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-wait"
-                :disabled="sourceConnecting"
+                :disabled="sourceConnecting || isSubmitting"
                 @click="connectWallet(fromSide.accent)"
               >
                 {{ sourceConnecting ? 'Connecting…' : 'Not connected' }}
@@ -1047,8 +1078,9 @@ onUnmounted(() => {
                 </span>
                 <button
                   type="button"
-                  class="flex shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-background/70 px-2.5 py-1 font-mono text-[11px] text-foreground transition-colors hover:border-foreground/25"
+                  class="flex shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-background/70 px-2.5 py-1 font-mono text-[11px] text-foreground transition-colors hover:border-foreground/25 disabled:cursor-not-allowed disabled:opacity-50"
                   :title="`Disconnect ${fromSide.network} wallet`"
+                  :disabled="isSubmitting"
                   @click="disconnectWallet(fromSide.accent)"
                 >
                   <span>{{ truncateAddress(sourceAddress ?? '') }}</span>
@@ -1079,6 +1111,7 @@ onUnmounted(() => {
                   v-if="tokenPairs.length > 1"
                   class="absolute inset-0 cursor-pointer opacity-0"
                   :value="selectedZts ?? ''"
+                  :disabled="isSubmitting"
                   aria-label="Select bridge token"
                   title="Select bridge token"
                   @change="updateTokenPair"
@@ -1154,7 +1187,7 @@ onUnmounted(() => {
                 v-if="!destinationConnected"
                 type="button"
                 class="flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-wait"
-                :disabled="destinationConnecting"
+                :disabled="destinationConnecting || isSubmitting"
                 @click="connectWallet(toSide.accent)"
               >
                 {{ destinationConnecting ? 'Connecting…' : 'Not connected' }}
@@ -1164,8 +1197,9 @@ onUnmounted(() => {
               <button
                 v-else
                 type="button"
-                class="flex shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-background/70 px-2.5 py-1 font-mono text-[11px] text-foreground transition-colors hover:border-foreground/25"
+                class="flex shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-background/70 px-2.5 py-1 font-mono text-[11px] text-foreground transition-colors hover:border-foreground/25 disabled:cursor-not-allowed disabled:opacity-50"
                 :title="`Disconnect ${toSide.network} wallet`"
+                :disabled="isSubmitting"
                 @click="disconnectWallet(toSide.accent)"
               >
                 <span>{{ truncateAddress(destinationAddress ?? '') }}</span>
