@@ -25,7 +25,7 @@ const mainnet: NetworkConfig = {
   evmRpcUrls: [
     'https://ethereum-rpc.publicnode.com',
     'https://eth.drpc.org',
-    'https://eth.merkle.io',
+    'https://rpc.mevblocker.io',
   ],
   evmExplorerTxUrl: 'https://etherscan.io/tx/',
   zenonExplorerTxUrl: 'https://zenonhub.io/explorer/transaction/',
