@@ -131,7 +131,7 @@ export function wrapRequestProgress(
       }
     case 'redeemable':
       return {
-        badge: 'Claim 1 of 2 ready',
+        badge: 'Step 2 of 3 ready',
         title: 'Claim on Ethereum',
         description: 'MetaMask will request wallet approval 2 of 3.',
         action: 'Claim on Ethereum · Step 2/3',
@@ -150,7 +150,7 @@ export function wrapRequestProgress(
       }
     case 'redeemable-2':
       return {
-        badge: 'Final claim ready',
+        badge: 'Step 3 of 3 ready',
         title: 'Complete claim on Ethereum',
         description: 'MetaMask will request the final wallet approval, step 3 of 3.',
         action: 'Complete claim · Step 3/3',
@@ -199,9 +199,18 @@ export function unwrapRequestProgress(
 ): RequestProgressCopy {
   const totalApprovals = knownTotalApprovals ?? 2
   const completedBeforeRedeem = totalApprovals - 1
+  // Badges count wallet approvals (same scheme as the wrap side) whenever the
+  // total is known — it is 2 or 3 depending on whether an ERC-20 approval was
+  // needed, and only the submitting browser knows. Node-only rows keep the
+  // neutral wording rather than guessing.
+  const known = knownTotalApprovals !== undefined
+  const stepBadge = (step: number, suffix: string, neutral: string): string =>
+    known ? `Step ${step} of ${totalApprovals}${suffix}` : neutral
+  const confirmedBadge = (count: number, neutral: string): string =>
+    known ? `${count} of ${totalApprovals} confirmed` : neutral
   if (pending === 'wallet') {
     return {
-      badge: 'Final approval',
+      badge: stepBadge(totalApprovals, '', 'Final approval'),
       title: 'Redeem on Zenon in Syrius',
       description: 'Waiting for Syrius approval. The action is locked to prevent duplicate prompts.',
       action: 'Waiting for Syrius…',
@@ -212,7 +221,7 @@ export function unwrapRequestProgress(
   }
   if (pending === 'confirming') {
     return {
-      badge: 'Final approval',
+      badge: stepBadge(totalApprovals, '', 'Final approval'),
       title: 'Confirming on Zenon',
       description: 'The redemption was submitted and is waiting for confirmation.',
       action: 'Confirming on Zenon…',
@@ -225,7 +234,7 @@ export function unwrapRequestProgress(
   switch (status) {
     case 'submitted':
       return {
-        badge: 'Submitted',
+        badge: stepBadge(completedBeforeRedeem, ' · confirming', 'Submitted'),
         title: 'Verifying Ethereum transaction',
         description: 'The transaction is pending or its receipt is temporarily unavailable. Do not submit it again.',
         actionable: false,
@@ -234,7 +243,7 @@ export function unwrapRequestProgress(
       }
     case 'pending':
       return {
-        badge: 'Source confirmed',
+        badge: confirmedBadge(completedBeforeRedeem, 'Source confirmed'),
         title: 'Waiting for Ethereum event indexing',
         description: finality
           ? describeFinality(finality)
@@ -245,7 +254,7 @@ export function unwrapRequestProgress(
       }
     case 'signing':
       return {
-        badge: 'Source confirmed',
+        badge: confirmedBadge(completedBeforeRedeem, 'Source confirmed'),
         title: 'Waiting for bridge signatures',
         description: 'No wallet action is required while bridge participants sign the request.',
         actionable: false,
@@ -254,7 +263,7 @@ export function unwrapRequestProgress(
       }
     case 'waiting':
       return {
-        badge: 'Source confirmed',
+        badge: confirmedBadge(completedBeforeRedeem, 'Source confirmed'),
         title: 'Security delay',
         description: 'The final Zenon redemption becomes available after the protocol delay.',
         actionable: false,
@@ -263,19 +272,19 @@ export function unwrapRequestProgress(
       }
     case 'redeemable':
       return {
-        badge: 'Final redemption ready',
+        badge: stepBadge(totalApprovals, ' ready', 'Final redemption ready'),
         title: 'Redeem on Zenon',
         description: knownTotalApprovals
           ? `Syrius will request wallet approval ${totalApprovals} of ${totalApprovals}.`
           : 'Syrius will request the final wallet approval.',
-        action: 'Redeem on Zenon · Final step',
+        action: known ? `Redeem on Zenon · Step ${totalApprovals}/${totalApprovals}` : 'Redeem on Zenon · Final step',
         actionable: true,
         completedApprovals: completedBeforeRedeem,
         totalApprovals,
       }
     case 'redeemed':
       return {
-        badge: 'Complete',
+        badge: confirmedBadge(totalApprovals, 'Complete'),
         title: 'Bridge complete',
         description: 'The Zenon redemption is confirmed.',
         actionable: false,
