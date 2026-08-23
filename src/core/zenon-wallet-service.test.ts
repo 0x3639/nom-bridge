@@ -268,6 +268,43 @@ describe('ZenonWalletService.connect — fresh pairing', () => {
     )
   })
 
+  it('a timed-out pairing is torn down too, and a late approval is disconnected', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    let approveLate: (session: unknown) => void = () => {}
+    h.client.connect.mockResolvedValue({
+      uri: `wc:${'cd'.repeat(32)}@2?relay-protocol=irn&symKey=ff`,
+      approval: vi.fn().mockReturnValue(new Promise(resolve => {
+        approveLate = resolve
+      })),
+    })
+    const {WC_TIMING} = await import('./wc-reliability')
+    WC_TIMING.approvalTimeoutMs = 10
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow('timed out')
+    expect(h.client.core.pairing.disconnect).toHaveBeenCalledWith({topic: 'cd'.repeat(32)})
+
+    approveLate(zenonSession('session-after-timeout', future()))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(h.client.disconnect).toHaveBeenCalledWith(
+      expect.objectContaining({topic: 'session-after-timeout', reason: expect.objectContaining({code: 6000})}),
+    )
+  })
+
+  it('a wallet-side rejection does not tear down anything (the wallet already declined)', async () => {
+    h.client.session.getAll.mockReturnValue([])
+    h.client.connect.mockResolvedValue({
+      uri: `wc:${'ef'.repeat(32)}@2?relay-protocol=irn&symKey=ff`,
+      approval: vi.fn().mockRejectedValue(Object.assign(new Error('rejected'), {code: 5000})),
+    })
+    const {ZenonWalletService} = await import('./zenon-wallet-service')
+
+    await expect(ZenonWalletService.getInstance().connect()).rejects.toThrow('Request rejected in the wallet')
+    expect(h.client.core.pairing.disconnect).not.toHaveBeenCalled()
+    expect(h.client.disconnect).not.toHaveBeenCalled()
+  })
+
   it('cancelPairing() is a no-op when no pairing is pending', async () => {
     const {ZenonWalletService} = await import('./zenon-wallet-service')
     expect(() => ZenonWalletService.getInstance().cancelPairing()).not.toThrow()

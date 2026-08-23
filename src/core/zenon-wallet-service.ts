@@ -190,15 +190,16 @@ export class ZenonWalletService {
         this.onPairingUri?.(uri)
       }
       const approvalPromise = approval()
-      let cancelledEarly = false
-      // Racing does not stop approval(): if Syrius approves after the user
-      // cancelled, the session would land in the store and be silently reused
-      // by the next connect(). Tear it down instead.
+      // Neither the timeout nor cancellation stops approval(): if Syrius
+      // approves after we gave up, the session would land in the store and be
+      // silently reused by the next connect(). Once abandoned, tear down the
+      // pairing topic and disconnect any session the approval still settles with.
+      let abandoned = false
       void approvalPromise.then(
         session => {
-          if (!cancelledEarly) return
+          if (!abandoned) return
           void client
-            .disconnect({topic: session.topic, reason: {code: 6000, message: 'Pairing cancelled'}})
+            .disconnect({topic: session.topic, reason: {code: 6000, message: 'Pairing abandoned'}})
             .catch(() => undefined)
         },
         () => undefined,
@@ -210,8 +211,10 @@ export class ZenonWalletService {
           cancelled,
         ])
       } catch (e) {
-        if (e instanceof PairingCancelledError && uri) {
-          cancelledEarly = true
+        // A wallet-side rejection already ended the pairing; only our own
+        // give-ups (cancel, timeout) leave a live pairing behind.
+        if ((e instanceof PairingCancelledError || e instanceof WalletTimeoutError) && uri) {
+          abandoned = true
           const topic = pairingTopicOf(uri)
           if (topic) await client.core.pairing.disconnect({topic}).catch(() => undefined)
         }
