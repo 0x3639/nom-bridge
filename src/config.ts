@@ -30,6 +30,8 @@ const mainnet: NetworkConfig = {
   zenonNetworkId: 1,
   networkClass: 2,
   evmChainId: 1,
+  // Source-receipt confirmation requires two separately addressed RPCs; the
+  // config test keeps this list free of duplicates so quorum cannot collapse.
   evmRpcUrls: [
     'https://ethereum-rpc.publicnode.com',
     'https://eth.drpc.org',
