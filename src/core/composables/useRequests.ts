@@ -130,7 +130,7 @@ export function reconcileUnknownWrapOperations(
     hash: string
     height: number
     zts: string
-    amount: string
+    amount: bigint
     evmToAddress: string | null
     networkClass: number | null
     chainId: number | null
@@ -143,11 +143,13 @@ export function reconcileUnknownWrapOperations(
   const ordered = [...operations].sort((a, b) => a.createdAt - b.createdAt)
   for (const operation of ordered) {
     if (operation.frontierHeight === null) continue
+    if (!/^\d+$/.test(operation.amount)) continue
+    const operationAmount = BigInt(operation.amount)
     const index = availableBlocks.findIndex(block =>
       block.corroborations >= MIN_ZENON_RPC_CORROBORATIONS &&
       block.height > (operation.frontierHeight as number) &&
       block.zts === operation.zts &&
-      block.amount === operation.amount &&
+      block.amount === operationAmount &&
       block.evmToAddress !== null &&
       block.evmToAddress.toLowerCase() === operation.evmToAddress.toLowerCase() &&
       block.networkClass === expected.networkClass &&

@@ -370,7 +370,7 @@ describe('BridgeService Zenon corroboration', () => {
         hash,
         height: 42,
         zts,
-        amount: '150000000',
+        amount: 150000000n,
         evmToAddress: '0xRecipient',
         networkClass: 2,
         chainId: 1,

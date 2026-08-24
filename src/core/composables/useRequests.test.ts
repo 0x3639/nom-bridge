@@ -89,7 +89,7 @@ describe('reconcileUnknownWrapOperations', () => {
     hash: string
     height: number
     zts: string
-    amount: string
+    amount: bigint
     evmToAddress: string | null
     networkClass: number | null
     chainId: number | null
@@ -98,7 +98,7 @@ describe('reconcileUnknownWrapOperations', () => {
     hash: 'blockhash-1',
     height: 42,
     zts: 'zts1znn',
-    amount: '150000000',
+    amount: 150000000n,
     evmToAddress: '0xrecipient',
     networkClass: 2,
     chainId: 1,
@@ -122,7 +122,15 @@ describe('reconcileUnknownWrapOperations', () => {
   it('ignores blocks at or below the recorded frontier or with a different tuple', () => {
     expect(reconcileUnknownWrapOperations([operation()], [block({height: 41})], expected)).toEqual([])
     expect(reconcileUnknownWrapOperations([operation()], [block({zts: 'zts1other'})], expected)).toEqual([])
-    expect(reconcileUnknownWrapOperations([operation()], [block({amount: '1'})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({amount: 1n})], expected)).toEqual([])
+  })
+
+  it('fails closed on a non-decimal tracked amount', () => {
+    expect(reconcileUnknownWrapOperations(
+      [operation({amount: '0x8f0d180'})],
+      [block()],
+      expected,
+    )).toEqual([])
   })
 
   it('requires the decoded EVM destination and chain to match the operation', () => {

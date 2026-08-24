@@ -55,7 +55,7 @@ interface CorroboratedWrapSend {
   height: number
   sourceAddress: string
   zts: string
-  amount: string
+  amount: bigint
   evmToAddress: string | null
   networkClass: number | null
   chainId: number | null
@@ -87,7 +87,7 @@ function wrapSendFingerprint(candidate: CorroboratedWrapSend): string {
     candidate.sourceAddress.toLowerCase(),
     BRIDGE_ADDRESS.toString().toLowerCase(),
     candidate.zts.toLowerCase(),
-    candidate.amount,
+    candidate.amount.toString(),
     candidate.evmToAddress?.toLowerCase() ?? null,
     candidate.networkClass,
     candidate.chainId,
@@ -280,7 +280,7 @@ export class BridgeService {
           height: block.height,
           sourceAddress: canonicalAddress,
           zts: block.tokenStandard.toString(),
-          amount: block.amount.toString(),
+          amount: BigInt(block.amount.toString()),
           ...decodeWrapTokenCall(block.data),
           confirmationMomentumHeight: confirmation.momentumHeight,
           confirmationMomentumHash: confirmation.momentumHash.toString(),
