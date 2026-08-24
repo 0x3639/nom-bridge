@@ -290,11 +290,12 @@ describe('BridgeService Zenon corroboration', () => {
     expect(h.getZenonRpcAccountBlock).not.toHaveBeenCalled()
   })
 
-  it('counts a confirmed wrap only when the second RPC returns the exact same block tuple', async () => {
+  it('canonicalizes uppercase-valid Zenon identifiers before corroborating the exact tuple', async () => {
     const actual = await vi.importActual<typeof import('znn-typescript-sdk')>('znn-typescript-sdk')
     const hash = 'ab'.repeat(32)
     const momentumHash = 'cd'.repeat(32)
-    const address = 'z1qsender'
+    const address = 'z1qxemdeddedxplasmaxxxxxxxxxxxxxxxxsctrp'
+    const zts = 'zts1znnxxxxxxxxxxxxx9z4ulx'
     const encoded = actual.BridgeContract.encodeCall('WrapToken', [2, 1, '0xRecipient'])
     const data = Buffer.from(encoded.replace(/^0x/i, ''), 'hex')
     const parsed = {toString: () => address}
@@ -308,7 +309,7 @@ describe('BridgeService Zenon corroboration', () => {
           height: 42,
           address: parsed,
           toAddress: actual.BRIDGE_ADDRESS,
-          tokenStandard: {toString: () => 'zts1znn'},
+          tokenStandard: {toString: () => zts},
           amount: 150000000n,
           data,
           confirmationDetail: {
@@ -324,9 +325,9 @@ describe('BridgeService Zenon corroboration', () => {
       blockType: actual.BlockTypeEnum.UserSend,
       hash,
       height: 42,
-      address,
-      toAddress: actual.BRIDGE_ADDRESS.toString(),
-      tokenStandard: 'zts1znn',
+      address: address.toUpperCase(),
+      toAddress: actual.BRIDGE_ADDRESS.toString().toUpperCase(),
+      tokenStandard: zts.toUpperCase(),
       amount: '150000000',
       data: data.toString('base64'),
       confirmationDetail: {
@@ -342,7 +343,7 @@ describe('BridgeService Zenon corroboration', () => {
       expect.objectContaining({
         hash,
         height: 42,
-        zts: 'zts1znn',
+        zts,
         amount: '150000000',
         evmToAddress: '0xRecipient',
         networkClass: 2,

@@ -84,9 +84,9 @@ function wrapSendFingerprint(candidate: CorroboratedWrapSend): string {
     BlockTypeEnum.UserSend,
     candidate.hash.toLowerCase(),
     candidate.height,
-    candidate.sourceAddress,
-    BRIDGE_ADDRESS.toString(),
-    candidate.zts,
+    candidate.sourceAddress.toLowerCase(),
+    BRIDGE_ADDRESS.toString().toLowerCase(),
+    candidate.zts.toLowerCase(),
     candidate.amount,
     candidate.evmToAddress?.toLowerCase() ?? null,
     candidate.networkClass,
@@ -106,9 +106,9 @@ function rpcWrapSendFingerprint(block: ZenonRpcAccountBlock): string | null {
     block.blockType,
     block.hash,
     block.height,
-    block.address,
-    block.toAddress,
-    block.tokenStandard,
+    block.address.toLowerCase(),
+    block.toAddress.toLowerCase(),
+    block.tokenStandard.toLowerCase(),
     block.amount,
     decoded.evmToAddress?.toLowerCase() ?? null,
     decoded.networkClass,
@@ -252,6 +252,7 @@ export class BridgeService {
     const ledger = this.zenonService.getZenon().ledger
     const primaryUrl = this.zenonService.getNodeUrl()
     const parsed = Address.parse(address)
+    const canonicalAddress = parsed.toString()
     const results: CorroboratedWrapSend[] = []
     for (let page = 0; page < 20; page += 1) {
       const response = await ledger.getAccountBlocksByPage(parsed, page, 50)
@@ -265,14 +266,14 @@ export class BridgeService {
         }
         if (block.chainIdentifier !== config.zenonChainId) continue
         if (block.blockType !== BlockTypeEnum.UserSend) continue
-        if (block.address.toString() !== address) continue
+        if (block.address.toString() !== canonicalAddress) continue
         if (block.toAddress.toString() !== BRIDGE_ADDRESS.toString()) continue
         const confirmation = block.confirmationDetail
         if (!confirmation) continue
         const candidate: CorroboratedWrapSend = {
           hash: block.hash.toString(),
           height: block.height,
-          sourceAddress: address,
+          sourceAddress: canonicalAddress,
           zts: block.tokenStandard.toString(),
           amount: block.amount.toString(),
           ...decodeWrapTokenCall(block.data),

@@ -145,9 +145,9 @@ async function wrapLocked(
     // Persist the safety intent BEFORE the wallet call: a crash while Syrius
     // holds the prompt — or right after broadcast — must still leave a durable
     // record, so the wallet prompt may not open unless this write succeeded.
-    // The originating account and the highest pre-send frontier observed by
-    // both pinned RPCs are what later let polling PROVE publication from the
-    // account chain. If either read fails, null prevents automatic release.
+    // Both pinned frontiers are required to rule out an old matching send.
+    // If either read fails, null permanently disables automatic release for
+    // this operation; an ambiguous result then requires manual resolution.
     const frontierHeight = await BridgeService.getInstance()
       .getAccountFrontierHeight(zenonFromAddress)
       .catch(() => null)

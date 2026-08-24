@@ -36,9 +36,16 @@ wallet call. Automatic recovery is deliberately stricter than ordinary reads:
 the pre-send account frontier is the highest height observed by both pinned
 Zenon RPCs, and the lock is released only when both RPCs return the same
 confirmed account-block hash, source account, bridge destination, token,
-amount, decoded EVM recipient/network tuple, and confirmation momentum. If
-either endpoint is unavailable or disagrees, reconciliation fails closed and
-the lock remains.
+amount, decoded EVM recipient/network tuple, and confirmation momentum.
+
+This deliberately couples automatic recovery to both endpoints at wrap time.
+If either frontier read fails, the wrap can still be submitted, but its safety
+record stores no baseline. If that submission later becomes ambiguous, the
+record cannot auto-release and requires manual resolution. Falling back to one
+frontier would let that node under-report the baseline so an old genuine block
+with the same transfer tuple could masquerade as the new submission. During
+reconciliation, either endpoint being unavailable or disagreeing also fails
+closed and leaves the lock intact.
 
 ## Unwrap self-referral bonus
 

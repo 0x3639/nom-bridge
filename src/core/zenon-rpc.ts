@@ -1,3 +1,5 @@
+import {Address, TokenStandard} from 'znn-typescript-sdk'
+
 const DEFAULT_RPC_TIMEOUT_MS = 8_000
 export const MIN_ZENON_RPC_CORROBORATIONS = 2
 
@@ -84,15 +86,25 @@ export function parseZenonRpcAccountBlock(value: unknown): ZenonRpcAccountBlock 
   ) {
     throw new Error('Invalid Zenon RPC account block')
   }
+  let address: string
+  let toAddress: string
+  let tokenStandard: string
+  try {
+    address = Address.parse(value.address).toString()
+    toAddress = Address.parse(value.toAddress).toString()
+    tokenStandard = TokenStandard.parse(value.tokenStandard).toString()
+  } catch {
+    throw new Error('Invalid Zenon RPC account block')
+  }
   return {
     chainIdentifier: value.chainIdentifier,
     blockType: value.blockType,
     hash: value.hash.toLowerCase(),
     height: value.height,
-    address: value.address,
-    toAddress: value.toAddress,
+    address,
+    toAddress,
     amount: value.amount,
-    tokenStandard: value.tokenStandard,
+    tokenStandard,
     data: value.data,
     confirmationDetail: parseConfirmationDetail(value.confirmationDetail),
   }
@@ -168,6 +180,10 @@ export function websocketJsonRpc<T>(
         return
       }
       if (!isRecord(response) || response.id !== requestId) return
+      if (response.jsonrpc !== '2.0') {
+        fail(new Error('Zenon RPC returned an invalid JSON-RPC version'))
+        return
+      }
       if (isRecord(response.error)) {
         const code = typeof response.error.code === 'number' ? ` (${response.error.code})` : ''
         fail(new Error(`Zenon RPC error${code}: ${method}`))
@@ -189,15 +205,18 @@ export async function getZenonRpcFrontierHeight(
   address: string,
   options: JsonRpcOptions = {},
 ): Promise<number> {
+  const canonicalAddress = Address.parse(address).toString()
   const response = await websocketJsonRpc<unknown>(
     url,
     'ledger.getFrontierAccountBlock',
-    [address],
+    [canonicalAddress],
     options,
   )
   if (response === null) return 0
   const block = parseZenonRpcAccountBlock(response)
-  if (block.address !== address) throw new Error('Zenon RPC returned the wrong account frontier')
+  if (block.address !== canonicalAddress) {
+    throw new Error('Zenon RPC returned the wrong account frontier')
+  }
   return block.height
 }
 

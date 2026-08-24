@@ -280,6 +280,24 @@ describe('useWrap.wrap', () => {
     expect(h.clearUnknownWrap).not.toHaveBeenCalled()
   })
 
+  it('stores no baseline when frontier corroboration fails, preventing automatic release', async () => {
+    h.buildWrapBlock.mockReturnValue({__block: true})
+    h.extractNumberDecimals.mockReturnValue({toString: () => '150000000'})
+    h.getAccountFrontierHeight.mockRejectedValue(new Error('secondary unavailable'))
+    const {ZenonSubmissionError} = await import('../zenon-wallet-service')
+    h.send.mockRejectedValue(new ZenonSubmissionError('ambiguous', 'result unavailable'))
+    const {useWrap} = await import('./useWrap')
+
+    await expect(
+      useWrap().wrap('0xRecipient', '1.5', 8, 'zts1znn', 'ZNN', 'z1qsender'),
+    ).rejects.toMatchObject({kind: 'ambiguous'})
+    expect(h.setUnknownWrap).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({frontierHeight: null}),
+    )
+    expect(h.clearUnknownWrap).not.toHaveBeenCalled()
+  })
+
   it('aborts the submission when the safety intent cannot be persisted', async () => {
     h.buildWrapBlock.mockReturnValue({__block: true})
     h.extractNumberDecimals.mockReturnValue({toString: () => '100000000'})

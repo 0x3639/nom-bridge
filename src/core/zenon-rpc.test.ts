@@ -7,16 +7,20 @@ import {
   type JsonRpcSocketFactory,
 } from './zenon-rpc'
 
+const SENDER_ADDRESS = 'z1qxemdeddedxplasmaxxxxxxxxxxxxxxxxsctrp'
+const BRIDGE_ADDRESS = 'z1qxemdeddedxdrydgexxxxxxxxxxxxxxxmqgr0d'
+const ZNN_TOKEN_STANDARD = 'zts1znnxxxxxxxxxxxxx9z4ulx'
+
 function rawBlock(overrides: Record<string, unknown> = {}) {
   return {
     chainIdentifier: 1,
     blockType: 2,
     hash: 'ab'.repeat(32),
     height: 42,
-    address: 'z1qsender',
-    toAddress: 'z1qbridge',
+    address: SENDER_ADDRESS,
+    toAddress: BRIDGE_ADDRESS,
     amount: '150000000',
-    tokenStandard: 'zts1znn',
+    tokenStandard: ZNN_TOKEN_STANDARD,
     data: 'd3JhcA==',
     confirmationDetail: {
       numConfirmations: 2,
@@ -28,7 +32,10 @@ function rawBlock(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function resultSocket(result: unknown): JsonRpcSocketFactory {
+function resultSocket(
+  result: unknown,
+  envelopeOverrides: Record<string, unknown> = {},
+): JsonRpcSocketFactory {
   return () => {
     const socket = {
       onopen: null as ((event: Event) => void) | null,
@@ -38,7 +45,7 @@ function resultSocket(result: unknown): JsonRpcSocketFactory {
       send(data: string) {
         const request = JSON.parse(data) as {id: number}
         queueMicrotask(() => socket.onmessage?.(new MessageEvent('message', {
-          data: JSON.stringify({jsonrpc: '2.0', id: request.id, result}),
+          data: JSON.stringify({jsonrpc: '2.0', id: request.id, result, ...envelopeOverrides}),
         })))
       },
       close() {},
@@ -55,10 +62,10 @@ describe('parseZenonRpcAccountBlock', () => {
       blockType: 2,
       hash: 'ab'.repeat(32),
       height: 42,
-      address: 'z1qsender',
-      toAddress: 'z1qbridge',
+      address: SENDER_ADDRESS,
+      toAddress: BRIDGE_ADDRESS,
       amount: '150000000',
-      tokenStandard: 'zts1znn',
+      tokenStandard: ZNN_TOKEN_STANDARD,
       data: 'd3JhcA==',
       confirmationDetail: {
         numConfirmations: 2,
@@ -82,18 +89,30 @@ describe('parseZenonRpcAccountBlock', () => {
     expect(parseZenonRpcAccountBlock(rawBlock({confirmationDetail: null})).confirmationDetail)
       .toBeNull()
   })
+
+  it('validates and canonicalizes uppercase Zenon Bech32 identifiers', () => {
+    expect(parseZenonRpcAccountBlock(rawBlock({
+      address: SENDER_ADDRESS.toUpperCase(),
+      toAddress: BRIDGE_ADDRESS.toUpperCase(),
+      tokenStandard: ZNN_TOKEN_STANDARD.toUpperCase(),
+    }))).toMatchObject({
+      address: SENDER_ADDRESS,
+      toAddress: BRIDGE_ADDRESS,
+      tokenStandard: ZNN_TOKEN_STANDARD,
+    })
+  })
 })
 
 describe('scoped Zenon RPC reads', () => {
   it('reads a validated frontier height and treats a new account as height zero', async () => {
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
-      'z1qsender',
+      SENDER_ADDRESS,
       {createSocket: resultSocket(rawBlock())},
     )).resolves.toBe(42)
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
-      'z1qsender',
+      SENDER_ADDRESS,
       {createSocket: resultSocket(null)},
     )).resolves.toBe(0)
   })
@@ -101,8 +120,8 @@ describe('scoped Zenon RPC reads', () => {
   it('rejects a frontier returned for a different account', async () => {
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
-      'z1qsender',
-      {createSocket: resultSocket(rawBlock({address: 'z1qother'}))},
+      SENDER_ADDRESS,
+      {createSocket: resultSocket(rawBlock({address: BRIDGE_ADDRESS}))},
     )).rejects.toThrow('wrong account frontier')
   })
 
@@ -213,5 +232,17 @@ describe('websocketJsonRpc', () => {
       ['ab'.repeat(32)],
       {createSocket},
     )).rejects.toThrow('Zenon RPC error (-32603): ledger.getAccountBlockByHash')
+  })
+
+  it.each([
+    {label: 'missing', jsonrpc: undefined},
+    {label: 'mismatched', jsonrpc: '1.0'},
+  ])('rejects a $label JSON-RPC version', async ({jsonrpc}) => {
+    await expect(websocketJsonRpc(
+      'wss://node.example',
+      'ledger.getAccountBlockByHash',
+      ['ab'.repeat(32)],
+      {createSocket: resultSocket(rawBlock(), {jsonrpc})},
+    )).rejects.toThrow('invalid JSON-RPC version')
   })
 })
