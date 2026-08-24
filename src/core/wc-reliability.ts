@@ -42,7 +42,8 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
 
 export type WalletErrorAction = 'reconnect' | 'retry' | 'locked' | 'rejected' | 'fatal'
 
-// Known Syrius/WalletConnect failure modes and how to react to each.
+// Known Syrius/WalletConnect failure shapes. Callers still decide whether a
+// retry is safe: in particular, znn_send must never be replayed automatically.
 export function classifyWalletError(e: unknown): WalletErrorAction {
   const code = (e as {code?: number})?.code
   const message = String((e as {message?: string})?.message ?? '')

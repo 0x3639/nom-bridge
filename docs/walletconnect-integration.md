@@ -180,18 +180,21 @@ The bridge interprets WalletConnect JSON-RPC error codes:
   treated as a **user/wallet rejection** and shown as *"Request rejected in the
   wallet."* Use a code in one of these when the user declines a
   `znn_send`/`znn_sign` prompt.
+- **Code `9000`** with a message containing **`Wallet is locked`** → treated as
+  a definite non-submission and shown as *"unlock your wallet."*
 - Any other error code or thrown error → generic *"WalletConnect request
   failed."*
 
 **The rejection code is load-bearing for `znn_send`.** The bridge persists a
 redemption safety lock *before* sending `znn_send` and only releases it on
-failure when the error is provably a rejection (a code above — nothing was
-signed or broadcast). Any other `znn_send` failure is treated as **ambiguous**
-(the wallet may still sign and broadcast late, e.g. after a relay timeout) and
-the safety lock is deliberately kept until the node's authoritative state
-resolves it. A wallet that reports user rejections with a non-rejection code
-will therefore leave the user's redemption locked until the node confirms
-nothing was published — always return `4001` or a `5xxx` code for declines.
+failure when the error is provably a rejection or the known locked-wallet
+response above (nothing was signed or broadcast). Any other `znn_send` failure
+is treated as **ambiguous** (the wallet may still sign and broadcast late, e.g.
+after a relay timeout) and the safety lock is deliberately kept until the
+node's authoritative state resolves it. A wallet that reports user rejections
+with a non-rejection code will therefore leave the user's redemption locked
+until the node confirms nothing was published — always return `4001` or a
+`5xxx` code for declines.
 
 ### dApp-side reliability behavior (v2)
 
@@ -201,13 +204,18 @@ The bridge now enforces the following on its side; wallets should be aware:
   races a **2 min timeout because signing is human-paced**; pairing approval
   races **5 min** (the pairing-URI lifetime). A hung request surfaces to the
   user as a timeout — respond or error, never go silent.
-- `znn_info`/`znn_send` are attempted up to **3 times**. Three error shapes get
-  special handling, matching known Syrius behavior:
+- Read-only `znn_info` requests are attempted up to **3 times**. Three error
+  shapes get special handling, matching known Syrius behavior:
   - `code 9000` + message containing `Wallet is locked` → surfaced as
     "unlock your wallet", no retry.
   - `code -32602` + `Bad state: No element` → the bridge drops the session,
     re-pairs/reuses, and retries.
   - `code -32602` + `No matching key` → retried as-is.
+- Non-idempotent `znn_send` requests are attempted **exactly once**. The known
+  `code 9000` + `Wallet is locked` response is a definite non-submission. A
+  timeout or any other non-rejection error may arrive after the wallet signed
+  or broadcast the block, so the bridge treats it as ambiguous and keeps its
+  safety lock; it never automatically sends the same transfer again.
 - If the relay transport is down when a request is made, the bridge reopens it
   and waits ~2 s before sending.
 - After session approval the bridge waits ~5 s and re-reads its session store
