@@ -6,6 +6,7 @@ import {pendingZenonRedeemFor, requestStore, type UnknownWrapOperation} from '..
 import {DEFAULT_MOMENTUM_TIME} from '@/config'
 import {config} from '@/config'
 import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, WrapRequestView, WrapStatus} from '@/types'
+import {TokenStandard} from 'znn-typescript-sdk'
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
@@ -145,10 +146,16 @@ export function reconcileUnknownWrapOperations(
     if (operation.frontierHeight === null) continue
     if (!/^\d+$/.test(operation.amount)) continue
     const operationAmount = BigInt(operation.amount)
+    let operationZts: string
+    try {
+      operationZts = TokenStandard.parse(operation.zts).toString()
+    } catch {
+      continue
+    }
     const index = availableBlocks.findIndex(block =>
       block.corroborations >= MIN_ZENON_RPC_CORROBORATIONS &&
       block.height > (operation.frontierHeight as number) &&
-      block.zts === operation.zts &&
+      block.zts === operationZts &&
       block.amount === operationAmount &&
       block.evmToAddress !== null &&
       block.evmToAddress.toLowerCase() === operation.evmToAddress.toLowerCase() &&

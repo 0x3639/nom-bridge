@@ -73,12 +73,14 @@ describe('matchesTrackedUnwrapEvent', () => {
 })
 
 describe('reconcileUnknownWrapOperations', () => {
+  const znnZts = 'zts1znnxxxxxxxxxxxxx9z4ulx'
+  const qsrZts = 'zts1qsrxxxxxxxxxxxxxmrhjll'
   const operation = (overrides: Partial<Parameters<typeof reconcileUnknownWrapOperations>[0][0]> = {}) => ({
     id: 'op-1',
     evmToAddress: '0xRecipient',
     zenonFromAddress: 'z1qsender',
     frontierHeight: 41,
-    zts: 'zts1znn',
+    zts: znnZts,
     amount: '150000000',
     decimals: 8,
     symbol: 'ZNN',
@@ -97,7 +99,7 @@ describe('reconcileUnknownWrapOperations', () => {
   }> = {}) => ({
     hash: 'blockhash-1',
     height: 42,
-    zts: 'zts1znn',
+    zts: znnZts,
     amount: 150000000n,
     evmToAddress: '0xrecipient',
     networkClass: 2,
@@ -121,13 +123,29 @@ describe('reconcileUnknownWrapOperations', () => {
 
   it('ignores blocks at or below the recorded frontier or with a different tuple', () => {
     expect(reconcileUnknownWrapOperations([operation()], [block({height: 41})], expected)).toEqual([])
-    expect(reconcileUnknownWrapOperations([operation()], [block({zts: 'zts1other'})], expected)).toEqual([])
+    expect(reconcileUnknownWrapOperations([operation()], [block({zts: qsrZts})], expected)).toEqual([])
     expect(reconcileUnknownWrapOperations([operation()], [block({amount: 1n})], expected)).toEqual([])
   })
 
   it('fails closed on a non-decimal tracked amount', () => {
     expect(reconcileUnknownWrapOperations(
       [operation({amount: '0x8f0d180'})],
+      [block()],
+      expected,
+    )).toEqual([])
+  })
+
+  it('canonicalizes an uppercase-valid tracked token standard', () => {
+    expect(reconcileUnknownWrapOperations(
+      [operation({zts: znnZts.toUpperCase()})],
+      [block()],
+      expected,
+    )).toEqual(['op-1'])
+  })
+
+  it('fails closed on an invalid tracked token standard', () => {
+    expect(reconcileUnknownWrapOperations(
+      [operation({zts: 'zts1invalid'})],
       [block()],
       expected,
     )).toEqual([])
