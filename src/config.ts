@@ -1,5 +1,6 @@
 export interface NetworkConfig {
   nodeUrl: string
+  zenonRpcUrls: readonly string[]
   zenonChainId: number
   zenonNetworkId: number
   networkClass: number       // 2 = EVM
@@ -18,6 +19,13 @@ export const DEFAULT_MOMENTUM_TIME = 10
 
 const mainnet: NetworkConfig = {
   nodeUrl: 'wss://node.zenonhub.io:35998',
+  // Distinct endpoints from zenon-network/zenon-node-database.
+  // Ambiguous wrap reconciliation requires matching observations from both;
+  // the first remains the application's normal read/write node.
+  zenonRpcUrls: [
+    'wss://node.zenonhub.io:35998',
+    'wss://my.hc1node.com:35998',
+  ],
   zenonChainId: 1,
   zenonNetworkId: 1,
   networkClass: 2,

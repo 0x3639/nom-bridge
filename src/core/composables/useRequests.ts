@@ -6,6 +6,7 @@ import {pendingZenonRedeemFor, requestStore, type UnknownWrapOperation} from '..
 import {DEFAULT_MOMENTUM_TIME} from '@/config'
 import {config} from '@/config'
 import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, WrapRequestView, WrapStatus} from '@/types'
+import {TokenStandard} from 'znn-typescript-sdk'
 import type {UnwrapTokenRequest, WrapTokenRequest} from 'znn-typescript-sdk'
 import type {Address, Hex} from 'viem'
 import {normalizeEvmHash} from '../evm-hash'
@@ -23,6 +24,7 @@ import {
   type FinalityProgress,
   type UnwrappedEventRecord,
 } from '../evm-service'
+import {MIN_ZENON_RPC_CORROBORATIONS} from '../zenon-rpc'
 export {normalizeEvmHash} from '../evm-hash'
 import {createPollScheduler} from './poll-scheduler'
 
@@ -119,7 +121,9 @@ export function matchesTrackedUnwrapEvent(
 // amount wrap to another destination, an undecodable payload, or a wrong
 // chain never matches. Candidate blocks are consumed one-to-one (oldest
 // operation first) so a single published block can never clear multiple
-// ambiguous operations. A null frontier (pre-send read failed) never
+// ambiguous operations. The same block and tuple must be confirmed by at
+// least two configured Zenon RPCs; one node can never release the safety
+// record by itself. A null frontier (pre-send read failed) never
 // auto-reconciles. Returns the ids of proven operations.
 export function reconcileUnknownWrapOperations(
   operations: Array<{id: string} & UnknownWrapOperation>,
@@ -127,10 +131,11 @@ export function reconcileUnknownWrapOperations(
     hash: string
     height: number
     zts: string
-    amount: string
+    amount: bigint
     evmToAddress: string | null
     networkClass: number | null
     chainId: number | null
+    corroborations: number
   }>,
   expected: {networkClass: number; evmChainId: number},
 ): string[] {
@@ -139,10 +144,19 @@ export function reconcileUnknownWrapOperations(
   const ordered = [...operations].sort((a, b) => a.createdAt - b.createdAt)
   for (const operation of ordered) {
     if (operation.frontierHeight === null) continue
+    if (!/^\d+$/.test(operation.amount)) continue
+    const operationAmount = BigInt(operation.amount)
+    let operationZts: string
+    try {
+      operationZts = TokenStandard.parse(operation.zts).toString()
+    } catch {
+      continue
+    }
     const index = availableBlocks.findIndex(block =>
+      block.corroborations >= MIN_ZENON_RPC_CORROBORATIONS &&
       block.height > (operation.frontierHeight as number) &&
-      block.zts === operation.zts &&
-      block.amount === operation.amount &&
+      block.zts === operationZts &&
+      block.amount === operationAmount &&
       block.evmToAddress !== null &&
       block.evmToAddress.toLowerCase() === operation.evmToAddress.toLowerCase() &&
       block.networkClass === expected.networkClass &&

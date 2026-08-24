@@ -8,10 +8,10 @@ const LOCKS_STORAGE_KEY = 'nom-bridge:action-locks:v1'
 
 export interface UnknownWrapOperation {
   evmToAddress: string
-  // Originating Zenon account and its frontier height read authoritatively
-  // pre-send: reconciliation scans THIS account's chain for a wrap send above
-  // THIS height. null frontier → the read failed, so the operation can never
-  // be auto-reconciled (fail closed).
+  // Originating Zenon account and the highest frontier height observed by the
+  // pinned RPC set pre-send: reconciliation scans THIS account's chain for a
+  // wrap send above THIS height. null frontier → a read failed, so the
+  // operation can never be auto-reconciled (fail closed).
   zenonFromAddress: string
   frontierHeight: number | null
   zts: string
