@@ -220,27 +220,36 @@ describe('BridgeService token reads', () => {
 })
 
 describe('BridgeService Zenon corroboration', () => {
-  it('records the highest frontier observed by both configured RPCs', async () => {
-    const parsed = {toString: () => 'z1qsender'}
+  it('canonicalizes the account and records the highest frontier observed by both RPCs', async () => {
+    const address = 'z1qxemdeddedxplasmaxxxxxxxxxxxxxxxxsctrp'
+    const parsed = {toString: () => address}
     h.addressParse.mockReturnValue(parsed)
     h.getFrontierAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId,
       address: parsed,
       height: 41,
     })
     h.getZenonRpcFrontierHeight.mockResolvedValue(43)
     const {BridgeService} = await import('./bridge-service')
 
-    await expect(BridgeService.getInstance().getAccountFrontierHeight('z1qsender')).resolves.toBe(43)
+    await expect(
+      BridgeService.getInstance().getAccountFrontierHeight(address.toUpperCase()),
+    ).resolves.toBe(43)
     expect(h.getZenonRpcFrontierHeight).toHaveBeenCalledWith(
       'wss://my.hc1node.com:35998',
-      'z1qsender',
+      address,
+      config.zenonChainId,
     )
   })
 
   it('fails closed when the corroborating frontier cannot be read', async () => {
     const parsed = {toString: () => 'z1qsender'}
     h.addressParse.mockReturnValue(parsed)
-    h.getFrontierAccountBlock.mockResolvedValue({address: parsed, height: 41})
+    h.getFrontierAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId,
+      address: parsed,
+      height: 41,
+    })
     h.getZenonRpcFrontierHeight.mockRejectedValue(new Error('secondary unavailable'))
     const {BridgeService} = await import('./bridge-service')
 
@@ -252,7 +261,24 @@ describe('BridgeService Zenon corroboration', () => {
   it('rejects a primary frontier for a different account', async () => {
     h.addressParse.mockReturnValue({toString: () => 'z1qsender'})
     h.getFrontierAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId,
       address: {toString: () => 'z1qother'},
+      height: 41,
+    })
+    h.getZenonRpcFrontierHeight.mockResolvedValue(41)
+    const {BridgeService} = await import('./bridge-service')
+
+    await expect(
+      BridgeService.getInstance().getAccountFrontierHeight('z1qsender'),
+    ).rejects.toThrow('invalid account frontier')
+  })
+
+  it('rejects a primary frontier for a different chain', async () => {
+    const parsed = {toString: () => 'z1qsender'}
+    h.addressParse.mockReturnValue(parsed)
+    h.getFrontierAccountBlock.mockResolvedValue({
+      chainIdentifier: config.zenonChainId + 1,
+      address: parsed,
       height: 41,
     })
     h.getZenonRpcFrontierHeight.mockResolvedValue(41)
@@ -328,7 +354,7 @@ describe('BridgeService Zenon corroboration', () => {
       address: address.toUpperCase(),
       toAddress: actual.BRIDGE_ADDRESS.toString().toUpperCase(),
       tokenStandard: zts.toUpperCase(),
-      amount: '150000000',
+      amount: 150000000n,
       data: data.toString('base64'),
       confirmationDetail: {
         numConfirmations: 2,
@@ -390,7 +416,7 @@ describe('BridgeService Zenon corroboration', () => {
       address,
       toAddress: actual.BRIDGE_ADDRESS.toString(),
       tokenStandard: 'zts1znn',
-      amount: '1',
+      amount: 1n,
       data: data.toString('base64'),
       confirmationDetail: {
         numConfirmations: 2,

@@ -64,7 +64,7 @@ describe('parseZenonRpcAccountBlock', () => {
       height: 42,
       address: SENDER_ADDRESS,
       toAddress: BRIDGE_ADDRESS,
-      amount: '150000000',
+      amount: 150000000n,
       tokenStandard: ZNN_TOKEN_STANDARD,
       data: 'd3JhcA==',
       confirmationDetail: {
@@ -108,11 +108,13 @@ describe('scoped Zenon RPC reads', () => {
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
       SENDER_ADDRESS,
+      1,
       {createSocket: resultSocket(rawBlock())},
     )).resolves.toBe(42)
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
       SENDER_ADDRESS,
+      1,
       {createSocket: resultSocket(null)},
     )).resolves.toBe(0)
   })
@@ -121,8 +123,18 @@ describe('scoped Zenon RPC reads', () => {
     await expect(getZenonRpcFrontierHeight(
       'wss://node.example',
       SENDER_ADDRESS,
+      1,
       {createSocket: resultSocket(rawBlock({address: BRIDGE_ADDRESS}))},
     )).rejects.toThrow('wrong account frontier')
+  })
+
+  it('rejects a frontier returned for a different chain', async () => {
+    await expect(getZenonRpcFrontierHeight(
+      'wss://node.example',
+      SENDER_ADDRESS,
+      1,
+      {createSocket: resultSocket(rawBlock({chainIdentifier: 2}))},
+    )).rejects.toThrow('wrong chain frontier')
   })
 
   it('reads only the requested account-block hash and preserves not-found', async () => {
@@ -244,5 +256,29 @@ describe('websocketJsonRpc', () => {
       ['ab'.repeat(32)],
       {createSocket: resultSocket(rawBlock(), {jsonrpc})},
     )).rejects.toThrow('invalid JSON-RPC version')
+  })
+
+  it.each([
+    {label: 'null', error: null},
+    {label: 'primitive', error: 'internal details'},
+  ])('rejects a response containing both result and a $label error', async ({error}) => {
+    await expect(websocketJsonRpc(
+      'wss://node.example',
+      'ledger.getAccountBlockByHash',
+      ['ab'.repeat(32)],
+      {createSocket: resultSocket(rawBlock(), {error})},
+    )).rejects.toThrow('exactly one of result or error')
+  })
+
+  it.each([
+    {label: 'null', error: null},
+    {label: 'primitive', error: 'internal details'},
+  ])('rejects an error-only response with a $label error value', async ({error}) => {
+    await expect(websocketJsonRpc(
+      'wss://node.example',
+      'ledger.getAccountBlockByHash',
+      ['ab'.repeat(32)],
+      {createSocket: resultSocket(undefined, {error})},
+    )).rejects.toThrow('invalid error object')
   })
 })

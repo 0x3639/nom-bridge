@@ -109,7 +109,7 @@ function rpcWrapSendFingerprint(block: ZenonRpcAccountBlock): string | null {
     block.address.toLowerCase(),
     block.toAddress.toLowerCase(),
     block.tokenStandard.toLowerCase(),
-    block.amount,
+    block.amount.toString(),
     decoded.evmToAddress?.toLowerCase() ?? null,
     decoded.networkClass,
     decoded.chainId,
@@ -216,17 +216,22 @@ export class BridgeService {
   async getAccountFrontierHeight(address: string): Promise<number> {
     await this.ensureInitialized()
     const primaryUrl = this.zenonService.getNodeUrl()
+    const parsedAddress = Address.parse(address)
+    const canonicalAddress = parsedAddress.toString()
     const frontierPromise = this.zenonService
       .getZenon()
-      .ledger.getFrontierAccountBlock(Address.parse(address))
+      .ledger.getFrontierAccountBlock(parsedAddress)
     const [frontier, ...secondaryHeights] = await Promise.all([
       frontierPromise,
-      ...secondaryRpcUrls(primaryUrl).map(url => getZenonRpcFrontierHeight(url, address)),
+      ...secondaryRpcUrls(primaryUrl).map(url =>
+        getZenonRpcFrontierHeight(url, canonicalAddress, config.zenonChainId),
+      ),
     ])
     let primaryHeight = 0
     if (frontier) {
       if (
-        frontier.address.toString() !== address ||
+        frontier.chainIdentifier !== config.zenonChainId ||
+        frontier.address.toString() !== canonicalAddress ||
         !Number.isSafeInteger(frontier.height) ||
         frontier.height < 0
       ) {

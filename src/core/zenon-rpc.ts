@@ -33,7 +33,7 @@ export interface ZenonRpcAccountBlock {
   height: number
   address: string
   toAddress: string
-  amount: string
+  amount: bigint
   tokenStandard: string
   data: string
   confirmationDetail: ZenonRpcConfirmationDetail | null
@@ -103,7 +103,7 @@ export function parseZenonRpcAccountBlock(value: unknown): ZenonRpcAccountBlock 
     height: value.height,
     address,
     toAddress,
-    amount: value.amount,
+    amount: BigInt(value.amount),
     tokenStandard,
     data: value.data,
     confirmationDetail: parseConfirmationDetail(value.confirmationDetail),
@@ -184,13 +184,19 @@ export function websocketJsonRpc<T>(
         fail(new Error('Zenon RPC returned an invalid JSON-RPC version'))
         return
       }
-      if (isRecord(response.error)) {
-        const code = typeof response.error.code === 'number' ? ` (${response.error.code})` : ''
-        fail(new Error(`Zenon RPC error${code}: ${method}`))
+      const hasResult = Object.prototype.hasOwnProperty.call(response, 'result')
+      const hasError = Object.prototype.hasOwnProperty.call(response, 'error')
+      if (hasResult === hasError) {
+        fail(new Error('Zenon RPC response must contain exactly one of result or error'))
         return
       }
-      if (!Object.prototype.hasOwnProperty.call(response, 'result')) {
-        fail(new Error('Zenon RPC response has no result'))
+      if (hasError) {
+        if (!isRecord(response.error)) {
+          fail(new Error('Zenon RPC returned an invalid error object'))
+          return
+        }
+        const code = typeof response.error.code === 'number' ? ` (${response.error.code})` : ''
+        fail(new Error(`Zenon RPC error${code}: ${method}`))
         return
       }
       succeed(response.result as T)
@@ -203,6 +209,7 @@ export function websocketJsonRpc<T>(
 export async function getZenonRpcFrontierHeight(
   url: string,
   address: string,
+  expectedChainIdentifier: number,
   options: JsonRpcOptions = {},
 ): Promise<number> {
   const canonicalAddress = Address.parse(address).toString()
@@ -214,6 +221,9 @@ export async function getZenonRpcFrontierHeight(
   )
   if (response === null) return 0
   const block = parseZenonRpcAccountBlock(response)
+  if (block.chainIdentifier !== expectedChainIdentifier) {
+    throw new Error('Zenon RPC returned the wrong chain frontier')
+  }
   if (block.address !== canonicalAddress) {
     throw new Error('Zenon RPC returned the wrong account frontier')
   }
