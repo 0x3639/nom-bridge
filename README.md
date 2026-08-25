@@ -28,7 +28,7 @@ sequenceDiagram
     participant M as EVM wallet
     participant E as Ethereum bridge
 
-    rect rgb(240,240,255)
+    rect rgba(59,130,246,0.18)
     note over U,E: Wrap (Zenon → Ethereum)
     U->>S: znn_send(unsigned wrap block)
     S->>Z: sign + broadcast
@@ -37,7 +37,7 @@ sequenceDiagram
     M->>E: claim wrapped tokens
     end
 
-    rect rgb(240,255,240)
+    rect rgba(34,197,94,0.18)
     note over U,E: Unwrap (Ethereum → Zenon)
     U->>M: approve(exact amount) + bridge.unwrap(receiver)
     M->>E: receipt (2-of-3 RPC quorum)
