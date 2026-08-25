@@ -1,8 +1,13 @@
 import {computed, ref} from 'vue'
 import {BridgeService} from '../bridge-service'
 import {EvmService} from '../evm-service'
-import type {WrapRedeemProgress} from '../evm-service'
-import {pendingZenonRedeemFor, requestStore, type UnknownWrapOperation} from '../request-store'
+import type {AuthoritativeEvmOutcome, WrapRedeemProgress} from '../evm-service'
+import {
+  pendingZenonRedeemFor,
+  requestStore,
+  type UnknownUnwrapOperation,
+  type UnknownWrapOperation,
+} from '../request-store'
 import {DEFAULT_MOMENTUM_TIME} from '@/config'
 import {config} from '@/config'
 import type {TrackedRequest, TokenPairView, UnwrapRequestView, UnwrapStatus, WrapRequestView, WrapStatus} from '@/types'
@@ -30,21 +35,30 @@ import {createPollScheduler} from './poll-scheduler'
 
 const wrapRequests = ref<WrapRequestView[]>([])
 const unwrapRequests = ref<UnwrapRequestView[]>([])
-// Durable hashless safety records for ambiguous wrap submissions, surfaced so
-// the Bridge form stays locked across reloads until reconciliation. Hydrated
+// Durable hashless safety records for ambiguous source submissions, surfaced
+// so the Bridge form stays locked across reloads until reconciliation. Hydrated
 // straight from storage (not the network poll) and refreshed on every lock
 // change; the form must stay gated until the first hydration completes.
 const unknownWrapOperations = ref<Array<{id: string} & UnknownWrapOperation>>([])
-const unknownWrapsHydrated = ref(false)
+const unknownUnwrapOperations = ref<Array<{id: string} & UnknownUnwrapOperation>>([])
+const unknownSourceOperationsHydrated = ref(false)
 const isLoading = ref(false)
 const pollingError = ref<string | null>(null)
 
-async function hydrateUnknownWraps(): Promise<void> {
+let unknownSourceHydrationRequestId = 0
+export async function hydrateUnknownSourceOperations(): Promise<void> {
+  const requestId = ++unknownSourceHydrationRequestId
   try {
     const snapshot = await requestStore.getSnapshot()
+    // Storage events and local mutations can start overlapping reads. Only the
+    // newest request may publish its snapshot; an older read resolving last
+    // must not resurrect a safety record that a newer snapshot already cleared.
+    if (requestId !== unknownSourceHydrationRequestId) return
     unknownWrapOperations.value = Object.entries(snapshot.unknownWraps)
       .map(([id, operation]) => ({id, ...operation}))
-    unknownWrapsHydrated.value = true
+    unknownUnwrapOperations.value = Object.entries(snapshot.unknownUnwraps)
+      .map(([id, operation]) => ({id, ...operation}))
+    unknownSourceOperationsHydrated.value = true
   } catch {
     // stays un-hydrated; the Bridge form remains gated
   }
@@ -55,7 +69,7 @@ function ensureLockSubscription(): void {
   if (locksSubscribed) return
   locksSubscribed = true
   requestStore.onLocksChanged(() => {
-    void hydrateUnknownWraps()
+    void hydrateUnknownSourceOperations()
   })
 }
 
@@ -110,6 +124,35 @@ export function matchesTrackedUnwrapEvent(
     beneficiaryOf(event.to) === tracked.zenonToAddress &&
     event.amount.toString() === tracked.amount &&
     event.token.toLowerCase() === pairTokenAddress.toLowerCase()
+  )
+}
+
+export function matchesUnknownUnwrapEvent(
+  operation: Pick<UnknownUnwrapOperation, 'tokenAddress' | 'receiver' | 'amount'>,
+  event: UnwrappedEventRecord,
+): boolean {
+  try {
+    return (
+      event.token.toLowerCase() === operation.tokenAddress.toLowerCase() &&
+      event.to === operation.receiver &&
+      event.amount === BigInt(operation.amount)
+    )
+  } catch {
+    return false
+  }
+}
+
+export function isConfirmedUnknownUnwrapEvent(
+  operation: Pick<UnknownUnwrapOperation, 'tokenAddress' | 'receiver' | 'amount'>,
+  event: UnwrappedEventRecord,
+  outcome: AuthoritativeEvmOutcome,
+  totalClients: number,
+): boolean {
+  const required = totalClients === 1 ? 1 : 2
+  return (
+    outcome === 'confirmed' &&
+    event.corroborations >= required &&
+    matchesUnknownUnwrapEvent(operation, event)
   )
 }
 
@@ -324,6 +367,7 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
     const zenonRedeems = snapshot.zenonRedeems
     const evmTxFacts = snapshot.evmTxFacts
     const unknownWraps = snapshot.unknownWraps
+    const unknownUnwraps = snapshot.unknownUnwraps
     const pairs = new Map((getTokenPairsFn?.() ?? []).map(pair => [pair.zts, pair]))
     const outcomeHashes = new Set<string>()
     for (const lock of Object.values(evmClaims)) {
@@ -365,10 +409,10 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
       if (outcome !== 'absent') continue
       const facts = evmTxFacts[hash]
       if (!facts) continue
-      const confirmedCount = await EvmService.getInstance()
+      const finalizedCount = await EvmService.getInstance()
         .getConfirmedTransactionCount(facts.from as Address)
         .catch(() => null)
-      if (confirmedCount !== null && isNonceConsumed(facts.nonce, confirmedCount)) {
+      if (finalizedCount !== null && isNonceConsumed(facts.nonce, finalizedCount)) {
         droppedHashes.add(hash)
       }
     }
@@ -395,6 +439,45 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
       })
       for (const provenId of proven) {
         await requestStore.clearUnknownWrap(provenId)
+      }
+    }
+
+    // Reconcile an injected-provider response loss only from a matching
+    // Unwrapped event whose transaction receipt is independently confirmed by
+    // the authoritative RPC policy. Absence never releases this lock: a
+    // private/pending transaction may remain invisible indefinitely.
+    for (const [operationId, operation] of Object.entries(unknownUnwraps)) {
+      if (operation.evmChainId !== config.evmChainId || operation.fromBlock === null) continue
+      let fromBlock: bigint
+      try {
+        fromBlock = BigInt(operation.fromBlock)
+        if (fromBlock < 0n) continue
+      } catch {
+        continue
+      }
+      const discovered = await EvmService.getInstance().findUnwrappedEvents(
+        operation.bridgeAddress as Address,
+        operation.evmFromAddress as Address,
+        fromBlock,
+      ).catch(() => null)
+      if (!discovered) continue
+      for (const event of discovered.events) {
+        if (!matchesUnknownUnwrapEvent(operation, event)) continue
+        const hash = normalizeEvmHash(event.transactionHash) as Hex
+        const outcome = await EvmService.getInstance().getAuthoritativeOutcome(hash).catch(() => 'unknown' as const)
+        if (!isConfirmedUnknownUnwrapEvent(operation, event, outcome, config.evmRpcUrls.length)) continue
+        await requestStore.trackUnwrap({
+          id: `${hash}:${event.logIndex}`,
+          zts: operation.zts,
+          amount: operation.amount,
+          decimals: operation.decimals,
+          symbol: operation.symbol,
+          zenonToAddress: operation.zenonToAddress,
+          approvalCount: operation.approvalCount,
+          createdAt: operation.createdAt,
+        })
+        await requestStore.clearUnknownUnwrap(operationId)
+        break
       }
     }
 
@@ -710,7 +793,7 @@ export function useRequests() {
     // Enforce durable safety records immediately — never wait for the first
     // full network poll to finish before the form can be gated.
     ensureLockSubscription()
-    void hydrateUnknownWraps()
+    void hydrateUnknownSourceOperations()
     pollScheduler.start()
     isLoading.value = true
     void runPoll()
@@ -740,13 +823,19 @@ export function useRequests() {
     await runPoll()
   }
 
+  async function clearUnknownUnwrapOperation(id: string): Promise<void> {
+    await requestStore.clearUnknownUnwrap(id)
+    await hydrateUnknownSourceOperations()
+  }
+
   return {
     wrapRequests,
     activeRequests,
     unwrapRequests,
     activeUnwrapRequests,
     unknownWrapOperations,
-    unknownWrapsHydrated,
+    unknownUnwrapOperations,
+    unknownSourceOperationsHydrated,
     isLoading,
     pollingError,
     getRawWrapRequest,
@@ -754,5 +843,6 @@ export function useRequests() {
     stopPolling,
     refresh,
     refreshForAccountChange,
+    clearUnknownUnwrapOperation,
   }
 }

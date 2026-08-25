@@ -52,6 +52,27 @@ This is RPC corroboration, not an Ethereum light client or cryptographic receipt
 proof. A single-RPC configuration has no peer to corroborate with and therefore
 retains the weaker standalone trust model.
 
+Before the non-idempotent `bridge.unwrap` wallet call, the application rechecks
+the connected EVM account and chain and persists an account-scoped submission
+record. If that record cannot be persisted, the wallet write is not attempted.
+If the injected provider then returns no transaction hash and the error is not
+an explicit user rejection, the outcome remains unknown across reloads and
+tabs, and another unwrap is blocked. Explicit EIP-1193 user rejection remains
+retryable.
+
+Automatic recovery from a hashless unwrap response requires configured RPCs to
+corroborate an `Unwrapped` event with the exact token, receiver, and amount, and
+a separately fetched successful receipt for that event's transaction. In a
+multi-RPC configuration at least two RPCs must corroborate the event; a
+single-RPC configuration retains its weaker standalone trust model. Missing,
+conflicting, or unavailable evidence leaves the submission record intact. The
+user may instead clear it manually after independently determining the outcome.
+
+For a hash-known unwrap whose transaction later appears dropped, nonce advance
+is release evidence only when the configured RPC quorum observes it at the
+`finalized` block tag. A `latest` or `pending` nonce is not sufficient; absent
+finalized-state evidence leaves the duplicate-submit lock intact.
+
 An ambiguous wrap response leaves a durable duplicate-submit lock before the
 wallet call. Automatic recovery is deliberately stricter than ordinary reads:
 the pre-send account frontier is the highest height observed by both pinned

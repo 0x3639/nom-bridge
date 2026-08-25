@@ -5,6 +5,10 @@ import {normalizeEvmHash} from './evm-hash'
 
 const STORAGE_KEY = 'nom-bridge:requests:v2'
 const LOCKS_STORAGE_KEY = 'nom-bridge:action-locks:v1'
+// Separate from action-locks:v1: an already-open older bundle rewrites that
+// whole document without fields it does not know, which would erase this new
+// safety record. The dedicated key survives unrelated legacy lock writes.
+const UNKNOWN_UNWRAPS_STORAGE_KEY = 'nom-bridge:unknown-unwraps:v1'
 
 export interface UnknownWrapOperation {
   evmToAddress: string
@@ -18,6 +22,27 @@ export interface UnknownWrapOperation {
   amount: string
   decimals: number
   symbol: string
+  createdAt: number
+}
+
+export interface UnknownUnwrapOperation {
+  // Exact EVM source identity and protocol parameters captured before the
+  // wallet side effect. A hashless provider failure must remain attributable
+  // to the account/chain/bridge that could have submitted it across reloads.
+  evmFromAddress: string
+  evmChainId: number
+  bridgeAddress: string
+  tokenAddress: string
+  receiver: string
+  zenonToAddress: string
+  zts: string
+  amount: string
+  decimals: number
+  symbol: string
+  // Latest block observed before opening the transfer prompt. null means the
+  // baseline read failed, so automatic event reconciliation must fail closed.
+  fromBlock: string | null
+  approvalCount: 2 | 3
   createdAt: number
 }
 
@@ -56,6 +81,29 @@ let revision = 0
 let locksDirty = false
 let locksWriteVersion = 0
 let pendingLockOps: LockOp[] = []
+
+type UnknownUnwrapOp = {
+  op: 'set' | 'delete'
+  key: string
+  value?: UnknownUnwrapOperation
+}
+
+let unknownUnwrapsMirror: Record<string, UnknownUnwrapOperation> | null = null
+let unknownUnwrapsDirty = false
+let unknownUnwrapsWriteVersion = 0
+let pendingUnknownUnwrapOps: UnknownUnwrapOp[] = []
+
+function applyUnknownUnwrapOps(
+  base: Record<string, UnknownUnwrapOperation>,
+  ops: UnknownUnwrapOp[],
+): Record<string, UnknownUnwrapOperation> {
+  const next = {...base}
+  for (const op of ops) {
+    if (op.op === 'delete') delete next[op.key]
+    else if (op.value) next[op.key] = op.value
+  }
+  return next
+}
 
 function emptyLocks(): PendingActionLocks {
   return {evmClaims: {}, zenonRedeems: {}, evmTxFacts: {}, unknownWraps: {}}
@@ -186,6 +234,70 @@ function mutateLocks(deriveOps: (locks: PendingActionLocks) => LockOp[]): Promis
   })
   const next = locksWriteQueue.then(run, run)
   locksWriteQueue = next.catch(() => undefined)
+  return next
+}
+
+async function ensureUnknownUnwrapsLoaded(): Promise<Record<string, UnknownUnwrapOperation>> {
+  if (unknownUnwrapsMirror === null) {
+    unknownUnwrapsMirror =
+      (await storageService.get<Record<string, UnknownUnwrapOperation>>(UNKNOWN_UNWRAPS_STORAGE_KEY)) ?? {}
+  }
+  return unknownUnwrapsMirror
+}
+
+async function refreshUnknownUnwrapsFromStorage(): Promise<Record<string, UnknownUnwrapOperation>> {
+  const current = await ensureUnknownUnwrapsLoaded()
+  if (unknownUnwrapsDirty) return current
+  const stored =
+    (await storageService.get<Record<string, UnknownUnwrapOperation>>(UNKNOWN_UNWRAPS_STORAGE_KEY)) ?? {}
+  if (!unknownUnwrapsDirty) unknownUnwrapsMirror = stored
+  return unknownUnwrapsMirror ?? current
+}
+
+async function persistUnknownUnwraps(): Promise<void> {
+  const writeVersion = unknownUnwrapsWriteVersion
+  await storageService.set(UNKNOWN_UNWRAPS_STORAGE_KEY, unknownUnwrapsMirror ?? {})
+  if (writeVersion === unknownUnwrapsWriteVersion) {
+    unknownUnwrapsDirty = false
+    pendingUnknownUnwrapOps = []
+  }
+}
+
+let unknownUnwrapsWriteQueue: Promise<unknown> = Promise.resolve()
+
+function mutateUnknownUnwraps(
+  deriveOps: (operations: Record<string, UnknownUnwrapOperation>) => UnknownUnwrapOp[],
+): Promise<void> {
+  const run = () => requestStore.withCrossContextLock('unknown-unwraps-write', async () => {
+    await ensureUnknownUnwrapsLoaded()
+    const stored =
+      (await storageService.get<Record<string, UnknownUnwrapOperation>>(UNKNOWN_UNWRAPS_STORAGE_KEY)) ?? {}
+    unknownUnwrapsMirror = unknownUnwrapsDirty
+      ? applyUnknownUnwrapOps(stored, pendingUnknownUnwrapOps)
+      : stored
+    const ops = deriveOps(unknownUnwrapsMirror)
+    if (!ops.length) return
+    const mirrorBeforeMutation = unknownUnwrapsMirror
+    const pendingOpsBeforeMutation = pendingUnknownUnwrapOps.length
+    unknownUnwrapsMirror = applyUnknownUnwrapOps(unknownUnwrapsMirror, ops)
+    pendingUnknownUnwrapOps.push(...ops)
+    unknownUnwrapsDirty = true
+    unknownUnwrapsWriteVersion += 1
+    bumpRevision()
+    notifyLocksChanged()
+    try {
+      await persistUnknownUnwraps()
+    } catch (e) {
+      pendingUnknownUnwrapOps = pendingUnknownUnwrapOps.slice(0, pendingOpsBeforeMutation)
+      unknownUnwrapsMirror = mirrorBeforeMutation
+      unknownUnwrapsDirty = pendingUnknownUnwrapOps.length > 0
+      bumpRevision()
+      notifyLocksChanged()
+      throw e
+    }
+  })
+  const next = unknownUnwrapsWriteQueue.then(run, run)
+  unknownUnwrapsWriteQueue = next.catch(() => undefined)
   return next
 }
 
@@ -368,6 +480,18 @@ function notifyLocksChanged(): void {
   },
 )
 
+;(storageService as SubscribableStorage).subscribe?.<Record<string, UnknownUnwrapOperation>>(
+  UNKNOWN_UNWRAPS_STORAGE_KEY,
+  incoming => {
+    const next = incoming ?? {}
+    unknownUnwrapsMirror = unknownUnwrapsDirty && unknownUnwrapsMirror
+      ? applyUnknownUnwrapOps(next, pendingUnknownUnwrapOps)
+      : next
+    bumpRevision()
+    notifyLocksChanged()
+  },
+)
+
 export const requestStore = {
   async withCrossContextLock<T>(key: string, action: () => Promise<T>): Promise<T> {
     if (typeof navigator === 'undefined' || !navigator.locks) return action()
@@ -453,15 +577,21 @@ export const requestStore = {
     zenonRedeems: PendingActionLocks['zenonRedeems']
     evmTxFacts: PendingActionLocks['evmTxFacts']
     unknownWraps: PendingActionLocks['unknownWraps']
+    unknownUnwraps: Record<string, UnknownUnwrapOperation>
     revision: number
   }> {
-    const [requests, locks] = await Promise.all([ensureLoaded(), refreshLocksFromStorage()])
+    const [requests, locks, unknownUnwraps] = await Promise.all([
+      ensureLoaded(),
+      refreshLocksFromStorage(),
+      refreshUnknownUnwrapsFromStorage(),
+    ])
     return {
       requests: [...requests],
       evmClaims: {...locks.evmClaims},
       zenonRedeems: {...locks.zenonRedeems},
       evmTxFacts: {...locks.evmTxFacts},
       unknownWraps: {...locks.unknownWraps},
+      unknownUnwraps: {...unknownUnwraps},
       revision,
     }
   },
@@ -562,6 +692,16 @@ export const requestStore = {
   async clearUnknownWrap(id: string): Promise<void> {
     await mutateLocks(locks => locks.unknownWraps[id]
       ? [{scope: 'unknownWraps', op: 'delete', key: id}]
+      : [])
+  },
+
+  async setUnknownUnwrap(id: string, operation: UnknownUnwrapOperation): Promise<void> {
+    await mutateUnknownUnwraps(() => [{op: 'set', key: id, value: operation}])
+  },
+
+  async clearUnknownUnwrap(id: string): Promise<void> {
+    await mutateUnknownUnwraps(operations => operations[id]
+      ? [{op: 'delete', key: id}]
       : [])
   },
 

@@ -6,10 +6,13 @@ const h = vi.hoisted(() => ({
   getAllowance: vi.fn(),
   approveAllowance: vi.fn(),
   unwrap: vi.fn(),
+  getBlockNumber: vi.fn(),
   buildRedeemBlock: vi.fn(),
   send: vi.fn(),
   trackUnwrap: vi.fn(),
   prune: vi.fn(),
+  setUnknownUnwrap: vi.fn(),
+  clearUnknownUnwrap: vi.fn(),
   setPendingZenonRedeem: vi.fn(),
   clearPendingZenonRedeem: vi.fn(),
   clearLegacyZenonRedeem: vi.fn(),
@@ -36,13 +39,14 @@ vi.mock('../bridge-service', () => ({
 
 vi.mock('../evm-service', () => ({
   EvmSubmissionError: class EvmSubmissionError extends Error {
-    constructor(public kind: string, public hash: string, message: string) { super(message) }
+    constructor(public kind: string, public hash: string | null, message: string) { super(message) }
   },
   EvmService: {
     getInstance: () => ({
       getAllowance: h.getAllowance,
       approveAllowance: h.approveAllowance,
       unwrap: h.unwrap,
+      getBlockNumber: h.getBlockNumber,
       getTransactionOutcome: h.getTransactionOutcome,
       getAuthoritativeOutcome: h.getAuthoritativeOutcome,
     }),
@@ -66,6 +70,8 @@ vi.mock('../request-store', async importOriginal => {
     requestStore: {
       trackUnwrap: h.trackUnwrap,
       prune: h.prune,
+      setUnknownUnwrap: h.setUnknownUnwrap,
+      clearUnknownUnwrap: h.clearUnknownUnwrap,
       setPendingZenonRedeem: h.setPendingZenonRedeem,
       clearPendingZenonRedeem: h.clearPendingZenonRedeem,
       clearLegacyZenonRedeem: h.clearLegacyZenonRedeem,
@@ -83,7 +89,10 @@ beforeEach(() => {
   Object.values(h).forEach(fn => fn.mockReset())
   h.setPendingZenonRedeem.mockResolvedValue(true)
   h.clearPendingZenonRedeem.mockResolvedValue(undefined)
-  h.getSnapshot.mockResolvedValue({zenonRedeems: {}, requests: []})
+  h.setUnknownUnwrap.mockResolvedValue(undefined)
+  h.clearUnknownUnwrap.mockResolvedValue(undefined)
+  h.getBlockNumber.mockResolvedValue(100n)
+  h.getSnapshot.mockResolvedValue({zenonRedeems: {}, unknownUnwraps: {}, requests: []})
   h.getUnwrapRequest.mockResolvedValue({redeemed: 0, revoked: 0})
   h.withCrossContextLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
   h.withWalletActionLock.mockImplementation(async (_key: string, action: () => Promise<unknown>) => action())
@@ -114,6 +123,7 @@ describe('useUnwrap.unwrap', () => {
       500n,
       'z1qrecipient',
       expect.any(Function),
+      '0xFrom000000000000000000000000000000000009',
     )
     expect(h.trackUnwrap).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -133,6 +143,7 @@ describe('useUnwrap.unwrap', () => {
       eventMatched: true,
       trackingFailed: false,
     })
+    expect(h.clearUnknownUnwrap).toHaveBeenCalledTimes(1)
   })
 
   it('sends the bare receiver when bonusActive is omitted (unchanged default behavior)', async () => {
@@ -155,6 +166,7 @@ describe('useUnwrap.unwrap', () => {
       500n,
       'z1qrecipient',
       expect.any(Function),
+      '0xFrom000000000000000000000000000000000009',
     )
     expect(h.trackUnwrap).toHaveBeenCalledWith(
       expect.objectContaining({zenonToAddress: 'z1qrecipient'}),
@@ -181,6 +193,7 @@ describe('useUnwrap.unwrap', () => {
       500n,
       'z1qrecipient&z1qrecipient',
       expect.any(Function),
+      '0xFrom000000000000000000000000000000000009',
     )
     expect(h.trackUnwrap).toHaveBeenCalledWith(
       expect.objectContaining({zenonToAddress: 'z1qrecipient'}),
@@ -242,6 +255,91 @@ describe('useUnwrap.unwrap', () => {
     expect(useUnwrap().error.value).toBeNull()
   })
 
+  it('persists the hashless intent before the wallet call and keeps it on ambiguous submission', async () => {
+    const order: string[] = []
+    h.getAllowance.mockResolvedValue(500n)
+    h.getBlockNumber.mockResolvedValue(77n)
+    h.setUnknownUnwrap.mockImplementation(async () => {
+      order.push('persist-intent')
+    })
+    const {EvmSubmissionError} = await import('../evm-service')
+    h.unwrap.mockImplementation(async () => {
+      order.push('wallet-write')
+      throw new EvmSubmissionError(
+        'submission-unknown',
+        null,
+        'The bridge transfer may have been submitted',
+      )
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      150n,
+      'z1qrecipient',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+      '0xFrom000000000000000000000000000000000009',
+    )).rejects.toMatchObject({kind: 'submission-unknown', hash: null})
+
+    expect(order).toEqual(['persist-intent', 'wallet-write'])
+    expect(h.setUnknownUnwrap).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        evmFromAddress: '0xFrom000000000000000000000000000000000009',
+        evmChainId: 1,
+        bridgeAddress: '0xBridge00000000000000000000000000000000',
+        tokenAddress: '0xToken0000000000000000000000000000000001',
+        receiver: 'z1qrecipient',
+        zenonToAddress: 'z1qrecipient',
+        amount: '150',
+        fromBlock: '77',
+        approvalCount: 2,
+      }),
+    )
+    expect(h.clearUnknownUnwrap).not.toHaveBeenCalled()
+    expect(useUnwrap().phase.value).toMatchObject({kind: 'submitted-unknown'})
+    expect(useUnwrap().error.value).toBeNull()
+  })
+
+  it('aborts before the wallet call when the hashless safety intent cannot be persisted', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.setUnknownUnwrap.mockRejectedValue(new Error('storage quota exceeded'))
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+      '0xFrom000000000000000000000000000000000009',
+    )).rejects.toThrow('safety lock')
+    expect(h.unwrap).not.toHaveBeenCalled()
+  })
+
+  it('releases the intent on a provably pre-write failure', async () => {
+    h.getAllowance.mockResolvedValue(500n)
+    h.unwrap.mockRejectedValue(new Error('The connected MetaMask account changed before the bridge transfer'))
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(useUnwrap().unwrap(
+      '0xToken0000000000000000000000000000000001' as `0x${string}`,
+      1n,
+      'z1q',
+      '0xBridge00000000000000000000000000000000' as `0x${string}`,
+      'zts1znn',
+      8,
+      'ZNN',
+      '0xFrom000000000000000000000000000000000009',
+    )).rejects.toThrow('account changed')
+    expect(h.clearUnknownUnwrap).toHaveBeenCalledTimes(1)
+  })
+
   it('does not expose retry when receipt confirmation fails after broadcast', async () => {
     h.getAllowance.mockResolvedValue(500n)
     h.trackUnwrap.mockResolvedValue(undefined)
@@ -289,6 +387,7 @@ describe('useUnwrap.unwrap', () => {
 
     expect(result).toMatchObject({kind: 'confirmed', hash: '0xconfirmed', trackingFailed: true})
     expect(useUnwrap().phase.value).toMatchObject({kind: 'submitted-untracked'})
+    expect(h.clearUnknownUnwrap).not.toHaveBeenCalled()
   })
 
   it('removes provisional tracking and allows retry after a definitive revert', async () => {
@@ -315,6 +414,7 @@ describe('useUnwrap.unwrap', () => {
       'ZNN', '0xFrom000000000000000000000000000000000009'
     )).rejects.toThrow('Unwrap transaction reverted')
     expect(h.prune).toHaveBeenCalled()
+    expect(h.clearUnknownUnwrap).toHaveBeenCalled()
     expect(useUnwrap().phase.value).toMatchObject({kind: 'failed', stage: 'bridge-transfer'})
   })
 })
@@ -358,6 +458,7 @@ describe('useUnwrap.unwrap cross-context exclusion', () => {
   it('refuses a queued submission when an unwrap was recorded after this click', async () => {
     h.getSnapshot.mockResolvedValue({
       zenonRedeems: {},
+      unknownUnwraps: {},
       requests: [{kind: 'unwrap', id: '0xfresh:-1', createdAt: Date.now() + 60_000}],
     })
     const {useUnwrap} = await import('./useUnwrap')
@@ -366,6 +467,26 @@ describe('useUnwrap.unwrap cross-context exclusion', () => {
       useUnwrap().unwrap(token, 1n, 'z1q', bridgeAddress, 'zts1znn', 8, 'ZNN', evmFrom),
     ).rejects.toThrow('another context')
     expect(h.unwrap).not.toHaveBeenCalled()
+  })
+
+  it('refuses inside the lock when this account has a durable hashless unwrap intent', async () => {
+    h.getSnapshot.mockResolvedValue({
+      zenonRedeems: {},
+      requests: [],
+      unknownUnwraps: {
+        'other-tab-op': {
+          evmFromAddress: evmFrom.toLowerCase(),
+          evmChainId: 1,
+        },
+      },
+    })
+    const {useUnwrap} = await import('./useUnwrap')
+
+    await expect(
+      useUnwrap().unwrap(token, 1n, 'z1q', bridgeAddress, 'zts1znn', 8, 'ZNN', evmFrom),
+    ).rejects.toThrow('may already be in progress')
+    expect(h.unwrap).not.toHaveBeenCalled()
+    expect(h.setUnknownUnwrap).not.toHaveBeenCalled()
   })
 })
 

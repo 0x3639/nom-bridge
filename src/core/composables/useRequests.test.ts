@@ -1,16 +1,90 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   computeFinalUnwrapHashes,
   deriveUnwrapStatus,
   deriveWrapStatus,
   findTrackedUnwrapByHash,
+  hydrateUnknownSourceOperations,
+  isConfirmedUnknownUnwrapEvent,
   matchesTrackedUnwrapEvent,
+  matchesUnknownUnwrapEvent,
   normalizeEvmHash,
   nextPollDelay,
   orderUnwrapRequests,
   reconcileUnknownWrapOperations,
+  useRequests,
 } from './useRequests'
+import {requestStore} from '../request-store'
 import type {UnwrapStatus} from '@/types'
+
+type RequestSnapshot = Awaited<ReturnType<typeof requestStore.getSnapshot>>
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+  return {promise, resolve}
+}
+
+function snapshotWithUnknownUnwrap(id: string): RequestSnapshot {
+  return {
+    requests: [],
+    evmClaims: {},
+    zenonRedeems: {},
+    evmTxFacts: {},
+    unknownWraps: {},
+    unknownUnwraps: {
+      [id]: {
+        evmFromAddress: '0x1111111111111111111111111111111111111111',
+        evmChainId: 1,
+        bridgeAddress: '0x2222222222222222222222222222222222222222',
+        tokenAddress: '0x3333333333333333333333333333333333333333',
+        receiver: 'z1qrecipient',
+        zenonToAddress: 'z1qrecipient',
+        zts: 'zts1znnxxxxxxxxxxxxx9z4ulx',
+        amount: '100',
+        decimals: 8,
+        symbol: 'ZNN',
+        fromBlock: '10',
+        approvalCount: 2,
+        createdAt: 1,
+      },
+    },
+    revision: 1,
+  }
+}
+
+describe('hydrateUnknownSourceOperations', () => {
+  it('ignores an older snapshot that resolves after a newer hydration', async () => {
+    const older = deferred<RequestSnapshot>()
+    const newer = deferred<RequestSnapshot>()
+    const snapshotSpy = vi.spyOn(requestStore, 'getSnapshot')
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise)
+    const state = useRequests()
+
+    try {
+      const olderHydration = hydrateUnknownSourceOperations()
+      const newerHydration = hydrateUnknownSourceOperations()
+
+      newer.resolve(snapshotWithUnknownUnwrap('newer-operation'))
+      await newerHydration
+      expect(state.unknownUnwrapOperations.value.map(operation => operation.id))
+        .toEqual(['newer-operation'])
+
+      older.resolve(snapshotWithUnknownUnwrap('stale-operation'))
+      await olderHydration
+      expect(state.unknownUnwrapOperations.value.map(operation => operation.id))
+        .toEqual(['newer-operation'])
+    } finally {
+      snapshotSpy.mockRestore()
+      state.unknownWrapOperations.value = []
+      state.unknownUnwrapOperations.value = []
+      state.unknownSourceOperationsHydrated.value = false
+    }
+  })
+})
 
 describe('normalizeEvmHash', () => {
   it('canonicalizes SDK and viem hash formats to the same key', () => {
@@ -32,6 +106,7 @@ describe('matchesTrackedUnwrapEvent', () => {
     token: '0xToKen',
     to: 'z1qrecipient',
     amount: 100n,
+    corroborations: 2,
   }
 
   it('matches a replacement transaction that executed the identical unwrap', () => {
@@ -56,6 +131,7 @@ describe('matchesTrackedUnwrapEvent', () => {
       token: '0xToKen',
       to: 'z1qrecipient&z1qrecipient',
       amount: 100n,
+      corroborations: 2,
     }
     expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', selfReferralEvent)).toBe(true)
   })
@@ -67,8 +143,58 @@ describe('matchesTrackedUnwrapEvent', () => {
       token: '0xToKen',
       to: 'z1qother&z1qrecipient',
       amount: 100n,
+      corroborations: 2,
     }
     expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', affiliateOnlyEvent)).toBe(false)
+  })
+})
+
+describe('matchesUnknownUnwrapEvent', () => {
+  const operation = {
+    tokenAddress: '0xToKen',
+    receiver: 'z1qrecipient&z1qrecipient',
+    amount: '100',
+  }
+  const event = {
+    transactionHash: `0x${'ab'.repeat(32)}`,
+    logIndex: 3,
+    token: '0xtoken',
+    to: 'z1qrecipient&z1qrecipient',
+    amount: 100n,
+    corroborations: 2,
+  }
+
+  it('requires the exact token, receiver string, and amount', () => {
+    expect(matchesUnknownUnwrapEvent(operation, event)).toBe(true)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, token: '0xother'})).toBe(false)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, to: 'z1qrecipient'})).toBe(false)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, amount: 99n})).toBe(false)
+  })
+
+  it('never releases the intent without an authoritative confirmed receipt', () => {
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'confirmed', 3)).toBe(true)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'unknown', 3)).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'absent', 3)).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'reverted', 3)).toBe(false)
+  })
+
+  it('never releases the intent from one uncorroborated event observation', () => {
+    expect(isConfirmedUnknownUnwrapEvent(
+      operation,
+      {...event, corroborations: 1},
+      'confirmed',
+      3,
+    )).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(
+      operation,
+      {...event, corroborations: 1},
+      'confirmed',
+      1,
+    )).toBe(true)
+  })
+
+  it('fails closed when the persisted amount is malformed', () => {
+    expect(matchesUnknownUnwrapEvent({...operation, amount: 'not-a-number'}, event)).toBe(false)
   })
 })
 

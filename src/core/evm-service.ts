@@ -55,12 +55,12 @@ export type WrapRedeemProgress =
 
 export type EvmTransactionOutcome = 'success' | 'reverted' | 'pending' | 'not-found' | 'unavailable'
 export type AuthoritativeEvmOutcome = 'confirmed' | 'reverted' | 'absent' | 'unknown'
-export type EvmSubmissionFailureKind = 'reverted' | 'confirmation-unknown'
+export type EvmSubmissionFailureKind = 'reverted' | 'confirmation-unknown' | 'submission-unknown'
 
 export class EvmSubmissionError extends Error {
   constructor(
     readonly kind: EvmSubmissionFailureKind,
-    readonly hash: Hex,
+    readonly hash: Hex | null,
     message: string,
     options?: {cause?: unknown},
   ) {
@@ -98,10 +98,10 @@ export function collapseAuthoritativeOutcomes(
 // Positive dropped-transaction evidence. Universal not-found is never proof a
 // wallet-broadcast transaction is dead (private mempools, poor propagation, a
 // low-fee tx that mines late). The only positive fact is nonce consumption:
-// getTransactionCount('latest') is the next unused nonce, so once the sender's
-// confirmed count passes the transaction's nonce, that nonce was consumed —
+// getTransactionCount('finalized') is the next unused nonce in finalized
+// state, so once it passes the transaction's nonce, that nonce was consumed —
 // by this tx (then it would not be absent) or by a replacement — and this hash
-// can never mine.
+// cannot become valid again after a shallow canonical-head reorg.
 export function isNonceConsumed(txNonce: number, confirmedTransactionCount: number): boolean {
   return confirmedTransactionCount > txNonce
 }
@@ -188,6 +188,7 @@ export interface UnwrappedEventRecord {
   token: string
   to: string
   amount: bigint
+  corroborations: number
 }
 
 // Release-critical facts must never rest on a single RPC's word. Sender/nonce
@@ -381,7 +382,7 @@ export class EvmService {
   async getConfirmedTransactionCount(address: Address): Promise<number | null> {
     const counts = await Promise.all(
       this.outcomeClients.map(client =>
-        client.getTransactionCount({address, blockTag: 'latest'}).catch(() => null),
+        client.getTransactionCount({address, blockTag: 'finalized'}).catch(() => null),
       ),
     )
     return collapseConfirmedCounts(counts, this.outcomeClients.length)
@@ -436,18 +437,33 @@ export class EvmService {
     for (const logs of perClient) {
       if (logs === null) continue
       responsiveClients += 1
+      const seenForClient = new Set<string>()
       for (const log of logs as unknown as Array<{
         transactionHash: string
         logIndex: number
         args: {token?: string; to?: string; amount?: bigint}
       }>) {
         if (!log.args.token || log.args.to === undefined || log.args.amount === undefined) continue
-        events.set(`${log.transactionHash}:${log.logIndex}`, {
+        // Count only identical event content, once per RPC. A single endpoint
+        // must not fabricate release evidence by attaching plausible fields
+        // to an unrelated confirmed transaction hash.
+        const key = [
+          log.transactionHash.toLowerCase(),
+          log.logIndex,
+          log.args.token.toLowerCase(),
+          log.args.to,
+          log.args.amount.toString(),
+        ].join(':')
+        if (seenForClient.has(key)) continue
+        seenForClient.add(key)
+        const existing = events.get(key)
+        events.set(key, {
           transactionHash: log.transactionHash,
           logIndex: log.logIndex,
           token: log.args.token,
           to: log.args.to,
           amount: log.args.amount,
+          corroborations: (existing?.corroborations ?? 0) + 1,
         })
       }
     }
@@ -584,12 +600,17 @@ export class EvmService {
     token: Address,
     amount: bigint,
     receiver: string,
-    onSubmitted?: (hash: Hex) => void,
+    onSubmitted?: (hash: Hex) => void | Promise<void>,
+    expectedAccount?: Address,
   ): Promise<{hash: Hex; provisionalLogIndex: number; eventMatched: boolean}> {
     const wallet = this.getWalletClient()
     try {
       const [account] = await wallet.requestAddresses()
       await this.assertWalletChain(wallet)
+      const pinnedAccount = getAddress(expectedAccount ?? account)
+      if (getAddress(account) !== pinnedAccount) {
+        throw new Error('The connected MetaMask account changed before the bridge transfer; review the form and try again')
+      }
       const {request} = await this.publicClient.simulateContract({
         address: bridge,
         abi: bridgeAbi,
@@ -598,8 +619,39 @@ export class EvmService {
         chain: CHAIN,
         account,
       })
-      const hash = await wallet.writeContract(request)
-      await onSubmitted?.(hash)
+      // Rebind immediately before the non-idempotent wallet side effect. The
+      // simulation's account is part of the request, but the injected wallet's
+      // selected account/chain can change while simulation is in flight.
+      const [writeAccount] = await wallet.requestAddresses()
+      await this.assertWalletChain(wallet)
+      if (getAddress(writeAccount) !== pinnedAccount) {
+        throw new Error('The connected MetaMask account changed before the bridge transfer; review the form and try again')
+      }
+      let hash: Hex
+      try {
+        hash = await wallet.writeContract(request)
+      } catch (e) {
+        if (isExplicitWalletRejection(e)) throw mapEvmError(e)
+        // eth_sendTransaction may have reached the wallet/node before an
+        // injected-provider response failure. Without a returned hash there is
+        // no safe basis for presenting this economic intent as retryable.
+        throw new EvmSubmissionError(
+          'submission-unknown',
+          null,
+          'The bridge transfer may have been submitted, but MetaMask did not return a transaction hash. Do not submit it again until its status is resolved.',
+          {cause: e},
+        )
+      }
+      try {
+        await onSubmitted?.(hash)
+      } catch (e) {
+        throw new EvmSubmissionError(
+          'confirmation-unknown',
+          hash,
+          'Unwrap transaction was submitted, but local submission tracking failed',
+          {cause: e},
+        )
+      }
       let receipt
       try {
         receipt = await this.publicClient.waitForTransactionReceipt({hash})
@@ -722,8 +774,22 @@ export function tssSignatureToHex(base64Sig: string): Hex {
 }
 
 export function mapEvmError(e: unknown): Error {
-  if (e instanceof UserRejectedRequestError) {
+  if (isExplicitWalletRejection(e)) {
     return new Error('Request rejected in MetaMask')
   }
   return e instanceof Error ? e : new Error('EVM request failed')
+}
+
+function isExplicitWalletRejection(error: unknown): boolean {
+  let current = error
+  const seen = new Set<unknown>()
+  for (let depth = 0; depth < 8 && current !== null && current !== undefined; depth += 1) {
+    if (seen.has(current)) return false
+    seen.add(current)
+    if (current instanceof UserRejectedRequestError) return true
+    if (typeof current !== 'object') return false
+    if ('code' in current && current.code === 4001) return true
+    current = 'cause' in current ? current.cause : undefined
+  }
+  return false
 }
