@@ -381,6 +381,80 @@ describe('requestStore', () => {
     expect((await requestStore.getSnapshot()).unknownWraps['op-1']).toBeUndefined()
   })
 
+  it('persists and clears hashless unknown-unwrap operations', async () => {
+    const {requestStore} = await import('./request-store')
+    const operation = {
+      evmFromAddress: '0x0000000000000000000000000000000000000001',
+      evmChainId: 1,
+      bridgeAddress: '0x0000000000000000000000000000000000000002',
+      tokenAddress: '0x0000000000000000000000000000000000000003',
+      receiver: 'z1qrecipient&z1qrecipient',
+      zenonToAddress: 'z1qrecipient',
+      zts: 'zts1znn',
+      amount: '150000000',
+      decimals: 8,
+      symbol: 'ZNN',
+      fromBlock: '19000000',
+      approvalCount: 2 as const,
+      createdAt: 1,
+    }
+    await requestStore.setUnknownUnwrap('evm-op-1', operation)
+    expect((await requestStore.getSnapshot()).unknownUnwraps['evm-op-1']).toEqual(operation)
+    await requestStore.clearUnknownUnwrap('evm-op-1')
+    expect((await requestStore.getSnapshot()).unknownUnwraps['evm-op-1']).toBeUndefined()
+  })
+
+  it('keeps unknown-unwrap safety records outside legacy action-lock rewrites', async () => {
+    const {requestStore} = await import('./request-store')
+    const operation = {
+      evmFromAddress: '0x0000000000000000000000000000000000000001',
+      evmChainId: 1,
+      bridgeAddress: '0x0000000000000000000000000000000000000002',
+      tokenAddress: '0x0000000000000000000000000000000000000003',
+      receiver: 'z1qrecipient',
+      zenonToAddress: 'z1qrecipient',
+      zts: 'zts1znn',
+      amount: '1',
+      decimals: 8,
+      symbol: 'ZNN',
+      fromBlock: '10',
+      approvalCount: 2 as const,
+      createdAt: 1,
+    }
+    await requestStore.setUnknownUnwrap('evm-op-1', operation)
+
+    // An old bundle knows only action-locks:v1 and rewrites that whole
+    // document. The dedicated new key must remain authoritative.
+    const legacyRewrite = {evmClaims: {}, zenonRedeems: {}, evmTxFacts: {}, unknownWraps: {}}
+    h.values.set('nom-bridge:action-locks:v1', legacyRewrite)
+    h.listeners.get('nom-bridge:action-locks:v1')?.(legacyRewrite)
+
+    expect((await requestStore.getSnapshot()).unknownUnwraps['evm-op-1']).toEqual(operation)
+    expect(h.values.get('nom-bridge:unknown-unwraps:v1')).toEqual({'evm-op-1': operation})
+  })
+
+  it('rolls back an unknown-unwrap intent when its dedicated persist fails', async () => {
+    h.set.mockRejectedValueOnce(new Error('storage write failed'))
+    const {requestStore} = await import('./request-store')
+
+    await expect(requestStore.setUnknownUnwrap('evm-op-1', {
+      evmFromAddress: '0x0000000000000000000000000000000000000001',
+      evmChainId: 1,
+      bridgeAddress: '0x0000000000000000000000000000000000000002',
+      tokenAddress: '0x0000000000000000000000000000000000000003',
+      receiver: 'z1qrecipient',
+      zenonToAddress: 'z1qrecipient',
+      zts: 'zts1znn',
+      amount: '1',
+      decimals: 8,
+      symbol: 'ZNN',
+      fromBlock: null,
+      approvalCount: 2,
+      createdAt: 1,
+    })).rejects.toThrow('storage write failed')
+    expect((await requestStore.getSnapshot()).unknownUnwraps['evm-op-1']).toBeUndefined()
+  })
+
   it('does not clobber another context\'s tracked request written between mutations', async () => {
     const {requestStore} = await import('./request-store')
     await requestStore.trackWrap(wrapFixture('mine'))

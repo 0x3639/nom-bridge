@@ -21,6 +21,7 @@ import {
 } from '../approval-ux'
 import {normalizeEvmHash, stripEvmHashPrefix} from '../evm-hash'
 import {ZenonSubmissionError} from '../zenon-wallet-service'
+import {config} from '@/config'
 
 export type UnwrapPhase =
   | {kind: 'idle'}
@@ -29,6 +30,7 @@ export type UnwrapPhase =
   | {kind: 'confirming-approval'; total: 3; hash: Hex}
   | {kind: 'submitting-unwrap'; step: 1 | 2; total: 2 | 3}
   | {kind: 'confirming-unwrap'; step: 1 | 2; total: 2 | 3; hash: Hex}
+  | {kind: 'submitted-unknown'; total: 2 | 3; operationId: string; message: string}
   | {kind: 'submitted-unconfirmed'; total: 2 | 3; hash: Hex; trackingFailed: boolean; message: string}
   | {kind: 'submitted-untracked'; total: 2 | 3; hash: Hex; message: string}
   | {kind: 'failed'; stage: 'allowance' | 'token-approval' | 'bridge-transfer'; message: string}
@@ -48,6 +50,11 @@ function setPendingRedeem(id: string, pending?: PendingRedeemPhase): void {
     const {[id]: _finished, ...remaining} = pendingRedeems.value
     pendingRedeems.value = remaining
   }
+}
+
+function generateUnknownUnwrapId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  return uuid ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 function resetPhase(): void {
@@ -92,7 +99,18 @@ async function unwrap(
       `unwrap-submit:${evmFromAddress.toLowerCase()}`,
       () => {
         lockedFlowRan = true
-        return unwrapLocked(token, amount, zenonAddress, bridge, zts, decimals, symbol, clickedAt, bonusActive)
+        return unwrapLocked(
+          token,
+          amount,
+          zenonAddress,
+          bridge,
+          zts,
+          decimals,
+          symbol,
+          evmFromAddress,
+          clickedAt,
+          bonusActive,
+        )
       },
     )
   } catch (e) {
@@ -113,6 +131,7 @@ async function unwrapLocked(
   zts: string,
   decimals: number,
   symbol: string,
+  evmFromAddress: string,
   clickedAt: number,
   bonusActive: boolean,
 ): Promise<UnwrapSubmissionResult> {
@@ -120,10 +139,17 @@ async function unwrapLocked(
   let broadcastHash: Hex | null = null
   let totalApprovals: 2 | 3 = 2
   let trackingResult: Promise<boolean> | null = null
+  let operationId: string | null = null
   try {
     // Atomic in-lock check: a submission that queued behind another context's
     // in-flight transfer must not re-submit once that transfer is recorded.
     const snapshot = await requestStore.getSnapshot()
+    if (Object.values(snapshot.unknownUnwraps).some(operation =>
+      operation.evmChainId === config.evmChainId &&
+      operation.evmFromAddress.toLowerCase() === evmFromAddress.toLowerCase()
+    )) {
+      throw new Error('A bridge transfer from this MetaMask account may already be in progress; resolve it before submitting again')
+    }
     if (snapshot.requests.some(request => request.kind === 'unwrap' && request.createdAt >= clickedAt)) {
       throw new Error('A bridge transfer was just submitted in another context; review History before submitting again')
     }
@@ -142,8 +168,32 @@ async function unwrapLocked(
 
     const unwrapStep = approvalRequired ? 2 : 1
     failureStage = 'bridge-transfer'
-    phase.value = {kind: 'submitting-unwrap', step: unwrapStep, total}
     const receiver = bonusActive ? selfReferralReceiver(zenonAddress) : zenonAddress
+    const fromBlock = await evm.getBlockNumber().then(block => block.toString(), () => null)
+    operationId = generateUnknownUnwrapId()
+    try {
+      await requestStore.setUnknownUnwrap(operationId, {
+        evmFromAddress,
+        evmChainId: config.evmChainId,
+        bridgeAddress: bridge,
+        tokenAddress: token,
+        receiver,
+        zenonToAddress: zenonAddress,
+        zts,
+        amount: amount.toString(),
+        decimals,
+        symbol,
+        fromBlock,
+        approvalCount: total,
+        createdAt: Date.now(),
+      })
+    } catch {
+      operationId = null
+      throw new Error(
+        'Could not record the transfer safety lock, so the bridge transfer was not submitted. Check storage availability and retry.',
+      )
+    }
+    phase.value = {kind: 'submitting-unwrap', step: unwrapStep, total}
     const {hash, provisionalLogIndex, eventMatched} = await evm.unwrap(
       bridge,
       token,
@@ -166,8 +216,12 @@ async function unwrapLocked(
           zenonToAddress: zenonAddress,
           approvalCount: total,
           createdAt: Date.now(),
-        }).then(() => true, () => false)
+        }).then(async () => {
+          if (operationId) await requestStore.clearUnknownUnwrap(operationId)
+          return true
+        }).catch(() => false)
       },
+      evmFromAddress as Address,
     )
     const tracked = trackingResult ? await trackingResult : false
     if (!tracked) {
@@ -183,8 +237,19 @@ async function unwrapLocked(
     return {kind: 'confirmed', hash, provisionalLogIndex, eventMatched, trackingFailed: false}
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
+    const submissionUnknown = e instanceof EvmSubmissionError && e.kind === 'submission-unknown'
     const definitivelyReverted = e instanceof EvmSubmissionError && e.kind === 'reverted'
     const submittedHash = e instanceof EvmSubmissionError ? e.hash : broadcastHash as Hex | null
+    if (submissionUnknown && !submittedHash) {
+      error.value = null
+      phase.value = {
+        kind: 'submitted-unknown',
+        total: totalApprovals,
+        operationId: operationId as string,
+        message: 'The bridge transfer may have been submitted, but MetaMask did not return a transaction hash. Do not submit it again; review MetaMask activity and History while automatic checks look for a matching confirmed event.',
+      }
+      throw e
+    }
     if (submittedHash && !definitivelyReverted) {
       const tracked = trackingResult ? await trackingResult : false
       const message = 'Bridge transfer was submitted, but confirmation could not be verified. Do not submit it again; check the Ethereum transaction and History.'
@@ -204,6 +269,12 @@ async function unwrapLocked(
         request.kind === 'unwrap' &&
         normalizeEvmHash(request.id.split(':')[0]) === normalized,
       ).catch(() => undefined)
+    }
+    if (operationId && (definitivelyReverted || !submittedHash)) {
+      // Definite revert or a provably pre-write error: the external transfer
+      // cannot still execute, so release the pre-wallet intent. A persist
+      // failure leaves the conservative lock in place.
+      await requestStore.clearUnknownUnwrap(operationId).catch(() => undefined)
     }
     phase.value = {kind: 'failed', stage: failureStage, message: error.value}
     throw e

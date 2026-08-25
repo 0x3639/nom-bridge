@@ -4,7 +4,9 @@ import {
   deriveUnwrapStatus,
   deriveWrapStatus,
   findTrackedUnwrapByHash,
+  isConfirmedUnknownUnwrapEvent,
   matchesTrackedUnwrapEvent,
+  matchesUnknownUnwrapEvent,
   normalizeEvmHash,
   nextPollDelay,
   orderUnwrapRequests,
@@ -32,6 +34,7 @@ describe('matchesTrackedUnwrapEvent', () => {
     token: '0xToKen',
     to: 'z1qrecipient',
     amount: 100n,
+    corroborations: 2,
   }
 
   it('matches a replacement transaction that executed the identical unwrap', () => {
@@ -56,6 +59,7 @@ describe('matchesTrackedUnwrapEvent', () => {
       token: '0xToKen',
       to: 'z1qrecipient&z1qrecipient',
       amount: 100n,
+      corroborations: 2,
     }
     expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', selfReferralEvent)).toBe(true)
   })
@@ -67,8 +71,58 @@ describe('matchesTrackedUnwrapEvent', () => {
       token: '0xToKen',
       to: 'z1qother&z1qrecipient',
       amount: 100n,
+      corroborations: 2,
     }
     expect(matchesTrackedUnwrapEvent(tracked, '0xtoken', affiliateOnlyEvent)).toBe(false)
+  })
+})
+
+describe('matchesUnknownUnwrapEvent', () => {
+  const operation = {
+    tokenAddress: '0xToKen',
+    receiver: 'z1qrecipient&z1qrecipient',
+    amount: '100',
+  }
+  const event = {
+    transactionHash: `0x${'ab'.repeat(32)}`,
+    logIndex: 3,
+    token: '0xtoken',
+    to: 'z1qrecipient&z1qrecipient',
+    amount: 100n,
+    corroborations: 2,
+  }
+
+  it('requires the exact token, receiver string, and amount', () => {
+    expect(matchesUnknownUnwrapEvent(operation, event)).toBe(true)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, token: '0xother'})).toBe(false)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, to: 'z1qrecipient'})).toBe(false)
+    expect(matchesUnknownUnwrapEvent(operation, {...event, amount: 99n})).toBe(false)
+  })
+
+  it('never releases the intent without an authoritative confirmed receipt', () => {
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'confirmed', 3)).toBe(true)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'unknown', 3)).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'absent', 3)).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(operation, event, 'reverted', 3)).toBe(false)
+  })
+
+  it('never releases the intent from one uncorroborated event observation', () => {
+    expect(isConfirmedUnknownUnwrapEvent(
+      operation,
+      {...event, corroborations: 1},
+      'confirmed',
+      3,
+    )).toBe(false)
+    expect(isConfirmedUnknownUnwrapEvent(
+      operation,
+      {...event, corroborations: 1},
+      'confirmed',
+      1,
+    )).toBe(true)
+  })
+
+  it('fails closed when the persisted amount is malformed', () => {
+    expect(matchesUnknownUnwrapEvent({...operation, amount: 'not-a-number'}, event)).toBe(false)
   })
 })
 

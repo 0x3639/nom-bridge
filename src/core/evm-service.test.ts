@@ -269,6 +269,7 @@ describe('dropped-transaction evidence', () => {
     expect(collapseConfirmedCounts([9], 1)).toBe(9)
     expect(collapseConfirmedCounts([null], 1)).toBeNull()
   })
+
 })
 
 describe('EvmService receipt-path quorum', () => {
@@ -280,6 +281,83 @@ describe('EvmService receipt-path quorum', () => {
     h.walletClient.writeContract.mockResolvedValue(`0x${'aa'.repeat(32)}`)
     h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'reverted', logs: []})
   }
+
+  it('treats a lost injected-provider response during submission as ambiguous', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {}})
+    h.walletClient.writeContract.mockRejectedValue(
+      new Error('Injected provider disconnected after accepting the request'),
+    )
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+    )).rejects.toMatchObject({
+      name: 'EvmSubmissionError',
+      kind: 'submission-unknown',
+      hash: null,
+    })
+  })
+
+  it('keeps an explicit EIP-1193 rejection retryable', async () => {
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {}})
+    h.walletClient.writeContract.mockRejectedValue(
+      Object.assign(new Error('User rejected the request'), {code: 4001}),
+    )
+    const {EvmService, EvmSubmissionError} = await import('./evm-service')
+
+    const result = EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+    )
+    await expect(result).rejects.toThrow('Request rejected in MetaMask')
+    await expect(result).rejects.not.toBeInstanceOf(EvmSubmissionError)
+  })
+
+  it('rebinds the expected account immediately before the wallet write', async () => {
+    const changed = '0x0000000000000000000000000000000000000004'
+    h.walletClient.requestAddresses
+      .mockResolvedValueOnce([account])
+      .mockResolvedValueOnce([changed])
+    h.publicClient.simulateContract.mockResolvedValue({request: {}})
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+      undefined,
+      account,
+    )).rejects.toThrow('account changed')
+    expect(h.walletClient.writeContract).not.toHaveBeenCalled()
+  })
+
+  it('preserves the returned hash when the submission callback fails', async () => {
+    const hash = `0x${'aa'.repeat(32)}` as const
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.walletClient.writeContract.mockResolvedValue(hash)
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+      async () => { throw new Error('storage write failed') },
+    )).rejects.toMatchObject({
+      name: 'EvmSubmissionError',
+      kind: 'confirmation-unknown',
+      hash,
+    })
+    expect(h.publicClient.waitForTransactionReceipt).not.toHaveBeenCalled()
+  })
 
   it('classifies a receipt revert as reverted only when the RPC quorum corroborates it', async () => {
     armUnwrapFlow()
@@ -367,7 +445,30 @@ describe('EvmService.findUnwrappedEvents', () => {
         token: '0xToken',
         to: 'z1qrecipient',
         amount: 100n,
+        corroborations: config.evmRpcUrls.length,
       },
+    ])
+  })
+
+  it('counts identical event content once per responding RPC', async () => {
+    const event = {
+      transactionHash: `0x${'ab'.repeat(32)}`,
+      logIndex: 3,
+      args: {from: '0xSender', token: '0xToken', to: 'z1qrecipient', amount: 100n},
+    }
+    h.publicClient.getLogs
+      .mockResolvedValueOnce([event, event])
+      .mockResolvedValueOnce([event])
+      .mockResolvedValueOnce([])
+    const {EvmService} = await import('./evm-service')
+
+    const result = await EvmService.getInstance().findUnwrappedEvents(
+      '0xB000000000000000000000000000000000000002',
+      '0xSender' as never,
+      1n,
+    )
+    expect(result.events).toEqual([
+      expect.objectContaining({transactionHash: event.transactionHash, corroborations: 2}),
     ])
   })
 

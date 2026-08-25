@@ -105,12 +105,14 @@ const {
   unwrapRequests,
   activeUnwrapRequests,
   unknownWrapOperations,
-  unknownWrapsHydrated,
+  unknownUnwrapOperations,
+  unknownSourceOperationsHydrated,
   getRawWrapRequest,
   startPolling,
   stopPolling,
   refresh: refreshRequests,
   refreshForAccountChange,
+  clearUnknownUnwrapOperation,
   pollingError,
 } = useRequests()
 
@@ -135,6 +137,13 @@ const relevantUnknownWraps = computed(() =>
   unknownWrapOperations.value.filter(operation =>
     evmAccount.value &&
     operation.evmToAddress.toLowerCase() === evmAccount.value.toLowerCase(),
+  ),
+)
+const relevantUnknownUnwraps = computed(() =>
+  unknownUnwrapOperations.value.filter(operation =>
+    evmAccount.value &&
+    operation.evmChainId === config.evmChainId &&
+    operation.evmFromAddress.toLowerCase() === evmAccount.value.toLowerCase(),
   ),
 )
 
@@ -196,6 +205,8 @@ const hasSubmittedSafetyState = computed(() =>
   wrapPhase.value.kind === 'submitted-untracked' ||
   wrapPhase.value.kind === 'submitted-unknown' ||
   relevantUnknownWraps.value.length > 0 ||
+  unwrapPhase.value.kind === 'submitted-unknown' ||
+  relevantUnknownUnwraps.value.length > 0 ||
   unwrapPhase.value.kind === 'submitted-unconfirmed' ||
   unwrapPhase.value.kind === 'submitted-untracked',
 )
@@ -204,14 +215,18 @@ const operationDirection = computed<'wrap' | 'unwrap'>(() => {
   if (
     isWrapping.value ||
     wrapPhase.value.kind === 'submitted-untracked' ||
-    wrapPhase.value.kind === 'submitted-unknown' ||
-    relevantUnknownWraps.value.length > 0
+    wrapPhase.value.kind === 'submitted-unknown'
   ) return 'wrap'
   if (
     isUnwrapping.value ||
+    unwrapPhase.value.kind === 'submitted-unknown' ||
     unwrapPhase.value.kind === 'submitted-unconfirmed' ||
     unwrapPhase.value.kind === 'submitted-untracked'
   ) return 'unwrap'
+  if (direction.value === 'unwrap' && relevantUnknownUnwraps.value.length > 0) return 'unwrap'
+  if (direction.value === 'wrap' && relevantUnknownWraps.value.length > 0) return 'wrap'
+  if (relevantUnknownUnwraps.value.length > 0) return 'unwrap'
+  if (relevantUnknownWraps.value.length > 0) return 'wrap'
   return direction.value
 })
 const approvalPlanCopy = computed(() => approvalPlan(direction.value))
@@ -329,6 +344,12 @@ const operationPhase = computed<{
         explorerUrl: config.evmExplorerTxUrl + unwrapPhase.value.hash,
         explorerLabel: 'View submitted Ethereum transaction',
       }
+    case 'submitted-unknown':
+      return {
+        badge: 'Submitted · verify status',
+        title: 'Bridge transfer may have been submitted',
+        description: unwrapPhase.value.message,
+      }
     case 'submitted-unconfirmed':
       return {
         badge: 'Submitted · verify status',
@@ -356,6 +377,13 @@ const operationPhase = computed<{
         description: unwrapPhase.value.message,
       }
     case 'idle':
+      if (relevantUnknownUnwraps.value.length > 0) {
+        return {
+          badge: 'Submitted · verify status',
+          title: 'Bridge transfer may have been submitted',
+          description: 'A previous transfer may have reached MetaMask or Ethereum without returning its transaction hash. Do not submit it again; review MetaMask activity and History while automatic checks look for a matching confirmed event.',
+        }
+      }
       return null
   }
 })
@@ -483,7 +511,7 @@ const canSubmit = computed<boolean>(() => {
   // Durable safety records must be enforced before any submission is possible;
   // until hydration completes the form cannot know whether a lock exists.
   if (isSubmitting.value) return false
-  if (!unknownWrapsHydrated.value) return false
+  if (!unknownSourceOperationsHydrated.value) return false
   if (!selectedPair.value || !amount.value) return false
   if (halted.value || allowKeyGen.value) return false
   if (evmChainId.value !== config.evmChainId) return false
@@ -565,6 +593,19 @@ watch([relevantUnknownWraps, isWrapping], ([operations, wrapping]) => {
   hadUnknownWrapOperations = false
   if (wrapPhase.value.kind === 'submitted-unknown') clearWrapPhase()
   toast.show('The wrap was published after all. Continue from the transfer progress list.', 'success')
+})
+
+let manuallyClearingUnknownUnwrapId: string | null = null
+watch(unknownUnwrapOperations, operations => {
+  const current = unwrapPhase.value
+  if (current.kind !== 'submitted-unknown') return
+  if (operations.some(operation => operation.id === current.operationId)) return
+  clearUnwrapPhase()
+  if (manuallyClearingUnknownUnwrapId === current.operationId) {
+    manuallyClearingUnknownUnwrapId = null
+    return
+  }
+  toast.show('The bridge transfer was found on Ethereum and restored to History.', 'success')
 })
 
 // Failed prompts are contextual. Editing the route, token, amount, or wallet
@@ -801,6 +842,12 @@ async function onUnwrapSubmit(intent: BridgeSubmitIntent): Promise<void> {
     await refreshRequestsSafely()
     await focusProgressRegion()
   } catch (e) {
+    if (e instanceof EvmSubmissionError && e.kind === 'submission-unknown') {
+      localError.value = null
+      toast.show('The bridge transfer may have been submitted. Do not submit it again while its status is resolved.', 'info')
+      await refreshRequestsSafely()
+      return
+    }
     localError.value = e instanceof Error ? e.message : 'Failed to submit unwrap'
     toast.show(localError.value, 'error')
   }
@@ -978,6 +1025,25 @@ function dismissSubmittedNotice(): void {
   if (wrapPhase.value.kind === 'submitted-untracked') clearWrapPhase()
   if (unwrapPhase.value.kind === 'submitted-untracked') clearUnwrapPhase()
   toast.show('Tracking notice dismissed. The confirmed transfer must not be submitted again.', 'info')
+}
+
+async function onResolveUnknownUnwrap(): Promise<void> {
+  const operation = relevantUnknownUnwraps.value[0]
+  if (!operation) return
+  const confirmed = window.confirm(
+    'Clear this safety lock only if you verified in MetaMask activity and an Ethereum explorer that no matching transaction is pending or confirmed. Clear it now?',
+  )
+  if (!confirmed) return
+  manuallyClearingUnknownUnwrapId = operation.id
+  try {
+    await clearUnknownUnwrapOperation(operation.id)
+    if (unwrapPhase.value.kind === 'submitted-unknown') clearUnwrapPhase()
+    manuallyClearingUnknownUnwrapId = null
+    toast.show('Safety lock cleared after manual verification. Review the transfer details before retrying.', 'info')
+  } catch (e) {
+    manuallyClearingUnknownUnwrapId = null
+    toast.show(e instanceof Error ? e.message : 'Could not clear the transfer safety lock', 'error')
+  }
 }
 
 async function focusProgressRegion(): Promise<void> {
@@ -1311,6 +1377,14 @@ onUnmounted(() => {
               {{ sourceRechecking ? 'Rechecking…' : 'Recheck on Ethereum' }}
             </button>
           </div>
+          <button
+            v-if="relevantUnknownUnwraps.length > 0"
+            type="button"
+            class="mt-3 rounded-full border border-border px-3 py-1.5 text-xs font-medium text-foreground"
+            @click="onResolveUnknownUnwrap"
+          >
+            I verified no transaction was sent
+          </button>
           <button
             v-if="wrapPhase.kind === 'submitted-untracked' || unwrapPhase.kind === 'submitted-untracked'"
             type="button"
