@@ -270,6 +270,27 @@ describe('dropped-transaction evidence', () => {
     expect(collapseConfirmedCounts([null], 1)).toBeNull()
   })
 
+  it('uses finalized transaction counts before treating a nonce as consumed', async () => {
+    h.publicClient.getTransactionCount.mockResolvedValue(9)
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().getConfirmedTransactionCount(
+      '0xAbC0000000000000000000000000000000000001',
+    )).resolves.toBe(9)
+    expect(h.publicClient.getTransactionCount).toHaveBeenCalled()
+    for (const [request] of h.publicClient.getTransactionCount.mock.calls) {
+      expect(request).toMatchObject({blockTag: 'finalized'})
+    }
+  })
+
+  it('returns no nonce-consumption evidence when finalized state is unavailable', async () => {
+    h.publicClient.getTransactionCount.mockRejectedValue(new Error('finalized block unavailable'))
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().getConfirmedTransactionCount(
+      '0xAbC0000000000000000000000000000000000001',
+    )).resolves.toBeNull()
+  })
 })
 
 describe('EvmService receipt-path quorum', () => {

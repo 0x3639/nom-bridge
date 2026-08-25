@@ -403,10 +403,10 @@ async function pollOnce(evmAddress: string | null, bridge: string | null): Promi
       if (outcome !== 'absent') continue
       const facts = evmTxFacts[hash]
       if (!facts) continue
-      const confirmedCount = await EvmService.getInstance()
+      const finalizedCount = await EvmService.getInstance()
         .getConfirmedTransactionCount(facts.from as Address)
         .catch(() => null)
-      if (confirmedCount !== null && isNonceConsumed(facts.nonce, confirmedCount)) {
+      if (finalizedCount !== null && isNonceConsumed(facts.nonce, finalizedCount)) {
         droppedHashes.add(hash)
       }
     }

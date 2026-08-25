@@ -98,10 +98,10 @@ export function collapseAuthoritativeOutcomes(
 // Positive dropped-transaction evidence. Universal not-found is never proof a
 // wallet-broadcast transaction is dead (private mempools, poor propagation, a
 // low-fee tx that mines late). The only positive fact is nonce consumption:
-// getTransactionCount('latest') is the next unused nonce, so once the sender's
-// confirmed count passes the transaction's nonce, that nonce was consumed —
+// getTransactionCount('finalized') is the next unused nonce in finalized
+// state, so once it passes the transaction's nonce, that nonce was consumed —
 // by this tx (then it would not be absent) or by a replacement — and this hash
-// can never mine.
+// cannot become valid again after a shallow canonical-head reorg.
 export function isNonceConsumed(txNonce: number, confirmedTransactionCount: number): boolean {
   return confirmedTransactionCount > txNonce
 }
@@ -382,7 +382,7 @@ export class EvmService {
   async getConfirmedTransactionCount(address: Address): Promise<number | null> {
     const counts = await Promise.all(
       this.outcomeClients.map(client =>
-        client.getTransactionCount({address, blockTag: 'latest'}).catch(() => null),
+        client.getTransactionCount({address, blockTag: 'finalized'}).catch(() => null),
       ),
     )
     return collapseConfirmedCounts(counts, this.outcomeClients.length)
