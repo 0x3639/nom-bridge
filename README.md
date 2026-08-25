@@ -96,7 +96,7 @@ Invariants enforced in code:
    released only when both pinned Zenon RPCs agree on the confirmed block.
 6. Zenon redeems use the node's authoritative `logIndex`; the browser-decoded
    value is display-only.
-7. Amounts are `bigint` end-to-end; no floating point touches token values.
+7. Amounts are `bigint` end-to-end. Token values never use floating-point arithmetic.
 
 The bridge contracts themselves were reviewed by ChainSafe in 2023; that audit
 did not cover this front end, the orchestrators, or WalletConnect. Bridge

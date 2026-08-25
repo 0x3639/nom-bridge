@@ -75,7 +75,7 @@ commits.
 | PoW runs on the main thread inside the extension | MV3 CSP forbids blob workers. |
 | `dist/` committed to git | Deployed artifact is reviewed alongside source; workflow rebuilds and verifies it. |
 | No Reown AppKit / WalletConnect modal | Pairing is a QR + copyable `wc:` URI by design; see `docs/walletconnect-integration.md`. |
-| Low-severity `elliptic` advisories in `npm audit` | Transitive via `znn-typescript-sdk`, below the high-severity gate; an SDK bump is the fix vehicle. |
+| Low-severity `elliptic` advisory (GHSA-848j-6mx2-7j84) in `npm audit` | No fixed `elliptic` release exists. It reaches the shipped bundle transitively via `znn-typescript-sdk` → `crypto-browserify`; it is below the high-severity gate, and removal requires the SDK to drop `crypto-browserify`, not a version bump here. |
 
 If you believe one of these should change, open an issue that proposes the
 alternative and its safety argument rather than a PR that changes behaviour.
