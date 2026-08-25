@@ -158,9 +158,12 @@ describe('collapseAuthoritativeOutcomes', () => {
     expect(collapseAuthoritativeOutcomes(['not-found', 'pending', 'unavailable'])).toBe('unknown')
   })
 
-  it('accepts a success receipt from any configured RPC as authoritative', async () => {
+  it('accepts success only after the configured RPC quorum corroborates it', async () => {
     const {collapseAuthoritativeOutcomes} = await import('./evm-service')
-    expect(collapseAuthoritativeOutcomes(['not-found', 'success', 'unavailable'])).toBe('confirmed')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'success', 'unavailable'])).toBe('unknown')
+    expect(collapseAuthoritativeOutcomes(['not-found', 'success', 'success'])).toBe('confirmed')
+    // A single-RPC deployment has no peer to corroborate with.
+    expect(collapseAuthoritativeOutcomes(['success'])).toBe('confirmed')
   })
 
   it('fails closed if RPCs return conflicting receipts', async () => {
@@ -268,7 +271,7 @@ describe('dropped-transaction evidence', () => {
   })
 })
 
-describe('EvmService receipt-path revert quorum', () => {
+describe('EvmService receipt-path quorum', () => {
   const account = '0xAbC0000000000000000000000000000000000001'
 
   function armUnwrapFlow() {
@@ -310,6 +313,32 @@ describe('EvmService receipt-path revert quorum', () => {
       1n,
       'z1qrecipient',
     )).rejects.toMatchObject({name: 'EvmSubmissionError', kind: 'confirmation-unknown'})
+  })
+
+  it('downgrades a fallback success when the RPC quorum does not corroborate it', async () => {
+    const hash = `0x${'aa'.repeat(32)}` as const
+    h.walletClient.requestAddresses.mockResolvedValue([account])
+    h.publicClient.simulateContract.mockResolvedValue({request: {}})
+    h.walletClient.writeContract.mockResolvedValue(hash)
+    h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success', logs: []})
+    const {TransactionNotFoundError, TransactionReceiptNotFoundError} = await import('viem')
+    h.publicClient.getTransactionReceipt
+      .mockResolvedValueOnce({status: 'success', blockNumber: 10n})
+      .mockRejectedValueOnce(new TransactionReceiptNotFoundError({hash}))
+      .mockRejectedValueOnce(new TransactionReceiptNotFoundError({hash}))
+    h.publicClient.getTransaction.mockRejectedValue(new TransactionNotFoundError({hash}))
+    const {EvmService} = await import('./evm-service')
+
+    await expect(EvmService.getInstance().unwrap(
+      '0xB000000000000000000000000000000000000002',
+      '0xC000000000000000000000000000000000000003',
+      1n,
+      'z1qrecipient',
+    )).rejects.toMatchObject({
+      name: 'EvmSubmissionError',
+      kind: 'confirmation-unknown',
+      hash,
+    })
   })
 })
 
@@ -737,6 +766,7 @@ describe('EvmService write verification', () => {
     h.publicClient.simulateContract.mockResolvedValue({request: {simulated: 'unwrap'}})
     h.walletClient.writeContract.mockResolvedValue('0xunwraptx')
     h.publicClient.waitForTransactionReceipt.mockResolvedValue({status: 'success', logs: []})
+    h.publicClient.getTransactionReceipt.mockResolvedValue({status: 'success', blockNumber: 10n})
     const {EvmService} = await import('./evm-service')
 
     await expect(

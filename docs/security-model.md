@@ -31,6 +31,27 @@ Bridge availability and signing still depend on the Zenon orchestrator set.
 Users should expect finality delays and verify operator health at
 <https://status.bridge.zenon.community/>.
 
+For an unwrap source transaction, one EVM RPC's successful receipt is not
+authoritative in the current three-RPC configuration. At least two configured
+RPCs must report success for the same transaction hash before the app treats it
+as confirmed. This applies both to the immediate fallback-receipt path and to
+later polling or manual rechecks. A success/revert conflict, or fewer than two
+success observations, remains unknown; the immediate path reports
+`confirmation-unknown`, and the submitted-unconfirmed warning stays active
+until a later poll or manual recheck obtains quorum evidence.
+
+This deliberately couples automatic unwrap confirmation to the availability of
+two EVM RPC endpoints. One endpoint may be unavailable without blocking
+confirmation when the other two agree, but with fewer than two successful
+observations even a genuine confirmed unwrap stays unconfirmed in the app until
+the quorum recovers. Users must not resubmit while that status is unknown.
+
+Distinct RPC URLs are enforced by configuration tests, but distinct addresses
+do not prove operational independence or protect against correlated compromise.
+This is RPC corroboration, not an Ethereum light client or cryptographic receipt
+proof. A single-RPC configuration has no peer to corroborate with and therefore
+retains the weaker standalone trust model.
+
 An ambiguous wrap response leaves a durable duplicate-submit lock before the
 wallet call. Automatic recovery is deliberately stricter than ordinary reads:
 the pre-send account frontier is the highest height observed by both pinned

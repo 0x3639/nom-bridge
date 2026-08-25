@@ -70,20 +70,21 @@ export class EvmSubmissionError extends Error {
   }
 }
 
-// A success receipt from any RPC is authoritative (fabricating success only
-// clears warning copy, never enables a resubmit). A revert must be the
-// consensus of every responsive RPC — corroborated by a second node unless only
-// one is configured — so a single stale or forked node cannot release a
-// duplicate-submit lock. `absent` requires every RPC to answer not-found; it
-// feeds the sustained-absence dropped-transaction policy below and is never a
-// release signal by itself.
+// Success and revert receipts can both release duplicate-submit safety state,
+// so neither may rest on one RPC in a multi-RPC configuration. Success requires
+// two matching observations; a revert must be the consensus of every responsive
+// RPC and be corroborated by a second node. Any success/revert conflict fails
+// closed. `absent` requires every RPC to answer not-found; it feeds the
+// sustained-absence dropped-transaction policy below and is never a release
+// signal by itself.
 export function collapseAuthoritativeOutcomes(
   outcomes: EvmTransactionOutcome[],
 ): AuthoritativeEvmOutcome {
-  const confirmed = outcomes.includes('success')
+  const confirmedCount = outcomes.filter(outcome => outcome === 'success').length
   const revertedCount = outcomes.filter(outcome => outcome === 'reverted').length
-  if (confirmed && revertedCount) return 'unknown'
-  if (confirmed) return 'confirmed'
+  if (confirmedCount > 0 && revertedCount > 0) return 'unknown'
+  const required = outcomes.length === 1 ? 1 : 2
+  if (confirmedCount >= required) return 'confirmed'
   const responsive = outcomes.filter(outcome => outcome !== 'unavailable')
   if (
     revertedCount > 0 &&
@@ -612,6 +613,17 @@ export class EvmService {
       }
       if (receipt.status !== 'success') {
         throw await this.classifyReceiptRevert(hash, 'Unwrap')
+      }
+      // The fallback transport returns the first successful RPC response. That
+      // receipt is useful for logs, but it is not enough to release the source
+      // submission lock until a second configured RPC corroborates success.
+      const outcome = await this.getAuthoritativeOutcome(hash).catch(() => 'unknown' as const)
+      if (outcome !== 'confirmed') {
+        throw new EvmSubmissionError(
+          'confirmation-unknown',
+          hash,
+          'Unwrap transaction was submitted, but its successful receipt could not be corroborated; do not resubmit until its status is verified',
+        )
       }
       const decoded = parseEventLogs({abi: bridgeAbi, logs: receipt.logs, eventName: 'Unwrapped'})
       const provisionalLogIndex = selectProvisionalLogIndex(
