@@ -1,9 +1,10 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   computeFinalUnwrapHashes,
   deriveUnwrapStatus,
   deriveWrapStatus,
   findTrackedUnwrapByHash,
+  hydrateUnknownSourceOperations,
   isConfirmedUnknownUnwrapEvent,
   matchesTrackedUnwrapEvent,
   matchesUnknownUnwrapEvent,
@@ -11,8 +12,79 @@ import {
   nextPollDelay,
   orderUnwrapRequests,
   reconcileUnknownWrapOperations,
+  useRequests,
 } from './useRequests'
+import {requestStore} from '../request-store'
 import type {UnwrapStatus} from '@/types'
+
+type RequestSnapshot = Awaited<ReturnType<typeof requestStore.getSnapshot>>
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+  return {promise, resolve}
+}
+
+function snapshotWithUnknownUnwrap(id: string): RequestSnapshot {
+  return {
+    requests: [],
+    evmClaims: {},
+    zenonRedeems: {},
+    evmTxFacts: {},
+    unknownWraps: {},
+    unknownUnwraps: {
+      [id]: {
+        evmFromAddress: '0x1111111111111111111111111111111111111111',
+        evmChainId: 1,
+        bridgeAddress: '0x2222222222222222222222222222222222222222',
+        tokenAddress: '0x3333333333333333333333333333333333333333',
+        receiver: 'z1qrecipient',
+        zenonToAddress: 'z1qrecipient',
+        zts: 'zts1znnxxxxxxxxxxxxx9z4ulx',
+        amount: '100',
+        decimals: 8,
+        symbol: 'ZNN',
+        fromBlock: '10',
+        approvalCount: 2,
+        createdAt: 1,
+      },
+    },
+    revision: 1,
+  }
+}
+
+describe('hydrateUnknownSourceOperations', () => {
+  it('ignores an older snapshot that resolves after a newer hydration', async () => {
+    const older = deferred<RequestSnapshot>()
+    const newer = deferred<RequestSnapshot>()
+    const snapshotSpy = vi.spyOn(requestStore, 'getSnapshot')
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise)
+    const state = useRequests()
+
+    try {
+      const olderHydration = hydrateUnknownSourceOperations()
+      const newerHydration = hydrateUnknownSourceOperations()
+
+      newer.resolve(snapshotWithUnknownUnwrap('newer-operation'))
+      await newerHydration
+      expect(state.unknownUnwrapOperations.value.map(operation => operation.id))
+        .toEqual(['newer-operation'])
+
+      older.resolve(snapshotWithUnknownUnwrap('stale-operation'))
+      await olderHydration
+      expect(state.unknownUnwrapOperations.value.map(operation => operation.id))
+        .toEqual(['newer-operation'])
+    } finally {
+      snapshotSpy.mockRestore()
+      state.unknownWrapOperations.value = []
+      state.unknownUnwrapOperations.value = []
+      state.unknownSourceOperationsHydrated.value = false
+    }
+  })
+})
 
 describe('normalizeEvmHash', () => {
   it('canonicalizes SDK and viem hash formats to the same key', () => {

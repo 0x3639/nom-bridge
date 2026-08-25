@@ -45,9 +45,15 @@ const unknownSourceOperationsHydrated = ref(false)
 const isLoading = ref(false)
 const pollingError = ref<string | null>(null)
 
-async function hydrateUnknownSourceOperations(): Promise<void> {
+let unknownSourceHydrationRequestId = 0
+export async function hydrateUnknownSourceOperations(): Promise<void> {
+  const requestId = ++unknownSourceHydrationRequestId
   try {
     const snapshot = await requestStore.getSnapshot()
+    // Storage events and local mutations can start overlapping reads. Only the
+    // newest request may publish its snapshot; an older read resolving last
+    // must not resurrect a safety record that a newer snapshot already cleared.
+    if (requestId !== unknownSourceHydrationRequestId) return
     unknownWrapOperations.value = Object.entries(snapshot.unknownWraps)
       .map(([id, operation]) => ({id, ...operation}))
     unknownUnwrapOperations.value = Object.entries(snapshot.unknownUnwraps)
